@@ -1,0 +1,145 @@
+services:
+  # ── INFRASTRUCTURE ──
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: tf-postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tradingfirm}
+      POSTGRES_USER: ${POSTGRES_USER:-tf_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-tradingfirm_dev_2026}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tf_user} -d ${POSTGRES_DB:-tradingfirm}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: tf-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── BACKEND SERVICES ──
+
+  data-engine:
+    build:
+      context: ./services/data-engine
+      dockerfile: Dockerfile
+    container_name: tf-data-engine
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: data-engine
+      SERVICE_PORT: "8001"
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:-tradingfirm_dev_2026}@postgres:5432/${POSTGRES_DB:-tradingfirm}
+      REDIS_URL: redis://redis:6379
+      DATA_PROVIDER: ${DATA_PROVIDER:-yfinance}
+    restart: unless-stopped
+
+  signal-engine:
+    build:
+      context: ./services/signal-engine
+      dockerfile: Dockerfile
+    container_name: tf-signal-engine
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      data-engine:
+        condition: service_started
+    environment:
+      SERVICE_NAME: signal-engine
+      SERVICE_PORT: "8002"
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:-tradingfirm_dev_2026}@postgres:5432/${POSTGRES_DB:-tradingfirm}
+      REDIS_URL: redis://redis:6379
+      DATA_ENGINE_URL: http://data-engine:8001
+    restart: unless-stopped
+
+  risk-shield:
+    build:
+      context: ./services/risk-shield
+      dockerfile: Dockerfile
+    container_name: tf-risk-shield
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: risk-shield
+      SERVICE_PORT: "8003"
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:-tradingfirm_dev_2026}@postgres:5432/${POSTGRES_DB:-tradingfirm}
+      REDIS_URL: redis://redis:6379
+      DATA_PROVIDER: ${DATA_PROVIDER:-yfinance}
+    restart: unless-stopped
+
+  ai-agent:
+    build:
+      context: ./services/ai-agent
+      dockerfile: Dockerfile
+    container_name: tf-ai-agent
+    ports:
+      - "8004:8004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: ai-agent
+      SERVICE_PORT: "8004"
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:-tradingfirm_dev_2026}@postgres:5432/${POSTGRES_DB:-tradingfirm}
+      REDIS_URL: redis://redis:6379
+      LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY:-}
+    restart: unless-stopped
+
+  # ── FRONTEND ──
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: tf-web
+    ports:
+      - "3000:3000"
+    depends_on:
+      - data-engine
+      - signal-engine
+      - risk-shield
+      - ai-agent
+    environment:
+      NEXT_PUBLIC_SUPABASE_URL: ${SUPABASE_URL:-}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      DATA_ENGINE_URL: http://data-engine:8001
+      SIGNAL_ENGINE_URL: http://signal-engine:8002
+      RISK_SHIELD_URL: http://risk-shield:8003
+      AI_AGENT_URL: http://ai-agent:8004
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+    driver: local

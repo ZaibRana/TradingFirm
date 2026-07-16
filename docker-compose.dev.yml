@@ -1,0 +1,40 @@
+# Dev overrides — hot reload via volume mounts
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  data-engine:
+    volumes:
+      - ./services/data-engine:/app
+    environment:
+      DEBUG: "true"
+    command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+
+  signal-engine:
+    volumes:
+      - ./services/signal-engine:/app
+    environment:
+      DEBUG: "true"
+    command: uvicorn main:app --host 0.0.0.0 --port 8002 --reload
+
+  risk-shield:
+    volumes:
+      - ./services/risk-shield:/app
+    environment:
+      DEBUG: "true"
+    command: uvicorn main:app --host 0.0.0.0 --port 8003 --reload
+
+  ai-agent:
+    volumes:
+      - ./services/ai-agent:/app
+    environment:
+      DEBUG: "true"
+    command: uvicorn main:app --host 0.0.0.0 --port 8004 --reload
+
+  web:
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+      - /app/.next
+    environment:
+      NODE_ENV: development
+    command: npm run dev

@@ -1,0 +1,39 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+venv/
+.venv/
+*.so
+
+# ── Node.js ──
+node_modules/
+.next/
+out/
+
+# ── Environment / Secrets ──
+.env
+.env.*
+!.env.example
+
+# ── Docker ──
+docker-data/
+*.log
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Scan Results (generated) ──
+pro_results.json
+scanner/pro_results.json
+
+# ── Antigravity agent data ──
+.gemini/
