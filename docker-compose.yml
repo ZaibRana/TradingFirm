@@ -11,7 +11,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-tradingfirm}
       POSTGRES_USER: ${POSTGRES_USER:-tf_user}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-tradingfirm_dev_2026}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tf_user} -d ${POSTGRES_DB:-tradingfirm}"]
       interval: 5s
@@ -48,7 +48,7 @@ services:
     environment:
       SERVICE_NAME: data-engine
       SERVICE_PORT: "8001"
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:-tradingfirm_dev_2026}@postgres:5432/${POSTGRES_DB:-tradingfirm}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:?Set DB_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-tradingfirm}
       REDIS_URL: redis://redis:6379
       DATA_PROVIDER: ${DATA_PROVIDER:-yfinance}
     restart: unless-stopped
@@ -70,7 +70,7 @@ services:
     environment:
       SERVICE_NAME: signal-engine
       SERVICE_PORT: "8002"
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:-tradingfirm_dev_2026}@postgres:5432/${POSTGRES_DB:-tradingfirm}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:?Set DB_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-tradingfirm}
       REDIS_URL: redis://redis:6379
       DATA_ENGINE_URL: http://data-engine:8001
     restart: unless-stopped
@@ -90,7 +90,7 @@ services:
     environment:
       SERVICE_NAME: risk-shield
       SERVICE_PORT: "8003"
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:-tradingfirm_dev_2026}@postgres:5432/${POSTGRES_DB:-tradingfirm}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:?Set DB_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-tradingfirm}
       REDIS_URL: redis://redis:6379
       DATA_PROVIDER: ${DATA_PROVIDER:-yfinance}
     restart: unless-stopped
@@ -110,7 +110,7 @@ services:
     environment:
       SERVICE_NAME: ai-agent
       SERVICE_PORT: "8004"
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:-tradingfirm_dev_2026}@postgres:5432/${POSTGRES_DB:-tradingfirm}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:?Set DB_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-tradingfirm}
       REDIS_URL: redis://redis:6379
       LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
