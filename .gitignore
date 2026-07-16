@@ -30,6 +30,9 @@ docker-data/
 *.swo
 .DS_Store
 Thumbs.db
+~$*
+*.docx
+*.xlsx
 
 # ── Scan Results (generated) ──
 pro_results.json
