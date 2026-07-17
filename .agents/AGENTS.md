@@ -194,6 +194,29 @@
 - If GitHub is not set up, ask the user for keys/repo before starting development
 - Push regularly — unsaved work is lost work
 
+### Rule 20: Version Audit Before First Use
+- Before using ANY library, run `library.__version__` and compare with requirements.txt
+- If versions differ (especially major version), search for breaking changes FIRST
+- Check deprecated parameters, changed defaults, removed features
+- Update requirements.txt to match installed version BEFORE writing code
+- NEVER assume the API is the same across major versions — it never is
+
+### Rule 21: Blame Yourself First
+- When an API returns errors, check YOUR code before blaming the API
+- Verify: correct parameters, correct version, correct auth method
+- If rate-limited, investigate whether YOUR calling pattern causes it (wrong session, wrong headers, deprecated params)
+- NEVER tell the user "the API is blocking you" until you've ruled out every code-side cause
+- "Wait 15 minutes" is not debugging — it's avoidance
+
+### Rule 22: Prove It's Not You
+- Before telling the user an API is blocking/rate-limiting them, you MUST provide evidence:
+  1. Show `library.__version__` vs requirements.txt — confirm they match
+  2. Show the exact call parameters and confirm they match the installed version's API docs
+  3. Run a minimal 3-line test that isolates the issue
+- If you cannot provide ALL THREE, say "I don't know the cause yet" — never blame the API
+- If you suggest "wait 15 min", "use VPN", or "switch network" without completing steps 1-3, you are WRONG
+- External blame is the LAST resort, not the first guess
+
 ---
 
 ## LESSONS LEARNED — Past Mistakes (Never Repeat)
@@ -227,6 +250,19 @@
 - 0 stocks found was clearly a bug (corrupted tickers), not expected behavior
 - **Rule**: 0 results is ALWAYS a problem. Investigate immediately.
 
+### Mistake 8: Blamed Yahoo rate-limiting instead of checking own code
+- yfinance was pinned at 0.2.55 in requirements.txt but 1.5.1 was installed
+- Custom `requests.Session` with `session=` parameter fights yfinance 1.x internal session/cookie handling
+- Every "test" call was failing because of OUR session interference, not Yahoo blocking the IP
+- Wasted 6+ hours telling user to "wait 15-30 min", "use VPN", "switch to hotspot"
+- **Rule**: When rate-limited, check YOUR code first (versions, params, sessions) before blaming the API
+
+### Mistake 9: Never verified installed library version matches requirements.txt
+- requirements.txt said 0.2.55, `pip` had 1.5.1 — a MAJOR version jump with breaking changes
+- Used deprecated `session=` parameter that actively caused rate limiting
+- Used `Ticker.info` instead of `Ticker.fast_info` (unstable in 1.x)
+- **Rule**: ALWAYS run `library.__version__` and compare with requirements.txt before first use
+
 ---
 
 ## SCANNER ARCHITECTURE — Source of Truth
@@ -251,7 +287,10 @@
 
 ### Known Library Bugs
 - **finvizfinance 1.3.0**: Doubles first character of every ticker. Must strip in code.
-- **yfinance in Docker**: Needs `threads=False`, `session=` with browser User-Agent, max 20 tickers per batch
+- **yfinance 1.x**: Do NOT pass `session=` to `yf.download()` or `yf.Ticker()` — yfinance manages its own sessions/cookies. Passing a custom session fights internal rate-limit handling and CAUSES blocks.
+- **yfinance 1.x**: Use `Ticker.fast_info` for market cap (reliable). `Ticker.info` is unstable — wrap in try/except.
+- **yfinance 1.x**: Single-ticker `yf.download()` returns flat columns (not MultiIndex). Must handle both formats in `extract_ticker_df()`.
+- **yfinance batch size**: Max 10 tickers per `yf.download()` call, 5s delay between batches.
 
 ---
 

@@ -36,8 +36,8 @@ logger = logging.getLogger(__name__)
 # ── Safety Constants ─────────────────────────────────────────────
 FINVIZ_DELAY_MIN = 1.0       # Minimum seconds between Finviz calls
 FINVIZ_DELAY_MAX = 2.5       # Maximum seconds between Finviz calls
-YF_BATCH_SIZE = 20            # Max tickers per yf.download() call (conservative)
-YF_BATCH_DELAY = 3.0          # Seconds between download batches
+YF_BATCH_SIZE = 10            # Max tickers per yf.download() call (very conservative)
+YF_BATCH_DELAY = 5.0          # Seconds between download batches (safe gap)
 YF_INFO_DELAY = 2.0           # Seconds between Ticker.info calls
 MAX_RETRIES = 3               # Max retries for API calls
 RETRY_BACKOFF = [1, 2, 4]     # Backoff schedule in seconds
@@ -46,27 +46,30 @@ RETRY_BACKOFF = [1, 2, 4]     # Backoff schedule in seconds
 class YFinanceProvider(DataProvider):
     """Data provider using yfinance (OHLCV) + Finviz (screening)."""
 
-    def __init__(self):
-        """Initialize with a persistent session to avoid rate limits."""
-        import requests
-        from urllib3.util.retry import Retry
-        from requests.adapters import HTTPAdapter
+    # ── Version Guardrail ─────────────────────────────────────────
+    # If someone installs a different major version, the provider
+    # refuses to start. Prevents silent use of deprecated APIs.
+    EXPECTED_YF_MAJOR = 1  # Code written for yfinance 1.x
 
-        self._session = requests.Session()
-        self._session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-        })
-        # Increase connection pool size for yf.download(threads=True)
-        adapter = HTTPAdapter(
-            pool_connections=50,
-            pool_maxsize=50,
-        )
-        self._session.mount("https://", adapter)
-        self._session.mount("http://", adapter)
+    def __init__(self):
+        """Initialize provider with version validation.
+
+        NOTE: yfinance 1.x manages its own sessions, cookies, and
+        User-Agent headers internally. Do NOT pass a custom session —
+        it fights with yfinance's internal cookie/rate-limit handling
+        and can actually make rate limiting worse.
+        """
+        # ── GUARDRAIL: Crash on major version mismatch ──
+        installed = tuple(int(x) for x in yf.__version__.split(".")[:2])
+        if installed[0] != self.EXPECTED_YF_MAJOR:
+            raise RuntimeError(
+                f"VERSION MISMATCH: yfinance {yf.__version__} installed, "
+                f"but this code is written for {self.EXPECTED_YF_MAJOR}.x. "
+                f"Breaking changes likely exist. Check parameters (session=, "
+                f"Ticker.info vs fast_info, column format) before proceeding. "
+                f"Update EXPECTED_YF_MAJOR after verifying compatibility."
+            )
+        logger.info(f"YFinanceProvider: yfinance {yf.__version__} (expected {self.EXPECTED_YF_MAJOR}.x) ✓")
 
     @property
     def provider_name(self) -> str:
@@ -218,8 +221,11 @@ class YFinanceProvider(DataProvider):
         interval: str,
     ) -> pd.DataFrame:
         """
-        Synchronous yfinance bulk download with batch splitting.
-        Max 50 tickers per call to avoid overloading Yahoo Finance.
+        Synchronous yfinance bulk download with batch splitting and canary validation.
+
+        CANARY BATCH: The first batch is treated as a "canary" — if it fails
+        or returns empty data, we abort the entire download immediately.
+        This prevents burning API calls when Yahoo is rate-limiting us.
         """
         if len(tickers) <= YF_BATCH_SIZE:
             return self._download_single_batch(tickers, period, interval)
@@ -231,7 +237,7 @@ class YFinanceProvider(DataProvider):
         ]
         logger.info(
             f"  Splitting {len(tickers)} tickers into {len(batches)} batches "
-            f"(max {YF_BATCH_SIZE} per batch)"
+            f"(max {YF_BATCH_SIZE} per batch, {YF_BATCH_DELAY}s delay)"
         )
 
         all_data = []
@@ -240,10 +246,44 @@ class YFinanceProvider(DataProvider):
                 logger.debug(f"  Batch {batch_num + 1}/{len(batches)}: sleeping {YF_BATCH_DELAY}s")
                 time.sleep(YF_BATCH_DELAY)
 
-            df = self._download_single_batch(batch, period, interval)
+            try:
+                df = self._download_single_batch(batch, period, interval)
+            except Exception as e:
+                if batch_num == 0:
+                    # ⚠️ CANARY FAILED: first batch errored — abort everything
+                    logger.error(
+                        f"  CANARY BATCH FAILED: First batch of {len(batch)} tickers "
+                        f"raised an error: {e}. ABORTING all downloads. "
+                        f"Yahoo may be rate-limiting — wait 15-30 minutes."
+                    )
+                    return pd.DataFrame()
+                else:
+                    logger.warning(
+                        f"  Batch {batch_num + 1}/{len(batches)} failed: {e}. "
+                        f"Skipping batch and continuing."
+                    )
+                    continue
+
+            # ⚠️ CANARY CHECK: if first batch returns empty, abort
+            if batch_num == 0 and (df is None or df.empty):
+                logger.error(
+                    f"  CANARY BATCH FAILED: First batch returned no data for "
+                    f"{batch[:3]}... ABORTING all downloads. "
+                    f"Yahoo may be rate-limiting — wait 15-30 minutes."
+                )
+                return pd.DataFrame()
+
             if df is not None and not df.empty:
                 all_data.append(df)
-            logger.info(f"  Batch {batch_num + 1}/{len(batches)}: {len(batch)} tickers downloaded")
+                logger.info(
+                    f"  Batch {batch_num + 1}/{len(batches)}: "
+                    f"{len(batch)} tickers downloaded ✓"
+                )
+            else:
+                logger.warning(
+                    f"  Batch {batch_num + 1}/{len(batches)}: "
+                    f"{len(batch)} tickers returned empty data"
+                )
 
         if not all_data:
             return pd.DataFrame()
@@ -263,7 +303,12 @@ class YFinanceProvider(DataProvider):
         period: str,
         interval: str,
     ) -> pd.DataFrame:
-        """Download a single batch of tickers using our persistent session."""
+        """Download a single batch of tickers.
+
+        NOTE: No session= parameter — yfinance 1.x manages its own
+        sessions and cookies. Passing a custom session interferes with
+        yfinance's internal rate-limit and cookie handling.
+        """
         ticker_str = " ".join(tickers)
         df = yf.download(
             ticker_str,
@@ -272,7 +317,6 @@ class YFinanceProvider(DataProvider):
             group_by="ticker",
             threads=False,       # Sequential — avoids 50 parallel connections
             progress=False,
-            session=self._session,  # Use our browser User-Agent session
         )
         logger.debug(f"  Downloaded {interval} batch: {df.shape if df is not None else 'None'}")
         return df
@@ -284,13 +328,26 @@ class YFinanceProvider(DataProvider):
         bulk_data: Any,
         ticker: str,
     ) -> Optional[pd.DataFrame]:
-        """Extract one ticker's OHLCV from a grouped bulk DataFrame."""
+        """Extract one ticker's OHLCV from a grouped bulk DataFrame.
+
+        Handles two yf.download() column formats:
+          - Multi-ticker: MultiIndex columns grouped by ticker
+          - Single-ticker: Flat columns ['Open','High','Low','Close','Volume']
+        """
         try:
             if bulk_data is None or bulk_data.empty:
                 return None
-            if ticker in bulk_data.columns.get_level_values(0):
-                df = bulk_data[ticker].dropna(subset=["Close"])
-                return df if len(df) > 0 else None
+
+            # Check if columns are MultiIndex (multi-ticker download)
+            if isinstance(bulk_data.columns, pd.MultiIndex):
+                if ticker in bulk_data.columns.get_level_values(0):
+                    df = bulk_data[ticker].dropna(subset=["Close"])
+                    return df if len(df) > 0 else None
+            else:
+                # Single-ticker download: flat columns, data IS the ticker
+                if "Close" in bulk_data.columns:
+                    df = bulk_data.dropna(subset=["Close"])
+                    return df if len(df) > 0 else None
         except Exception:
             pass
         return None
@@ -318,9 +375,26 @@ class YFinanceProvider(DataProvider):
         raise last_error
 
     def _get_stock_info_sync(self, ticker: str) -> dict:
-        """Synchronous stock info fetch using persistent session."""
-        t = yf.Ticker(ticker, session=self._session)
-        info = t.info or {}
+        """Synchronous stock info fetch.
+
+        Uses fast_info for reliable price/cap data (stable in yfinance 1.x),
+        falls back to info for sector/industry/news (less stable).
+        No session= parameter — yfinance 1.x manages its own.
+        """
+        t = yf.Ticker(ticker)
+
+        # fast_info: reliable for market cap (yfinance 1.x)
+        try:
+            fi = t.fast_info
+            market_cap = int(getattr(fi, "market_cap", 0) or 0)
+        except Exception:
+            market_cap = 0
+
+        # info: less stable, but needed for sector/industry/float
+        try:
+            info = t.info or {}
+        except Exception:
+            info = {}
 
         # Float display string
         flt = info.get("floatShares", 0) or 0
@@ -332,6 +406,10 @@ class YFinanceProvider(DataProvider):
             flt_str = f"{flt:,.0f}"
         else:
             flt_str = "N/A"
+
+        # Use fast_info market_cap if info didn't have it
+        if not market_cap:
+            market_cap = info.get("marketCap", 0) or 0
 
         # News headlines (top 3)
         headlines = []
@@ -370,7 +448,7 @@ class YFinanceProvider(DataProvider):
             "name": info.get("shortName", ""),
             "sector": info.get("sector", "Other"),
             "industry": info.get("industry", "Other"),
-            "marketCap": info.get("marketCap", 0) or 0,
+            "marketCap": market_cap,
             "floatShares": flt,
             "floatStr": flt_str,
             "news": headlines,

@@ -1,20 +1,22 @@
 """
 TradingFirm — Market Scanner Pipeline
 
-Orchestrates the full scan flow:
-  1. Pre-screen candidates (Finviz)
-  2. Bulk download OHLCV data (yfinance)
-  3. Apply technical filters (ATRP, RVOL, EMA, 52w)
-  4. Enrich winners (name, sector, float, news)
-  5. Apply fundamental gates (market cap, float)
-  6. Sort by quality score (RVOL × ATRP)
+Orchestrates the full scan flow (optimized: daily first, filter, then hourly):
+  1. Pre-screen candidates via Finviz (~650 tickers)
+  2. Download DAILY ONLY for all candidates
+  3. Apply daily-only filters (ATRP, RVOL, 52w, IPO) → ~20-40 winners
+  4. Download HOURLY ONLY for daily winners (~95% fewer API calls)
+  5. Apply hourly filters (4H price > 50 EMA, 1H EMA20 > EMA50)
+  6. Enrich final winners (name, sector, float, news) + fundamental gates
+  7. Sort by quality score (RVOL × ATRP)
 
 Ported from scanner/pro_scan.py into an async, provider-agnostic class.
 
 RATE LIMIT SAFETY:
+  - Canary batch: first download batch must succeed or entire scan aborts
+  - 10 tickers per batch, 5s delay between batches
   - 2s delay between enrichment calls (yf.Ticker.info)
-  - Large DataFrames explicitly deleted after use
-  - gc.collect() after heavy processing
+  - Large DataFrames explicitly deleted after use + gc.collect()
 """
 
 import asyncio
@@ -73,6 +75,15 @@ class MarketScanner:
         """
         Execute the full scan pipeline.
 
+        Optimized flow — downloads daily first, filters, then hourly only for winners:
+          Step 1: Pre-screen candidates via Finviz (~650 tickers)
+          Step 2: Download DAILY ONLY for all candidates
+          Step 3: Apply daily-only filters (ATRP, RVOL, 52w, IPO) → ~20-40 winners
+          Step 4: Download HOURLY ONLY for daily winners
+          Step 5: Apply hourly filters (4H EMA50, 1H EMA20>EMA50) → ~10-20 final
+          Step 6: Enrich final winners (name, sector, float, news)
+          Step 7: Sort by quality score (RVOL × ATRP)
+
         Args:
             price_min: Minimum stock price
             price_max: Maximum stock price
@@ -87,7 +98,7 @@ class MarketScanner:
         logger.info(f"{'='*60}")
 
         # ── Step 1: Pre-screen via provider ──
-        logger.info("Step 1: Pre-screening candidates...")
+        logger.info("Step 1/7: Pre-screening candidates...")
         tickers, market_status = await self.provider.get_candidates(
             price_min=price_min,
             price_max=price_max,
@@ -95,61 +106,131 @@ class MarketScanner:
 
         if not tickers:
             logger.warning("No candidates found. Returning empty result.")
-            return ScanResult(
-                timestamp=datetime.now(timezone.utc),
-                duration_seconds=time.time() - t0,
-                market_status=market_status,
-                total_scanned=0,
-                passed_count=0,
-                stocks=[],
-            )
+            return self._empty_result(t0, market_status, total_scanned=0)
 
-        logger.info(f"Step 1 complete: {len(tickers)} candidates")
+        logger.info(f"Step 1/7 complete: {len(tickers)} candidates")
 
-        # ── Step 2: Bulk download ──
-        logger.info("Step 2: Downloading chart data...")
+        # ── Step 2: Download DAILY ONLY for all candidates ──
+        logger.info(f"Step 2/7: Downloading DAILY data for {len(tickers)} tickers...")
         daily_data = await self.provider.download_daily(tickers)
-        hourly_data = await self.provider.download_hourly(tickers)
-        logger.info("Step 2 complete: Downloads finished")
 
-        # ── Step 3: Apply filters ──
-        logger.info(f"Step 3: Applying filters ({market_status} mode)...")
-        winners = {}
-        rejections = {}
+        # ⚠️ CANARY: if daily download returned nothing, abort
+        if daily_data is None or (hasattr(daily_data, 'empty') and daily_data.empty):
+            logger.error(
+                "Step 2/7 FAILED: Daily download returned no data. "
+                "Yahoo may be rate-limiting — wait 15-30 minutes. ABORTING."
+            )
+            return self._empty_result(t0, market_status, total_scanned=len(tickers))
+
+        logger.info("Step 2/7 complete: Daily downloads finished")
+
+        # ── Step 3: Apply DAILY-ONLY filters ──
+        logger.info(f"Step 3/7: Applying daily filters ({market_status} mode)...")
+        daily_winners = {}
+        daily_rejections = {}
 
         for ticker in tickers:
             daily_df = self.provider.extract_ticker_df(daily_data, ticker)
-            hourly_df = self.provider.extract_ticker_df(hourly_data, ticker)
-
-            if daily_df is None or hourly_df is None:
+            if daily_df is None:
                 continue
 
-            passed, result = self._apply_filters(
-                ticker, daily_df, hourly_df, market_status
-            )
+            passed, result = self._apply_daily_filters(ticker, daily_df, market_status)
 
             if passed:
-                winners[ticker] = result
+                daily_winners[ticker] = result
                 logger.debug(
                     f"  ✅ {ticker:6s}  ATRP {result['atrp']:>5.1f}%  "
                     f"RVOL {result['rvol']:>5.2f}x  52w {result['pos52w']:>3d}%"
                 )
             else:
-                # Track rejection reasons
                 key = result.split("(")[0].split("<")[0].strip()
-                rejections[key] = rejections.get(key, 0) + 1
+                daily_rejections[key] = daily_rejections.get(key, 0) + 1
 
-        logger.info(f"Step 3 complete: {len(winners)} passed / {len(tickers)} scanned")
-        for reason, count in sorted(rejections.items(), key=lambda x: -x[1])[:8]:
+        logger.info(
+            f"Step 3/7 complete: {len(daily_winners)} passed daily filters "
+            f"/ {len(tickers)} scanned"
+        )
+        for reason, count in sorted(daily_rejections.items(), key=lambda x: -x[1])[:8]:
             logger.info(f"  {count:>4d}×  {reason}")
 
-        # ⚠️ GARBAGE: release large DataFrames before enrichment
-        del daily_data, hourly_data
-        gc.collect()
-        logger.debug("Released bulk DataFrames from memory")
+        if not daily_winners:
+            logger.warning("No tickers passed daily filters. Returning empty result.")
+            del daily_data
+            gc.collect()
+            return self._empty_result(t0, market_status, total_scanned=len(tickers))
 
-        # ── Step 4: Enrich winners ──
-        logger.info(f"Step 4: Enriching {len(winners)} winners (with {ENRICHMENT_DELAY}s delays)...")
+        # ⚠️ GARBAGE: release daily data BEFORE downloading hourly
+        del daily_data
+        gc.collect()
+        logger.debug("Released daily DataFrames from memory")
+
+        # ── Step 4: Download HOURLY ONLY for daily winners ──
+        daily_winner_tickers = list(daily_winners.keys())
+        logger.info(
+            f"Step 4/7: Downloading HOURLY data for {len(daily_winner_tickers)} "
+            f"daily winners (NOT all {len(tickers)} candidates)"
+        )
+        hourly_data = await self.provider.download_hourly(daily_winner_tickers)
+
+        hourly_failed = (
+            hourly_data is None
+            or (hasattr(hourly_data, 'empty') and hourly_data.empty)
+        )
+        if hourly_failed:
+            logger.warning(
+                "Step 4/7: Hourly download returned no data. "
+                "Skipping hourly filters (degraded mode)."
+            )
+        else:
+            logger.info("Step 4/7 complete: Hourly downloads finished")
+
+        # ── Step 5: Apply HOURLY filters ──
+        logger.info(f"Step 5/7: Applying hourly filters to {len(daily_winners)} daily winners...")
+        winners = {}
+        hourly_rejections = {}
+
+        for ticker, daily_filter_data in daily_winners.items():
+            if hourly_failed:
+                # Degraded mode: skip hourly filters, pass through daily winners
+                winners[ticker] = daily_filter_data
+                continue
+
+            hourly_df = self.provider.extract_ticker_df(hourly_data, ticker)
+            if hourly_df is None:
+                hourly_rejections["No hourly data"] = (
+                    hourly_rejections.get("No hourly data", 0) + 1
+                )
+                continue
+
+            passed, result = self._apply_hourly_filters(
+                ticker, hourly_df, daily_filter_data
+            )
+
+            if passed:
+                winners[ticker] = result
+                logger.debug(f"  ✅ {ticker:6s}  Passed hourly filters")
+            else:
+                key = result.split("(")[0].split("<")[0].strip()
+                hourly_rejections[key] = hourly_rejections.get(key, 0) + 1
+
+        logger.info(
+            f"Step 5/7 complete: {len(winners)} passed hourly filters "
+            f"/ {len(daily_winners)} daily winners"
+        )
+        for reason, count in sorted(hourly_rejections.items(), key=lambda x: -x[1])[:5]:
+            logger.info(f"  {count:>4d}×  {reason}")
+
+        # ⚠️ GARBAGE: release hourly data before enrichment
+        if not hourly_failed:
+            del hourly_data
+        gc.collect()
+        logger.debug("Released hourly DataFrames from memory")
+
+        # ── Step 6: Enrich winners ──
+        logger.info(
+            f"Step 6/7: Enriching {len(winners)} winners "
+            f"(with {ENRICHMENT_DELAY}s delays)..."
+        )
         results = []
         enrich_count = 0
 
@@ -170,7 +251,7 @@ class MarketScanner:
             except Exception as e:
                 logger.warning(f"  ❌ {ticker}: Enrichment failed — {e}")
 
-        # ── Step 5: Sort by quality (RVOL × ATRP) ──
+        # ── Step 7: Sort by quality (RVOL × ATRP) ──
         results.sort(
             key=lambda s: (s.rvol or 0) * (s.atrp or 0),
             reverse=True,
@@ -179,6 +260,10 @@ class MarketScanner:
         duration = time.time() - t0
         logger.info(f"{'='*60}")
         logger.info(f"  SCAN COMPLETE: {len(results)} stocks in {duration:.1f}s")
+        logger.info(
+            f"  Pipeline: {len(tickers)} screened → {len(daily_winners)} daily "
+            f"→ {len(winners)} hourly → {len(results)} enriched"
+        )
         logger.info(f"{'='*60}")
 
         return ScanResult(
@@ -190,17 +275,36 @@ class MarketScanner:
             stocks=results,
         )
 
-    # ── Private: Filter Logic ────────────────────────────────────
+    def _empty_result(
+        self, t0: float, market_status: str, total_scanned: int
+    ) -> ScanResult:
+        """Helper to return an empty ScanResult without repeating boilerplate."""
+        return ScanResult(
+            timestamp=datetime.now(timezone.utc),
+            duration_seconds=time.time() - t0,
+            market_status=market_status,
+            total_scanned=total_scanned,
+            passed_count=0,
+            stocks=[],
+        )
 
-    def _apply_filters(
+    # ── Private: Daily-Only Filters (split from old _apply_filters) ──
+
+    def _apply_daily_filters(
         self,
         ticker: str,
         daily_df,
-        hourly_df,
         market_status: str,
     ) -> tuple[bool, any]:
         """
-        Apply all technical filters to a single stock.
+        Apply daily-only technical filters to a single stock.
+        These filters use only daily OHLCV data — no hourly data needed.
+
+        Filters applied:
+          1. IPO / history check (120+ trading days ≈ 6 months)
+          2. ATRP 2.5% – 6.0%
+          3. RVOL > threshold (time-adjusted for live market)
+          4. 52-week position not in top/bottom 10%
 
         Returns:
             (True, data_dict) if passed, or (False, reason_string) if rejected.
@@ -239,6 +343,49 @@ class MarketScanner:
         if rvol < rvol_floor:
             return False, f"RVOL {rvol:.2f}"
 
+        # ── 52-week position: not in top/bottom 10% ──
+        pos = check_52w_position(closes)
+        if pos > 0.90:
+            return False, f"52w high zone ({pos:.0%})"
+        if pos < 0.10:
+            return False, f"52w low zone ({pos:.0%})"
+
+        # ── All daily filters passed ──
+        atr_series = calc_atr(daily_df["High"], daily_df["Low"], closes)
+        return True, {
+            "atrp": round(atrp, 2),
+            "atr": round(float(atr_series.iloc[-1]), 2),
+            "rvol": round(rvol, 2),
+            "pos52w": round(pos * 100),
+            "price": round(float(closes.iloc[-1]), 2),
+            "hi52": round(float(closes.max()), 2),
+            "lo52": round(float(closes.min()), 2),
+        }
+
+    # ── Private: Hourly Filters (new — split from _apply_filters) ──
+
+    def _apply_hourly_filters(
+        self,
+        ticker: str,
+        hourly_df,
+        daily_filter_data: dict,
+    ) -> tuple[bool, any]:
+        """
+        Apply hourly-based technical filters to a single stock.
+        Only called on stocks that already passed daily filters.
+
+        Filters applied:
+          1. 4H: Price > 50 EMA (aggregate hourly → 4H first)
+          2. 1H: EMA 20 > EMA 50
+
+        Args:
+            ticker: Stock symbol
+            hourly_df: 1-hour OHLCV DataFrame
+            daily_filter_data: Data dict from _apply_daily_filters (passed through)
+
+        Returns:
+            (True, merged_data_dict) if passed, or (False, reason_string) if rejected.
+        """
         # ── 4H: Price > 50 EMA ──
         h4 = aggregate_4h(hourly_df)
         if len(h4) < 55:
@@ -258,24 +405,8 @@ class MarketScanner:
         if ema20_1h <= ema50_1h:
             return False, "1H EMA20 < EMA50"
 
-        # ── 52-week position: not in top/bottom 10% ──
-        pos = check_52w_position(closes)
-        if pos > 0.90:
-            return False, f"52w high zone ({pos:.0%})"
-        if pos < 0.10:
-            return False, f"52w low zone ({pos:.0%})"
-
-        # ── All passed ──
-        atr_series = calc_atr(daily_df["High"], daily_df["Low"], closes)
-        return True, {
-            "atrp": round(atrp, 2),
-            "atr": round(float(atr_series.iloc[-1]), 2),
-            "rvol": round(rvol, 2),
-            "pos52w": round(pos * 100),
-            "price": round(float(closes.iloc[-1]), 2),
-            "hi52": round(float(closes.max()), 2),
-            "lo52": round(float(closes.min()), 2),
-        }
+        # ── All hourly filters passed — return daily data unchanged ──
+        return True, daily_filter_data
 
     # ── Private: Enrichment ──────────────────────────────────────
 
