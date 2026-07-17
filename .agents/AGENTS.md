@@ -131,7 +131,7 @@ Reference implementation: `scanner/pro_scan.py` (523 lines)
 - **Do NOT pass `session=`** to `yf.download()` or `yf.Ticker()` — yfinance 1.x manages its own sessions/cookies. Custom sessions fight internal rate-limit handling and CAUSE blocks.
 - **Use `Ticker.fast_info`** for market cap (reliable). `Ticker.info` is unstable — wrap in try/except, use only for sector/industry/float.
 - **Single-ticker `yf.download()`** returns flat columns (not MultiIndex). Handle both formats in `extract_ticker_df()`.
-- **Batch size**: Max 10 tickers per `yf.download()` call, 5s delay between batches.
+- **Batch size**: Max 20 tickers per `yf.download()` call, 3s delay between batches.
 - **Always** use `threads=False` — parallel connections trigger rate limits.
 - **Enrichment**: 2s delay between `yf.Ticker` calls. Skip failed tickers, never crash the scan.
 - **Canary check**: First batch must succeed or abort the entire scan — don't burn quota on a bad IP.

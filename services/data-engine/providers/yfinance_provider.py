@@ -36,9 +36,9 @@ logger = logging.getLogger(__name__)
 # ── Safety Constants ─────────────────────────────────────────────
 FINVIZ_DELAY_MIN = 1.0       # Minimum seconds between Finviz calls
 FINVIZ_DELAY_MAX = 2.5       # Maximum seconds between Finviz calls
-YF_BATCH_SIZE = 10            # Max tickers per yf.download() call (very conservative)
-YF_BATCH_DELAY = 5.0          # Seconds between download batches (safe gap)
-YF_INFO_DELAY = 2.0           # Seconds between Ticker.info calls
+YF_BATCH_SIZE = 20            # Max tickers per yf.download() call
+YF_BATCH_DELAY = 3.0          # Seconds between download batches
+YF_INFO_DELAY = 1.5           # Seconds between Ticker.info calls
 MAX_RETRIES = 3               # Max retries for API calls
 RETRY_BACKOFF = [1, 2, 4]     # Backoff schedule in seconds
 
