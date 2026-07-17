@@ -27,6 +27,14 @@
 → Fix it, test with 1 item, only then retry
 → Never burn tokens/time/rate-limits guessing
 
+### G3.5: Consult Before Fixing
+**When:** An error occurs and you have a proposed fix
+→ Do NOT apply the fix immediately
+→ Show the user: (1) what went wrong, (2) your proposed fix, (3) the best alternative approach
+→ Present both options side by side — let the user choose
+→ Only apply after the user says which one to use
+→ This prevents wasted tokens on wrong guesses and gives the user control
+
 ### G4: Verify Library Before Use
 **When:** Using any library for the first time, or resuming work after a break
 → Run `library.__version__` and compare with requirements.txt
