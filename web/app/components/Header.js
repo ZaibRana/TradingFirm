@@ -1,10 +1,40 @@
 "use client";
 
+import { useState, useEffect } from "react";
 import { useAuth } from "@/lib/firebase/auth-context";
+
+const BACKEND = process.env.NEXT_PUBLIC_DATA_ENGINE_URL || "http://localhost:8001";
 
 export default function Header() {
   const { user, loading, isFirebaseReady, signInWithGoogle, signOut } =
     useAuth();
+
+  const [marketStatus, setMarketStatus] = useState({ status: "unknown", display: "" });
+
+  useEffect(() => {
+    fetch(`${BACKEND}/market/status`)
+      .then((r) => r.json())
+      .then((data) => setMarketStatus(data))
+      .catch(() => setMarketStatus({ status: "unknown", display: "Unavailable" }));
+
+    // Refresh every 60 seconds
+    const interval = setInterval(() => {
+      fetch(`${BACKEND}/market/status`)
+        .then((r) => r.json())
+        .then((data) => setMarketStatus(data))
+        .catch(() => {});
+    }, 60000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const isOpen = marketStatus.status === "market_open";
+  const statusLabel = isOpen
+    ? "Market Open"
+    : marketStatus.status === "pre_market"
+      ? "Pre-Market"
+      : marketStatus.status === "post_market"
+        ? "After Hours"
+        : "Market Closed";
 
   return (
     <header className="header">
@@ -18,8 +48,11 @@ export default function Header() {
 
       <div className="header__right">
         <div className="header__market-status">
-          <span className="header__dot header__dot--closed" id="market-dot" />
-          <span className="header__market-label">Market Closed</span>
+          <span className={`header__dot header__dot--${isOpen ? "open" : "closed"}`} id="market-dot" />
+          <span className="header__market-label">{statusLabel}</span>
+          {marketStatus.display && (
+            <span className="header__market-time">{marketStatus.display}</span>
+          )}
         </div>
 
         {!loading && isFirebaseReady && (
@@ -108,6 +141,12 @@ export default function Header() {
           gap: 6px;
           font-size: 0.8rem;
           color: var(--text-secondary);
+        }
+
+        .header__market-time {
+          font-size: 0.7rem;
+          color: var(--text-muted);
+          margin-left: 4px;
         }
 
         .header__dot {

@@ -3,7 +3,7 @@ TradingFirm — Data Engine (Service 1)
 
 FastAPI application with endpoints:
   POST /scan/run       — trigger a new market scan (background)
-  GET  /scan/results   — latest scan results (cached or DB)
+  GET  /scan/results   — latest scan results (cached or in-memory)
   GET  /scan/history   — past scan metadata
   GET  /scan/status    — current scan status (idle/running/completed)
   GET  /stocks/{ticker} — enriched data for one stock
@@ -22,16 +22,7 @@ from datetime import datetime, timezone
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from cache import (
-    cache_scan_result,
-    create_redis,
-    get_cached_scan,
-    get_scan_status,
-    publish_scan_complete,
-    set_scan_status,
-)
 from config import settings
-from db import create_db_pool, get_latest_scan, get_scan_history, save_scan_result, upsert_stocks
 from providers import get_provider
 from scanners.market_scanner import MarketScanner
 from scanners.market_status import get_market_status
@@ -47,6 +38,29 @@ logging.basicConfig(
 logger = logging.getLogger("data-engine")
 
 
+# ── In-Memory Fallback (when Redis/Postgres unavailable) ─────────
+
+class InMemoryStore:
+    """Simple in-memory store for scan results when Redis/DB unavailable."""
+
+    def __init__(self):
+        self.scan_status = {"status": "idle", "message": "No scan running"}
+        self.scan_result = None
+        self.last_scan_time = 0.0
+
+    def set_status(self, status: str, message: str):
+        self.scan_status = {"status": status, "message": message}
+
+    def get_status(self) -> dict:
+        return self.scan_status
+
+    def set_result(self, result: dict):
+        self.scan_result = result
+
+    def get_result(self) -> dict | None:
+        return self.scan_result
+
+
 # ── Lifespan (startup/shutdown) ──────────────────────────────────
 
 @asynccontextmanager
@@ -54,20 +68,26 @@ async def lifespan(app: FastAPI):
     """Initialize DB pool and Redis on startup, close on shutdown."""
     logger.info("Starting Data Engine...")
 
-    # Startup
-    try:
-        app.state.db_pool = await create_db_pool()
-        logger.info("✅ Database pool ready")
-    except Exception as e:
-        logger.error(f"❌ Database connection failed: {e}")
-        app.state.db_pool = None
+    # In-memory store (always available)
+    app.state.memory = InMemoryStore()
 
+    # Redis (optional)
     try:
+        from cache import create_redis
         app.state.redis = await create_redis()
         logger.info("✅ Redis connection ready")
     except Exception as e:
-        logger.error(f"❌ Redis connection failed: {e}")
+        logger.warning(f"⚠️  Redis unavailable (using in-memory): {e}")
         app.state.redis = None
+
+    # Database (optional)
+    try:
+        from db import create_db_pool
+        app.state.db_pool = await create_db_pool()
+        logger.info("✅ Database pool ready")
+    except Exception as e:
+        logger.warning(f"⚠️  Database unavailable (results not persisted): {e}")
+        app.state.db_pool = None
 
     app.state.provider = get_provider(settings.data_provider)
     logger.info(f"✅ Data provider: {app.state.provider.provider_name}")
@@ -86,10 +106,6 @@ async def lifespan(app: FastAPI):
     if app.state.redis:
         await app.state.redis.close()
         logger.info("Redis connection closed")
-    # Close the requests.Session used by yfinance provider
-    if hasattr(app.state, 'provider') and hasattr(app.state.provider, '_session'):
-        app.state.provider._session.close()
-        logger.info("Provider HTTP session closed")
 
 
 # ── App ──────────────────────────────────────────────────────────
@@ -97,7 +113,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="TradingFirm — Data Engine",
     description="Market data scanning, indicators, and fundamentals",
-    version="0.1.0",
+    version="0.2.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
@@ -120,10 +136,12 @@ async def _run_scan_background(
     price_max: float,
     advanced: bool,
 ):
-    """Background task: run full scan, save to DB, cache, publish event."""
+    """Background task: run full scan, save to DB/cache/memory."""
     try:
         # Mark scan as running
+        app_state.memory.set_status("running", "Scan in progress...")
         if app_state.redis:
+            from cache import set_scan_status
             await set_scan_status(app_state.redis, "running", "Scan in progress...")
 
         # Run the scanner
@@ -135,9 +153,16 @@ async def _run_scan_background(
 
         result_dict = result.model_dump(mode="json", by_alias=True)
 
-        # Save to database
+        # Always save to in-memory store
+        app_state.memory.set_result(result_dict)
+        app_state.memory.set_status(
+            "completed", f"Scan complete: {result.passed_count} stocks found"
+        )
+
+        # Save to database (optional)
         if app_state.db_pool:
             try:
+                from db import save_scan_result, upsert_stocks
                 await save_scan_result(
                     pool=app_state.db_pool,
                     scanned_at=result.timestamp,
@@ -147,14 +172,14 @@ async def _run_scan_background(
                     duration_seconds=result.duration_seconds,
                     stocks=result_dict["stocks"],
                 )
-                # Upsert stock records
                 await upsert_stocks(app_state.db_pool, result_dict["stocks"])
             except Exception as e:
                 logger.error(f"DB save failed: {e}")
 
-        # Cache in Redis
+        # Cache in Redis (optional)
         if app_state.redis:
             try:
+                from cache import cache_scan_result, publish_scan_complete, set_scan_status
                 await cache_scan_result(app_state.redis, result_dict)
                 await publish_scan_complete(app_state.redis, result_dict)
                 await set_scan_status(
@@ -169,8 +194,10 @@ async def _run_scan_background(
 
     except Exception as e:
         logger.error(f"Background scan failed: {e}", exc_info=True)
+        app_state.memory.set_status("failed", str(e))
         if app_state.redis:
             try:
+                from cache import set_scan_status
                 await set_scan_status(app_state.redis, "failed", str(e))
             except Exception:
                 pass
@@ -185,7 +212,7 @@ async def health():
         "service": settings.service_name,
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": "0.1.0",
+        "version": "0.2.0",
         "provider": settings.data_provider,
         "db_connected": app.state.db_pool is not None,
         "redis_connected": app.state.redis is not None,
@@ -219,33 +246,31 @@ async def scan_run(
     """
     Trigger a new market scan in the background.
 
-    A full scan takes 1–5 minutes. This endpoint returns immediately
+    A full scan takes ~6 minutes. This endpoint returns immediately
     with status 202. Poll GET /scan/status to check progress,
     then GET /scan/results for data.
     """
-    # Check if scan is already running
-    if app.state.redis:
-        status = await get_scan_status(app.state.redis)
-        if status.get("status") == "running":
-            return {
-                "status": "already_running",
-                "message": "A scan is already in progress. Check GET /scan/status.",
-            }
+    # Check if scan is already running (memory or Redis)
+    mem_status = app.state.memory.get_status()
+    if mem_status.get("status") == "running":
+        return {
+            "status": "already_running",
+            "message": "A scan is already in progress. Check GET /scan/status.",
+        }
 
-        # ⚠️ RATE LIMIT: 10-minute cooldown between scans
-        last_scan_time = await app.state.redis.get("tf:cache:last_scan_time")
-        if last_scan_time:
-            elapsed = _time.time() - float(last_scan_time)
-            if elapsed < 600:  # 10 minutes
-                remaining = int(600 - elapsed)
-                return {
-                    "status": "cooldown",
-                    "message": f"Scan cooldown: {remaining}s remaining. Min 10 minutes between scans.",
-                    "retry_after_seconds": remaining,
-                }
+    # ⚠️ RATE LIMIT: 10-minute cooldown between scans
+    now = _time.time()
+    elapsed = now - app.state.memory.last_scan_time
+    if app.state.memory.last_scan_time > 0 and elapsed < 600:
+        remaining = int(600 - elapsed)
+        return {
+            "status": "cooldown",
+            "message": f"Scan cooldown: {remaining}s remaining. Min 10 minutes between scans.",
+            "retry_after_seconds": remaining,
+        }
 
-        # Record scan start time
-        await app.state.redis.set("tf:cache:last_scan_time", str(_time.time()), ex=3600)
+    # Record scan start time
+    app.state.memory.last_scan_time = now
 
     # Launch background scan
     background_tasks.add_task(
@@ -270,11 +295,12 @@ async def scan_results(
     """
     Get the latest scan results.
 
-    Checks Redis cache first (fast), falls back to database.
+    Checks Redis cache first → in-memory → database fallback.
     """
-    # Try cache first
+    # Try Redis cache first
     if use_cache and app.state.redis:
         try:
+            from cache import get_cached_scan
             cached = await get_cached_scan(app.state.redis)
             if cached:
                 cached["source"] = "cache"
@@ -282,16 +308,22 @@ async def scan_results(
         except Exception as e:
             logger.warning(f"Cache read failed: {e}")
 
+    # Try in-memory store
+    mem_result = app.state.memory.get_result()
+    if mem_result:
+        mem_result["source"] = "memory"
+        return mem_result
+
     # Fall back to database
     if app.state.db_pool:
         try:
+            from db import get_latest_scan
             db_result = await get_latest_scan(app.state.db_pool)
             if db_result:
                 db_result["source"] = "database"
                 return db_result
         except Exception as e:
             logger.error(f"DB read failed: {e}")
-            raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
     # No results anywhere
     return {
@@ -307,9 +339,10 @@ async def scan_history(
 ):
     """List past scan runs (metadata only, no stocks array)."""
     if not app.state.db_pool:
-        raise HTTPException(status_code=503, detail="Database not connected")
+        return {"scans": [], "count": 0, "message": "Database not connected"}
 
     try:
+        from db import get_scan_history
         history = await get_scan_history(app.state.db_pool, limit=limit)
         return {"scans": history, "count": len(history)}
     except Exception as e:
@@ -320,14 +353,17 @@ async def scan_history(
 @app.get("/scan/status")
 async def scan_status():
     """Check if a scan is currently running."""
-    if not app.state.redis:
-        return {"status": "unknown", "message": "Redis not connected"}
+    # Try Redis first
+    if app.state.redis:
+        try:
+            from cache import get_scan_status
+            status = await get_scan_status(app.state.redis)
+            return status
+        except Exception:
+            pass
 
-    try:
-        status = await get_scan_status(app.state.redis)
-        return status
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    # Fall back to in-memory
+    return app.state.memory.get_status()
 
 
 @app.get("/stocks/{ticker}")

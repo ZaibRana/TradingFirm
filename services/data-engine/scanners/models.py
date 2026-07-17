@@ -43,11 +43,13 @@ class ScanResult(BaseModel):
     """Complete scan run output."""
     scanner: str = "professional"
     timestamp: datetime
-    duration_seconds: float = 0.0
-    market_status: str = ""
-    total_scanned: int = 0
-    passed_count: int = 0
+    duration_seconds: float = Field(0.0, alias="durationSeconds")
+    market_status: str = Field("", alias="marketStatus")
+    total_scanned: int = Field(0, alias="totalScanned")
+    passed_count: int = Field(0, alias="passedCount")
     stocks: list[StockResult] = []
+
+    model_config = {"populate_by_name": True}
 
 
 class ScanRequest(BaseModel):
