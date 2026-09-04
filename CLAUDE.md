@@ -18,6 +18,15 @@ TradingFirm — a day-trading system that screens the market, applies technical 
 - **G7 — Tests alongside code.** Every module gets a unit test; tests must not call external APIs (mock the provider).
 - **G8 — Clean up memory.** `del` DataFrames + `gc.collect()` after use; never store raw DataFrames in `app.state`.
 
+## Docs discipline
+
+- **Active plan: `docs/plan-analyst-watcher.md`.** Read it before starting any part. Its §0 decisions are binding — do not re-litigate them. The user says which part to build each session.
+- **Plan files are read-only** once approved. If a part proves the plan wrong, do not edit the plan — record the change in `docs/decisions.md` (with "supersedes D-n") and note it in `docs/progress.md`.
+- **`docs/overview.md` describes what exists now**, never future state. Update it when a part changes the architecture, adds a service or endpoint, or adds a third-party API or library.
+- **`docs/decisions.md` is append-only.** One entry per decision: date, decision, why, what it supersedes.
+- **`docs/progress.md` tracks parts.** One row per part: status, commit hash, date, notes. Update it at the end of every part, before the commit.
+- **Never delete a plan file.** Superseded plans get a status banner at the top and stay in `docs/` (e.g. `docs/plan-x.md`).
+
 ## Commands
 
 ### Data engine (Python)

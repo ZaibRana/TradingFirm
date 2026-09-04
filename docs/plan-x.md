@@ -2,6 +2,8 @@
 
 Status: **proposal, no code written.** Every phase below still goes through G1 (3-sentence spec, your approval) before files are touched.
 
+> **Superseded** by [`docs/plan-analyst-watcher.md`](plan-analyst-watcher.md) for product direction. Kept as reference — §5 (disposable Docker environments) is parked to that plan's Phase 9. Do not build from this file directly.
+
 Sources: `docs/overview.md` (what exists), `Documents/system_e_hybrid_proposal.md` + `Documents/final_comparison_and_conclusions.md` (what we want), `Documents/architecture_desig/part_1..8` (how the target is designed), `.agents/AGENTS.md` (rules).
 
 ---

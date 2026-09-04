@@ -37,6 +37,16 @@ Thumbs.db
 # ── Scan Results (generated) ──
 pro_results.json
 scanner/pro_results.json
+scanner/results.json
+scanner/status.json
+
+# ── Test artifacts ──
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Claude Code (per-machine permissions) ──
+.claude/settings.local.json
 
 # ── Antigravity agent data ──
 .gemini/
