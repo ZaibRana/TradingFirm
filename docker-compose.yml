@@ -8,6 +8,7 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./infra/supabase/migrations:/docker-entrypoint-initdb.d:ro
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-tradingfirm}
       POSTGRES_USER: ${POSTGRES_USER:-tf_user}
