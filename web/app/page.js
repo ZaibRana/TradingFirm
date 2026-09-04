@@ -3,19 +3,9 @@
 import { useState, useEffect } from "react";
 import Header from "./components/Header";
 import SectorTabs from "./components/SectorTabs";
-import StockCard from "./components/StockCard";
 import ProStockCard from "./components/ProStockCard";
 
 export default function Home() {
-  // Scanner tab
-  const [activeScanner, setActiveScanner] = useState("pro");
-
-  // Scanner 1 state
-  const [s1Stocks, setS1Stocks] = useState([]);
-  const [s1Scanning, setS1Scanning] = useState(false);
-  const [s1Progress, setS1Progress] = useState("");
-  const [s1Info, setS1Info] = useState(null);
-
   // Professional Scanner state
   const [proStocks, setProStocks] = useState([]);
   const [proScanning, setProScanning] = useState(false);
@@ -28,27 +18,13 @@ export default function Home() {
   // Sector filter
   const [activeSector, setActiveSector] = useState("all");
 
-  // Current scanner's stocks
-  const currentStocks = activeScanner === "pro" ? proStocks : s1Stocks;
   const filteredStocks =
     activeSector === "all"
-      ? currentStocks
-      : currentStocks.filter((s) => s.sectorId === activeSector);
+      ? proStocks
+      : proStocks.filter((s) => s.sectorId === activeSector);
 
   // ─── Load cached results on mount ─────────────────────────────
   useEffect(() => {
-    // Scanner 1
-    fetch("/api/scanner/run")
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.success && data.stocks?.length > 0) {
-          setS1Stocks(mapS1Results(data));
-          setS1Info(data);
-        }
-      })
-      .catch(() => {});
-
-    // Pro Scanner
     fetch("/api/scanner/pro")
       .then((r) => r.json())
       .then((data) => {
@@ -61,56 +37,13 @@ export default function Home() {
   }, []);
 
   // ─── Mappers ──────────────────────────────────────────────────
-  const mapS1Results = (data) =>
-    (data.stocks || []).map((s) => ({
-      symbol: s.symbol,
-      name: s.name || "",
-      price: s.price || 0,
-      change: 0,
-      changePercent: 0,
-      volume: 0,
-      avgVolume: 0,
-      high52w: s.fiftyTwoWeekHigh || 0,
-      low52w: s.fiftyTwoWeekLow || 0,
-      marketCap: s.marketCap || 0,
-      atr: s.atr || 0,
-      adx: s.adx || 0,
-      avgRange3d: s.avgRange3d || 0,
-      rvol: 0,
-      sector: s.sector || "",
-      sectorId: (s.sector || "other").toLowerCase().replace(/\s+/g, "_"),
-      industry: s.industry || "",
-      analystRating: s.analystRating || "",
-      analystTargetPrice: s.analystTargetPrice || 0,
-      options: s.options || {},
-    }));
-
   const mapProResults = (data) =>
     (data.stocks || []).map((s) => ({
       ...s,
       sectorId: (s.sector || "other").toLowerCase().replace(/\s+/g, "_"),
     }));
 
-  // ─── Scan Handlers ────────────────────────────────────────────
-  const handleS1Scan = async () => {
-    setS1Scanning(true);
-    setS1Progress("Running Smart Scanner… ~3 min");
-    try {
-      const res = await fetch("/api/scanner/run", { method: "POST" });
-      const data = await res.json();
-      if (!data.success) throw new Error(data.error);
-      setS1Stocks(mapS1Results(data));
-      setS1Info(data);
-      setS1Progress(`${data.totalScanned} scanned → ${data.passedCount} passed`);
-      setTimeout(() => setS1Progress(""), 5000);
-    } catch (err) {
-      setS1Progress(`Error: ${err.message}`);
-      setTimeout(() => setS1Progress(""), 5000);
-    } finally {
-      setS1Scanning(false);
-    }
-  };
-
+  // ─── Scan Handler ─────────────────────────────────────────────
   const handleProScan = async () => {
     setProScanning(true);
     setProProgress(proAdvanced
@@ -140,101 +73,67 @@ export default function Home() {
     }
   };
 
-  // Current scanner helpers
-  const isScanning = activeScanner === "pro" ? proScanning : s1Scanning;
-  const progress = activeScanner === "pro" ? proProgress : s1Progress;
-  const info = activeScanner === "pro" ? proInfo : s1Info;
-  const handleScan = activeScanner === "pro" ? handleProScan : handleS1Scan;
-
-  const subtitle = progress
-    ? progress
-    : info
-      ? `${info.passedCount} results · ${info.totalScanned} scanned · ${info.marketStatus || ""}${info.duration ? " · " + info.duration.split(".")[0] : ""}`
+  const subtitle = proProgress
+    ? proProgress
+    : proInfo
+      ? `${proInfo.passedCount} results · ${proInfo.totalScanned} scanned · ${proInfo.marketStatus || ""}${proInfo.duration ? " · " + proInfo.duration.split(".")[0] : ""}`
       : "Run scanner to find today's tradeable stocks";
 
   return (
     <>
       <Header />
       <main className="dashboard">
-        {/* Scanner Type Tabs */}
-        <div className="scanner-tabs">
-          <button
-            className={`scanner-tab ${activeScanner === "pro" ? "scanner-tab--active" : ""}`}
-            onClick={() => { setActiveScanner("pro"); setActiveSector("all"); }}
-          >
-            <span className="scanner-tab__icon">⚡</span>
-            Professional Scanner
-            {proStocks.length > 0 && (
-              <span className="scanner-tab__count">{proStocks.length}</span>
-            )}
-          </button>
-          <button
-            className={`scanner-tab ${activeScanner === "smart" ? "scanner-tab--active" : ""}`}
-            onClick={() => { setActiveScanner("smart"); setActiveSector("all"); }}
-          >
-            <span className="scanner-tab__icon">🔍</span>
-            Smart Scanner
-            {s1Stocks.length > 0 && (
-              <span className="scanner-tab__count">{s1Stocks.length}</span>
-            )}
-          </button>
-        </div>
-
         {/* Controls */}
         <section className="scanner-controls">
           <div className="scanner-controls__left">
-            <h2 className="scanner-controls__title">
-              {activeScanner === "pro" ? "Professional Day Trading" : "Smart Scanner"}
-            </h2>
+            <h2 className="scanner-controls__title">Professional Day Trading</h2>
             <p className="scanner-controls__subtitle">{subtitle}</p>
-            {activeScanner === "pro" && proInfo?.marketStatus === "weekend" && (
+            {proInfo?.marketStatus === "weekend" && (
               <p className="scanner-controls__warning">
                 ⚠ Weekend mode — RVOL relaxed to &gt;1.0, using Friday data
               </p>
             )}
           </div>
           <div className="scanner-controls__right">
-            {activeScanner === "pro" && (
-              <div className="pro-filters">
-                <div className="price-inputs">
-                  <span className="price-inputs__label">Price $</span>
-                  <input
-                    type="number"
-                    className="price-input"
-                    placeholder="Min"
-                    value={priceMin}
-                    onChange={(e) => setPriceMin(e.target.value)}
-                    min="0"
-                  />
-                  <span className="price-inputs__sep">–</span>
-                  <input
-                    type="number"
-                    className="price-input"
-                    placeholder="Max"
-                    value={priceMax}
-                    onChange={(e) => setPriceMax(e.target.value)}
-                    min="0"
-                  />
-                </div>
-                <label className="toggle-row">
-                  <span className="toggle-label">5M Filters</span>
-                  <div
-                    className={`toggle-switch ${proAdvanced ? "toggle-switch--on" : ""}`}
-                    onClick={() => setProAdvanced(!proAdvanced)}
-                    role="switch"
-                    aria-checked={proAdvanced}
-                  >
-                    <div className="toggle-knob" />
-                  </div>
-                </label>
+            <div className="pro-filters">
+              <div className="price-inputs">
+                <span className="price-inputs__label">Price $</span>
+                <input
+                  type="number"
+                  className="price-input"
+                  placeholder="Min"
+                  value={priceMin}
+                  onChange={(e) => setPriceMin(e.target.value)}
+                  min="0"
+                />
+                <span className="price-inputs__sep">–</span>
+                <input
+                  type="number"
+                  className="price-input"
+                  placeholder="Max"
+                  value={priceMax}
+                  onChange={(e) => setPriceMax(e.target.value)}
+                  min="0"
+                />
               </div>
-            )}
+              <label className="toggle-row">
+                <span className="toggle-label">5M Filters</span>
+                <div
+                  className={`toggle-switch ${proAdvanced ? "toggle-switch--on" : ""}`}
+                  onClick={() => setProAdvanced(!proAdvanced)}
+                  role="switch"
+                  aria-checked={proAdvanced}
+                >
+                  <div className="toggle-knob" />
+                </div>
+              </label>
+            </div>
             <button
-              className={`scan-btn ${isScanning ? "scan-btn--scanning" : ""}`}
-              onClick={handleScan}
-              disabled={isScanning}
+              className={`scan-btn ${proScanning ? "scan-btn--scanning" : ""}`}
+              onClick={handleProScan}
+              disabled={proScanning}
             >
-              {isScanning ? (
+              {proScanning ? (
                 <>
                   <span className="scan-btn__spinner" />
                   Scanning…
@@ -254,7 +153,7 @@ export default function Home() {
           <SectorTabs
             activeSector={activeSector}
             onSectorChange={setActiveSector}
-            stocks={currentStocks}
+            stocks={proStocks}
           />
         </section>
 
@@ -272,19 +171,13 @@ export default function Home() {
 
         {/* Stock Grid */}
         <section className="stock-grid">
-          {filteredStocks.map((stock) =>
-            activeScanner === "pro" ? (
-              <ProStockCard key={stock.symbol} stock={stock} />
-            ) : (
-              <StockCard key={stock.symbol} stock={stock} />
-            )
-          )}
-          {filteredStocks.length === 0 && !isScanning && (
+          {filteredStocks.map((stock) => (
+            <ProStockCard key={stock.symbol} stock={stock} />
+          ))}
+          {filteredStocks.length === 0 && !proScanning && (
             <div className="empty-state">
               <div className="empty-state__content">
-                <span className="empty-state__icon">
-                  {activeScanner === "pro" ? "⚡" : "📡"}
-                </span>
+                <span className="empty-state__icon">⚡</span>
                 <p className="empty-state__title">No stocks loaded</p>
                 <p className="empty-state__desc">
                   Click <strong>Run Scanner</strong> to discover
@@ -301,49 +194,6 @@ export default function Home() {
           max-width: 1280px;
           margin: 0 auto;
           padding: 24px 28px 60px;
-        }
-
-        /* Scanner Type Tabs */
-        .scanner-tabs {
-          display: flex;
-          gap: 8px;
-          margin-bottom: 24px;
-          border-bottom: 1px solid var(--border-color);
-          padding-bottom: 0;
-        }
-        .scanner-tab {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          padding: 12px 20px;
-          border: none;
-          background: none;
-          font-family: inherit;
-          font-size: 0.85rem;
-          font-weight: 600;
-          color: var(--text-muted);
-          cursor: pointer;
-          border-bottom: 2px solid transparent;
-          transition: all 0.2s ease;
-          margin-bottom: -1px;
-        }
-        .scanner-tab:hover {
-          color: var(--text-secondary);
-        }
-        .scanner-tab--active {
-          color: var(--accent-blue);
-          border-bottom-color: var(--accent-blue);
-        }
-        .scanner-tab__icon {
-          font-size: 1rem;
-        }
-        .scanner-tab__count {
-          background: var(--accent-blue);
-          color: #fff;
-          font-size: 0.7rem;
-          font-weight: 700;
-          padding: 2px 7px;
-          border-radius: 10px;
         }
 
         /* Controls */
@@ -562,7 +412,6 @@ export default function Home() {
           }
           .scan-btn { width: 100%; justify-content: center; }
           .stock-grid { grid-template-columns: 1fr; }
-          .scanner-tabs { overflow-x: auto; }
         }
       `}</style>
     </>

@@ -1,14 +1,10 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { useAuth } from "@/lib/firebase/auth-context";
 
 const BACKEND = process.env.NEXT_PUBLIC_DATA_ENGINE_URL || "http://localhost:8001";
 
 export default function Header() {
-  const { user, loading, isFirebaseReady, signInWithGoogle, signOut } =
-    useAuth();
-
   const [marketStatus, setMarketStatus] = useState({ status: "unknown", display: "" });
 
   useEffect(() => {
@@ -54,34 +50,6 @@ export default function Header() {
             <span className="header__market-time">{marketStatus.display}</span>
           )}
         </div>
-
-        {!loading && isFirebaseReady && (
-          <>
-            {user ? (
-              <div className="header__user">
-                <img
-                  src={user.photoURL || ""}
-                  alt=""
-                  className="header__avatar"
-                  referrerPolicy="no-referrer"
-                />
-                <span className="header__username">
-                  {user.displayName?.split(" ")[0]}
-                </span>
-                <button onClick={signOut} className="header__btn header__btn--ghost">
-                  Sign Out
-                </button>
-              </div>
-            ) : (
-              <button
-                onClick={signInWithGoogle}
-                className="header__btn header__btn--primary"
-              >
-                Sign In
-              </button>
-            )}
-          </>
-        )}
       </div>
 
       <style jsx>{`
@@ -163,56 +131,6 @@ export default function Header() {
 
         .header__dot--closed {
           background: var(--text-muted);
-        }
-
-        .header__user {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-        }
-
-        .header__avatar {
-          width: 28px;
-          height: 28px;
-          border-radius: 50%;
-          border: 1px solid var(--border-color-hover);
-        }
-
-        .header__username {
-          font-size: 0.85rem;
-          color: var(--text-secondary);
-        }
-
-        .header__btn {
-          padding: 6px 16px;
-          border-radius: var(--radius-sm);
-          font-size: 0.8rem;
-          font-weight: 600;
-          cursor: pointer;
-          transition: all var(--transition-fast);
-          border: none;
-          font-family: inherit;
-        }
-
-        .header__btn--primary {
-          background: var(--accent-blue);
-          color: #fff;
-        }
-
-        .header__btn--primary:hover {
-          opacity: 0.9;
-          transform: translateY(-1px);
-        }
-
-        .header__btn--ghost {
-          background: transparent;
-          color: var(--text-muted);
-          border: 1px solid var(--border-color);
-        }
-
-        .header__btn--ghost:hover {
-          color: var(--text-secondary);
-          border-color: var(--border-color-hover);
         }
 
         @keyframes pulse {

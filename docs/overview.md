@@ -49,25 +49,20 @@ pub/sub, never by writing into another service's tables.
 
 ## The scanner pipeline (the core of the system)
 
-The scanner is implemented **three separate times**, at different points in
-the project's evolution. They don't share code, and a fix in one does not
-propagate to the others:
+There is now **one live scanner path**:
+[`services/data-engine`](../services/data-engine), wired to the dashboard's
+"Pro Scanner" tab via
+[`web/app/api/scanner/pro/route.js`](../web/app/api/scanner/pro/route.js),
+which proxies to it.
 
-1. **[`scanner/pro_scan.py`](../scanner/pro_scan.py)** (+ `scan.py`,
-   `step1_finviz.py` … `step4_enrich.py`) — the original standalone Python
-   reference implementation, run from a local venv.
-2. **[`web/lib/scanner/*.js`](../web/lib/scanner) +
-   [`web/app/api/scanner/{discover,filter,technical}`](../web/app/api/scanner)** —
-   an independent JS reimplementation using `yahoo-finance2`, no Python
-   involved. It currently has no caller in the UI.
-3. **[`services/data-engine`](../services/data-engine)** — the FastAPI port
-   of `pro_scan.py`, and the one actually wired to the dashboard's "Pro
-   Scanner" tab via
-   [`web/app/api/scanner/pro/route.js`](../web/app/api/scanner/pro/route.js),
-   which proxies to it.
-   [`web/app/api/scanner/run/route.js`](../web/app/api/scanner/run/route.js)
-   is a legacy path that still `exec`s `scanner/scan.py` (path 1) directly
-   and is what the dashboard's "Scanner 1" tab uses.
+[`scanner/pro_scan.py`](../scanner/pro_scan.py) (+ `scan.py`,
+`step1_finviz.py` … `step4_enrich.py`) is the original standalone Python
+implementation `services/data-engine` was ported from. It stays in the repo
+as a **frozen reference** (see [`scanner/README.md`](../scanner/README.md))
+— not run by anything, not built on. The earlier JS reimplementation
+(`web/lib/scanner/*.js` + `web/app/api/scanner/{discover,filter,technical}`)
+and the "Scanner 1" tab/`/api/scanner/run` legacy exec path that duplicated
+it have been removed.
 
 ### Pipeline steps (data-engine / `pro_scan.py`)
 
@@ -124,21 +119,15 @@ FastAPI app. Key pieces:
 
 ## Web dashboard
 
-Next.js 15 / React 19 app in [`web/`](../web). `web/app/page.js` renders two
-scanner tabs side by side:
+Next.js 15 / React 19 app in [`web/`](../web). `web/app/page.js` renders the
+Pro Scanner: backed by `/api/scanner/pro`, which proxies to the
+`data-engine` FastAPI service — POST triggers a scan and polls
+`/scan/status` until it completes, then fetches `/scan/results`.
 
-- **"Scanner 1"** — backed by `/api/scanner/run`, which execs the standalone
-  `scanner/scan.py` (pipeline implementation #1) and reads its
-  `results.json`/`status.json` output files.
-- **"Pro Scanner"** (default) — backed by `/api/scanner/pro`, which proxies
-  to the `data-engine` FastAPI service (pipeline implementation #3): POST
-  triggers a scan and polls `/scan/status` until it completes, then fetches
-  `/scan/results`.
-
-`StockCard`/`ProStockCard` render individual candidates, `SectorTabs` filters
-by sector, and `Header` shows market status. Firebase config exists under
-`web/lib/firebase/` for auth, separate from the Supabase-flavored Postgres
-schema used by the backend services.
+`ProStockCard` renders individual candidates, `SectorTabs` filters by
+sector, and `Header` shows market status. There is no auth yet (D18 in
+`docs/plan-analyst-watcher.md` parks it deliberately); the earlier Firebase
+Google-sign-in scaffolding under `web/lib/firebase/` has been removed.
 
 ## Infrastructure
 
@@ -161,8 +150,6 @@ screen the market, filter candidates, enrich, display them. Everything
 downstream of that — actually generating trade signals (`signal-engine`),
 managing risk (`risk-shield`), and grading trades with AI (`ai-agent`) — is
 still an empty FastAPI scaffold with no business logic. The `scanner/`
-standalone scripts and the `web/lib/scanner` JS reimplementation are earlier
-or parallel iterations of the same pipeline that predate/duplicate the
-data-engine port; know which of the three you're editing (see
-[`.agents/AGENTS.md`](../.agents/AGENTS.md) for the full rationale) before
-changing scan logic.
+standalone scripts predate the data-engine port and stay only as a frozen
+reference — see [`.agents/AGENTS.md`](../.agents/AGENTS.md) for the full
+rationale.
