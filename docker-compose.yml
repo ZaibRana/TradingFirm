@@ -128,10 +128,14 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - data-engine
-      - signal-engine
-      - risk-shield
-      - ai-agent
+      data-engine:
+        condition: service_healthy
+      signal-engine:
+        condition: service_started
+      risk-shield:
+        condition: service_started
+      ai-agent:
+        condition: service_started
     environment:
       NEXT_PUBLIC_SUPABASE_URL: ${SUPABASE_URL:-}
       NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
