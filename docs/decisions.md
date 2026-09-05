@@ -27,8 +27,8 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 
 ## 2026-09-05 — Migrations must be idempotent; recording init-applied files is deferred
 
-**Decision:** Every file in `infra/supabase/migrations/` must be safe to run twice (`IF NOT EXISTS` on schemas/tables/indexes, `ADD COLUMN IF NOT EXISTS`, no plain `INSERT` seed rows). This is enforced by convention only, via a rule in `CLAUDE.md`. The root-cause fix — an init shell script that inserts every init-applied filename into `public.schema_migrations` so the fresh-volume and `migrate.sh` paths converge — is deferred until the first migration that cannot be made idempotent (e.g. seed data).
+**Decision:** Every file in `infra/supabase/migrations/` must be safe to run twice (`IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, no plain `INSERT` seeds). Enforced by convention (rule in `CLAUDE.md`). The root-cause fix — an init script that records init-applied filenames in `public.schema_migrations` — is deferred until the first migration that cannot be made idempotent (e.g. seed data).
 
-**Why:** Part 0.2 left two apply paths. A fresh `pgdata` volume runs the files through Postgres's `docker-entrypoint-initdb.d` without recording them; an existing volume goes through `scripts/migrate.sh`, which does record. The first `migrate.sh` run after a fresh boot therefore re-applies every file. Phase 1's only migration (`002_bars.sql`, one table + index) is naturally idempotent, so a convention covers it without adding infra now.
+**Why:** A fresh `pgdata` volume applies migrations via Postgres init without recording them; `scripts/migrate.sh` then re-applies all of them on its first run. Phase 1's only migration is one table + index, so a convention covers it without new infra.
 
-**Supersedes:** N/A — refines the Part 0.2 mechanism; does not change it.
+**Supersedes:** N/A — refines Part 0.2, does not change it.
