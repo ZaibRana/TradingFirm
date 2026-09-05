@@ -7,6 +7,7 @@ FastAPI application with endpoints:
   GET  /scan/history   — past scan metadata
   GET  /scan/status    — current scan status (idle/running/completed)
   GET  /stocks/{ticker} — enriched data for one stock
+  POST /stock/{ticker}/refresh — download + persist bars for one stock
   GET  /market/status  — current market session
   GET  /health         — health check
   GET  /               — service info
@@ -14,6 +15,7 @@ FastAPI application with endpoints:
 Port: 8001
 """
 
+import gc
 import logging
 import time as _time
 from contextlib import asynccontextmanager
@@ -47,6 +49,7 @@ class InMemoryStore:
         self.scan_status = {"status": "idle", "message": "No scan running"}
         self.scan_result = None
         self.last_scan_time = 0.0
+        self.last_refresh_time: dict[str, float] = {}
 
     def set_status(self, status: str, message: str):
         self.scan_status = {"status": status, "message": message}
@@ -59,6 +62,19 @@ class InMemoryStore:
 
     def get_result(self) -> dict | None:
         return self.scan_result
+
+    def get_refresh_cooldown(self, ticker: str, ttl: int) -> int | None:
+        """Seconds remaining in `ticker`'s refresh cooldown, or None if clear."""
+        last = self.last_refresh_time.get(ticker)
+        if last is None:
+            return None
+        elapsed = _time.time() - last
+        if elapsed < ttl:
+            return int(ttl - elapsed)
+        return None
+
+    def set_refresh_time(self, ticker: str):
+        self.last_refresh_time[ticker] = _time.time()
 
 
 # ── Lifespan (startup/shutdown) ──────────────────────────────────
@@ -232,6 +248,7 @@ async def root():
             "GET  /scan/history",
             "GET  /scan/status",
             "GET  /stocks/{ticker}",
+            "POST /stock/{ticker}/refresh",
             "GET  /market/status",
             "GET  /health",
         ],
@@ -399,6 +416,104 @@ async def get_stock(ticker: str):
             status_code=502,
             detail=f"Data provider error for {ticker}: {e}",
         )
+
+
+def _bar_records_from_df(df) -> list[dict]:
+    """Convert a provider OHLCV DataFrame (Open/High/Low/Close/Volume,
+    datetime index) into the lowercase dict shape upsert_bars() expects."""
+    if df is None or df.empty:
+        return []
+    return [
+        {
+            "ts": ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts,
+            "open": float(row["Open"]),
+            "high": float(row["High"]),
+            "low": float(row["Low"]),
+            "close": float(row["Close"]),
+            "volume": int(row["Volume"]),
+        }
+        for ts, row in df.iterrows()
+    ]
+
+
+@app.post("/stock/{ticker}/refresh")
+async def refresh_stock(ticker: str):
+    """
+    Download daily (2y) + hourly (3mo) bars for one ticker and persist them.
+
+    Rejects with 429 if this ticker was refreshed in the last 15 minutes
+    (Redis-backed cooldown, falling back to an in-memory one if Redis is
+    down). Returns 503 if the database is unavailable — bars are never
+    fetched and silently discarded.
+    """
+    ticker = ticker.upper().strip()
+    if not ticker.isalpha() or len(ticker) > 5:
+        raise HTTPException(status_code=400, detail="Invalid ticker format")
+
+    if not app.state.db_pool:
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable; refresh would not be persisted.",
+        )
+
+    from cache import TTL_REFRESH_COOLDOWN, get_refresh_cooldown, set_refresh_cooldown
+
+    if app.state.redis:
+        try:
+            remaining = await get_refresh_cooldown(app.state.redis, ticker)
+        except Exception as e:
+            logger.warning(f"Redis cooldown check failed for {ticker}: {e}")
+            remaining = app.state.memory.get_refresh_cooldown(ticker, TTL_REFRESH_COOLDOWN)
+    else:
+        remaining = app.state.memory.get_refresh_cooldown(ticker, TTL_REFRESH_COOLDOWN)
+
+    if remaining is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"'{ticker}' was refreshed recently. Try again in {remaining}s.",
+            headers={"Retry-After": str(remaining)},
+        )
+
+    try:
+        bulk_daily = await app.state.provider.download_daily([ticker], period="2y")
+        bulk_hourly = await app.state.provider.download_hourly([ticker], period="3mo")
+    except Exception as e:
+        error_msg = str(e).lower()
+        logger.error(f"Refresh fetch failed for {ticker}: {e}")
+        if "rate" in error_msg or "too many" in error_msg or "429" in error_msg:
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limited by data provider. Try again later.",
+            )
+        raise HTTPException(status_code=502, detail=f"Data provider error for {ticker}: {e}")
+
+    df_daily = app.state.provider.extract_ticker_df(bulk_daily, ticker)
+    df_hourly = app.state.provider.extract_ticker_df(bulk_hourly, ticker)
+    daily_bars = _bar_records_from_df(df_daily)
+    hourly_bars = _bar_records_from_df(df_hourly)
+
+    from db import upsert_bars
+    daily_count = await upsert_bars(app.state.db_pool, ticker, "1d", daily_bars)
+    hourly_count = await upsert_bars(app.state.db_pool, ticker, "1h", hourly_bars)
+
+    del bulk_daily, bulk_hourly, df_daily, df_hourly, daily_bars, hourly_bars
+    gc.collect()
+
+    # Cooldown starts only now — after a successful fetch + persist.
+    if app.state.redis:
+        try:
+            await set_refresh_cooldown(app.state.redis, ticker, TTL_REFRESH_COOLDOWN)
+        except Exception as e:
+            logger.warning(f"Redis cooldown write failed for {ticker}: {e}")
+            app.state.memory.set_refresh_time(ticker)
+    else:
+        app.state.memory.set_refresh_time(ticker)
+
+    return {
+        "ticker": ticker,
+        "dailyBars": daily_count,
+        "hourlyBars": hourly_count,
+    }
 
 
 @app.get("/market/status")

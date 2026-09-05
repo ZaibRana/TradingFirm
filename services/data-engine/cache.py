@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 # Cache keys (matching shared/constants.py)
 CACHE_LAST_SCAN = "tf:cache:last_scan"
 CACHE_SCAN_STATUS = "tf:cache:scan_status"
+CACHE_REFRESH_PREFIX = "tf:cache:refresh:"
 
 # Pub/sub channels
 CHANNEL_SCAN_COMPLETE = "tf:scan:complete"
@@ -25,6 +26,7 @@ CHANNEL_SCAN_COMPLETE = "tf:scan:complete"
 # TTLs (seconds)
 TTL_SCAN_RESULT = 3600      # 1 hour
 TTL_SCAN_STATUS = 600       # 10 minutes
+TTL_REFRESH_COOLDOWN = 900  # 15 minutes
 
 
 # ── Connection ───────────────────────────────────────────────────
@@ -88,6 +90,32 @@ async def get_scan_status(r: aioredis.Redis) -> dict:
     if data is None:
         return {"status": "idle", "message": ""}
     return json.loads(data)
+
+
+# ── Per-Ticker Refresh Cooldown ──────────────────────────────────
+
+async def get_refresh_cooldown(r: aioredis.Redis, ticker: str) -> Optional[int]:
+    """
+    Seconds remaining before `ticker` may be refreshed again, or None
+    if it's clear to refresh now.
+    """
+    ttl = await r.ttl(f"{CACHE_REFRESH_PREFIX}{ticker}")
+    if ttl is None or ttl < 0:
+        return None
+    return ttl
+
+
+async def set_refresh_cooldown(
+    r: aioredis.Redis,
+    ticker: str,
+    ttl: int = TTL_REFRESH_COOLDOWN,
+) -> None:
+    """
+    Start the refresh cooldown window for `ticker`. Call only after a
+    successful fetch + persist — never before, so a failed refresh
+    doesn't lock the ticker out with nothing to show for it.
+    """
+    await r.set(f"{CACHE_REFRESH_PREFIX}{ticker}", "1", ex=ttl)
 
 
 # ── Pub/Sub Events ───────────────────────────────────────────────
