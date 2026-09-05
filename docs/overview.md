@@ -108,9 +108,15 @@ FastAPI app. Key pieces:
 - **Storage fallback chain**: results are always kept in an in-memory store;
   Redis and Postgres are optional — the service degrades gracefully and
   keeps working (from memory only) if either is unavailable at startup.
-- **`providers/`** — a `DataProvider` abstraction (`yfinance_provider.py`
-  today) so a production data source can be swapped in later without
-  touching scanner logic.
+- **`providers/`** — a `DataProvider` abstraction so a production data
+  source can be swapped in later without touching scanner logic.
+  `get_provider()` knows two: `yfinance` (`yfinance_provider.py`, the live
+  default) and `fixture` (`fixture_provider.py`, replays
+  `tests/fixtures/{daily,hourly,info}/<TICKER>.json` with no network — for
+  tests only, selectable via `DATA_PROVIDER=fixture`).
+- **`requirements-dev.txt`** — `pytest` + `pytest-asyncio` on top of
+  `requirements.txt`; not in the prod image, installed into the dev
+  container to run tests (see `CLAUDE.md` Commands).
 - **`indicators/technical.py`** — ATR, ATRP, RVOL, EMA, 52-week position,
   4H aggregation from hourly bars.
 - **`scanners/models.py`** — Pydantic models with `by_alias` field aliases

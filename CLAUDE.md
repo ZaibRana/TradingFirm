@@ -37,6 +37,14 @@ uvicorn main:app --reload --port 8001          # run standalone
 
 pytest tests/test_scanner_pipeline.py -v        # run the safe unit tests
 ```
+Test deps live in `requirements-dev.txt` (not in the prod image). Run tests inside the
+hot-reload dev container, not on the host — the host's pandas is not the pinned version:
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d data-engine
+docker exec tf-data-engine pip install -r requirements-dev.txt
+docker exec tf-data-engine pytest tests/test_fixture_provider.py tests/test_provider_factory.py tests/test_scanner_pipeline.py -v
+docker compose up -d data-engine     # restore the prod build afterwards
+```
 
 ### Web dashboard (Next.js)
 ```bash

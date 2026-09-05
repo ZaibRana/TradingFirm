@@ -1,0 +1,10 @@
+# Dev/test-only dependencies. Not installed in the prod image.
+# Install into the hot-reload dev container (which volume-mounts the source):
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d data-engine
+#   docker exec tf-data-engine pip install -r requirements-dev.txt
+#   docker exec tf-data-engine pytest tests/test_fixture_provider.py -v
+# Run tests inside the container, not on the host: the host Python's pandas
+# is not the pinned version and has silently changed read_json() behaviour.
+-r requirements.txt
+pytest==9.1.1
+pytest-asyncio==1.4.0
