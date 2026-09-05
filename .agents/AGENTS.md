@@ -13,6 +13,14 @@
 → Get user approval before touching any file
 → NEVER assume a library, data source, or architecture — always ask
 
+### G1.5: Spec Tables
+**When:** The part writes state (Postgres, Redis, disk) or calls a dependency
+→ After the 3-sentence spec, two tables. "n/a" cells are allowed, blank cells are not:
+  Writes: `write | before/after success | state left if the op fails after it`
+  Failure branches: `branch | fails open/closed (both valid) | test function` — cover at least: dependency down, bad input, empty result, repeat call
+→ Keys and lookups: one named normalization function; every endpoint touching that key calls it
+→ Approval check: every failure-branch row names a test function that exists. No name, no approval
+
 ### G2: Test Small First
 **When:** Any new code, pipeline, or integration is ready to test
 → Test 1 item → verify output → then 5 → then full load

@@ -13,6 +13,7 @@ TradingFirm — a day-trading system that screens the market, applies technical 
 12 global rules + project rules take priority over generic habits. The ones most likely to bite:
 
 - **G1 — Ask before building.** 3-sentence spec approved before touching files for any new feature/service.
+- **G1.5 — Spec tables.** Stateful parts: writes table + failure-branch table in the spec, each branch naming its test function. Keys go through one shared normalization function.
 - **G3.5 — Consult before fixing.** On an error, present the root cause and 2 options; don't auto-apply a fix.
 - **G6 — Protect external APIs.** Never run untested code against live yfinance/Finviz at scale; delays and canary batches are mandatory. Getting the user's IP rate-limited is the #1 thing to avoid.
 - **G7 — Tests alongside code.** Every module gets a unit test; tests never call external APIs (mock the provider).
