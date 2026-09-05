@@ -179,3 +179,94 @@ async def upsert_stocks(pool: asyncpg.Pool, stocks: list[dict]) -> int:
 
     logger.info(f"Upserted {len(records)} stocks into data_engine.stocks")
     return len(records)
+
+
+# ── OHLCV Bars ───────────────────────────────────────────────────
+
+async def upsert_bars(
+    pool: asyncpg.Pool,
+    ticker: str,
+    interval: str,
+    bars: list[dict],
+) -> int:
+    """
+    Upsert OHLCV bars into data_engine.ohlcv_bars.
+    Each bar dict needs: ts (datetime), open, high, low, close, volume.
+    Returns the number of rows upserted.
+    """
+    if not bars:
+        return 0
+
+    query = """
+        INSERT INTO data_engine.ohlcv_bars
+            (ticker, interval, ts, open, high, low, close, volume)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (ticker, interval, ts) DO UPDATE SET
+            open = EXCLUDED.open,
+            high = EXCLUDED.high,
+            low = EXCLUDED.low,
+            close = EXCLUDED.close,
+            volume = EXCLUDED.volume
+    """
+    records = [
+        (
+            ticker,
+            interval,
+            bar["ts"],
+            bar["open"],
+            bar["high"],
+            bar["low"],
+            bar["close"],
+            bar["volume"],
+        )
+        for bar in bars
+    ]
+
+    async with pool.acquire() as conn:
+        await conn.executemany(query, records)
+
+    logger.info(f"Upserted {len(records)} {interval} bars for {ticker}")
+    return len(records)
+
+
+async def get_bars(
+    pool: asyncpg.Pool,
+    ticker: str,
+    interval: str,
+    since: Optional[datetime] = None,
+) -> list[dict]:
+    """
+    Fetch stored OHLCV bars for a ticker/interval, ordered oldest first.
+    If `since` is given, only bars with ts >= since are returned.
+    """
+    if since is not None:
+        query = """
+            SELECT ts, open, high, low, close, volume
+            FROM data_engine.ohlcv_bars
+            WHERE ticker = $1 AND interval = $2 AND ts >= $3
+            ORDER BY ts ASC
+        """
+        args = (ticker, interval, since)
+    else:
+        query = """
+            SELECT ts, open, high, low, close, volume
+            FROM data_engine.ohlcv_bars
+            WHERE ticker = $1 AND interval = $2
+            ORDER BY ts ASC
+        """
+        args = (ticker, interval)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(query, *args)
+
+    return [
+        {
+            "ts": row["ts"],
+            "open": row["open"],
+            "high": row["high"],
+            "low": row["low"],
+            "close": row["close"],
+            "volume": row["volume"],
+        }
+        for row in rows
+    ]
