@@ -5,6 +5,15 @@ import Header from "./components/Header";
 import SectorTabs from "./components/SectorTabs";
 import ProStockCard from "./components/ProStockCard";
 
+// Adds a sectorId slug to each scanned stock for SectorTabs filtering.
+// Module-level (not inside Home) so the mount effect below can call it
+// without referencing a const before its declaration.
+const mapProResults = (data) =>
+  (data.stocks || []).map((s) => ({
+    ...s,
+    sectorId: (s.sector || "other").toLowerCase().replace(/\s+/g, "_"),
+  }));
+
 export default function Home() {
   // Professional Scanner state
   const [proStocks, setProStocks] = useState([]);
@@ -35,13 +44,6 @@ export default function Home() {
       })
       .catch(() => {});
   }, []);
-
-  // ─── Mappers ──────────────────────────────────────────────────
-  const mapProResults = (data) =>
-    (data.stocks || []).map((s) => ({
-      ...s,
-      sectorId: (s.sector || "other").toLowerCase().replace(/\s+/g, "_"),
-    }));
 
   // ─── Scan Handler ─────────────────────────────────────────────
   const handleProScan = async () => {

@@ -113,7 +113,7 @@ services:
       SERVICE_PORT: "8004"
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:?Set DB_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-tradingfirm}
       REDIS_URL: redis://redis:6379
-      LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY:-}
     restart: unless-stopped
