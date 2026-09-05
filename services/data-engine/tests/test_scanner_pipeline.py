@@ -327,3 +327,223 @@ class TestPipelineIntegration:
 
         print(f"  download_hourly called with {hourly_call_tickers} (not all {len(all_tickers)})")
         print(f"  Scan result: {result.passed_count} stocks passed")
+
+
+# ── Test: Part 1.3 — scan persists bars for winners ─────────────
+
+
+def _make_mock_provider(all_tickers, daily_bulk, hourly_bulk, daily_map, hourly_map):
+    """Mock provider whose extract_ticker_df dispatches by upper-cased
+    ticker, so callers can exercise both raw-case candidates and the
+    normalized keys the scanner produces downstream."""
+    mock_provider = AsyncMock()
+    mock_provider.provider_name = "mock"
+    mock_provider.get_candidates = AsyncMock(return_value=(all_tickers, "weekend"))
+    mock_provider.download_daily = AsyncMock(return_value=daily_bulk)
+    mock_provider.download_hourly = AsyncMock(return_value=hourly_bulk)
+
+    def extract_fn(bulk, ticker):
+        key = ticker.upper()
+        if bulk is daily_bulk:
+            return daily_map.get(key)
+        if bulk is hourly_bulk:
+            return hourly_map.get(key)
+        return None
+
+    mock_provider.extract_ticker_df = MagicMock(side_effect=extract_fn)
+    mock_provider.get_stock_info = AsyncMock(return_value={
+        "name": "Good Corp",
+        "sector": "Technology",
+        "industry": "Software",
+        "marketCap": 5_000_000_000,
+        "floatShares": 100_000_000,
+        "floatStr": "100M",
+        "news": [],
+    })
+    return mock_provider
+
+
+class TestPipelinePersistsWinnerBars:
+    """Part 1.3: scan pipeline persists daily + hourly bars for final
+    winners only, via db.upsert_bars, with normalized ticker keys."""
+
+    @pytest.mark.asyncio
+    async def test_persists_bars_for_final_winners_only_with_normalized_keys(self):
+        from scanners.market_scanner import MarketScanner
+
+        # "good" (lowercase candidate) passes both daily + hourly filters.
+        good_daily = make_daily_df(
+            rows=150, base_price=25.0, daily_range=1.0,
+            volume_avg=1_500_000, volume_last=2_000_000, trend=0.01,
+        )
+        good_hourly = make_hourly_df(rows=300, base_price=25.0, trend=0.005)
+
+        # Fails daily filters (ATRP too low) — never reaches winners.
+        bad_atrp_daily = make_daily_df(
+            rows=150, base_price=25.0, daily_range=0.2,
+            volume_avg=1_500_000, volume_last=2_000_000,
+        )
+
+        # Passes daily filters but fails hourly (downtrend) — reaches
+        # daily_winners/daily_frames but must NOT be persisted at all.
+        good_but_down_daily = make_daily_df(
+            rows=150, base_price=25.0, daily_range=1.0,
+            volume_avg=1_500_000, volume_last=2_000_000, trend=0.01,
+        )
+        good_but_down_hourly = make_hourly_df(rows=300, base_price=30.0, trend=-0.01)
+
+        daily_bulk = MagicMock()
+        daily_bulk.empty = False
+        hourly_bulk = MagicMock()
+        hourly_bulk.empty = False
+
+        daily_map = {
+            "GOOD": good_daily,
+            "BAD_ATRP": bad_atrp_daily,
+            "GOOD_BUT_DOWN": good_but_down_daily,
+        }
+        hourly_map = {
+            "GOOD": good_hourly,
+            "GOOD_BUT_DOWN": good_but_down_hourly,
+        }
+
+        mock_provider = _make_mock_provider(
+            ["good", "BAD_ATRP", "GOOD_BUT_DOWN"], daily_bulk, hourly_bulk, daily_map, hourly_map,
+        )
+
+        scanner = MarketScanner(mock_provider, db_pool=MagicMock())
+
+        with patch("db.upsert_bars", new=AsyncMock(return_value=1)) as mock_upsert:
+            result = await scanner.run_scan(price_min=10.0, price_max=40.0)
+
+        calls = mock_upsert.call_args_list
+        # upsert_bars(pool, ticker, interval, bars) — positional call.
+        call_keys = {(c.args[1], c.args[2]) for c in calls}
+
+        assert call_keys == {("GOOD", "1d"), ("GOOD", "1h")}, (
+            f"Expected exactly the normalized-key GOOD 1d/1h upserts, got {call_keys}"
+        )
+        assert not any(c.args[1] == "BAD_ATRP" for c in calls), "non-daily-winner was persisted"
+        assert not any(c.args[1] == "GOOD_BUT_DOWN" for c in calls), (
+            "daily winner that failed hourly filters was persisted"
+        )
+        assert not any(c.args[1] == "good" for c in calls), "persisted under raw (non-normalized) key"
+
+        assert result.passed_count == 1
+        assert result.stocks[0].symbol == "GOOD", "winner symbol should be the normalized ticker"
+        print(f"  upsert_bars calls: {call_keys}")
+
+    @pytest.mark.asyncio
+    async def test_skips_persist_when_pool_none(self):
+        from scanners.market_scanner import MarketScanner
+
+        good_daily = make_daily_df(
+            rows=150, base_price=25.0, daily_range=1.0,
+            volume_avg=1_500_000, volume_last=2_000_000, trend=0.01,
+        )
+        good_hourly = make_hourly_df(rows=300, base_price=25.0, trend=0.005)
+        daily_bulk = MagicMock()
+        daily_bulk.empty = False
+        hourly_bulk = MagicMock()
+        hourly_bulk.empty = False
+
+        mock_provider = _make_mock_provider(
+            ["GOOD"], daily_bulk, hourly_bulk, {"GOOD": good_daily}, {"GOOD": good_hourly},
+        )
+
+        scanner = MarketScanner(mock_provider)  # db_pool defaults to None
+
+        with patch("db.upsert_bars", new=AsyncMock()) as mock_upsert:
+            result = await scanner.run_scan(price_min=10.0, price_max=40.0)
+
+        mock_upsert.assert_not_called()
+        assert result.passed_count == 1
+        print("  no db_pool -> persist skipped, scan still returned results")
+
+    @pytest.mark.asyncio
+    async def test_continues_on_upsert_error(self):
+        from scanners.market_scanner import MarketScanner
+
+        good_daily = make_daily_df(
+            rows=150, base_price=25.0, daily_range=1.0,
+            volume_avg=1_500_000, volume_last=2_000_000, trend=0.01,
+        )
+        good_hourly = make_hourly_df(rows=300, base_price=25.0, trend=0.005)
+        daily_bulk = MagicMock()
+        daily_bulk.empty = False
+        hourly_bulk = MagicMock()
+        hourly_bulk.empty = False
+
+        mock_provider = _make_mock_provider(
+            ["GOOD"], daily_bulk, hourly_bulk, {"GOOD": good_daily}, {"GOOD": good_hourly},
+        )
+
+        scanner = MarketScanner(mock_provider, db_pool=MagicMock())
+
+        with patch(
+            "db.upsert_bars", new=AsyncMock(side_effect=Exception("db exploded"))
+        ) as mock_upsert:
+            result = await scanner.run_scan(price_min=10.0, price_max=40.0)
+
+        # Both the 1d and 1h attempts still happen despite each raising.
+        assert mock_upsert.call_count == 2
+        assert result.passed_count == 1
+        assert result.stocks[0].symbol == "GOOD"
+        print("  upsert_bars raised on every call, scan still completed normally")
+
+    @pytest.mark.asyncio
+    async def test_no_upsert_when_no_final_winners(self):
+        """daily_winners is non-empty (GOOD_BUT_DOWN passes daily filters)
+        but every one fails hourly filters, so winners ends up empty —
+        exercises _persist_winner_bars' own empty-winners guard."""
+        from scanners.market_scanner import MarketScanner
+
+        good_but_down_daily = make_daily_df(
+            rows=150, base_price=25.0, daily_range=1.0,
+            volume_avg=1_500_000, volume_last=2_000_000, trend=0.01,
+        )
+        good_but_down_hourly = make_hourly_df(rows=300, base_price=30.0, trend=-0.01)
+        daily_bulk = MagicMock()
+        daily_bulk.empty = False
+        hourly_bulk = MagicMock()
+        hourly_bulk.empty = False
+
+        mock_provider = _make_mock_provider(
+            ["GOOD_BUT_DOWN"], daily_bulk, hourly_bulk,
+            {"GOOD_BUT_DOWN": good_but_down_daily}, {"GOOD_BUT_DOWN": good_but_down_hourly},
+        )
+
+        scanner = MarketScanner(mock_provider, db_pool=MagicMock())
+
+        with patch("db.upsert_bars", new=AsyncMock()) as mock_upsert:
+            result = await scanner.run_scan(price_min=10.0, price_max=40.0)
+
+        mock_upsert.assert_not_called()
+        assert result.passed_count == 0
+        print("  no final winners -> zero upsert_bars calls")
+
+    @pytest.mark.asyncio
+    async def test_repeat_persist_calls_upsert_again_each_time(self):
+        """Consecutive persist calls for the same winner (as back-to-back
+        scheduled scans would produce) re-upsert every time — idempotency
+        is delegated to upsert_bars' ON CONFLICT DO UPDATE, not to any
+        client-side dedup/skip logic here."""
+        from scanners.market_scanner import MarketScanner
+
+        good_daily = make_daily_df(
+            rows=150, base_price=25.0, daily_range=1.0,
+            volume_avg=1_500_000, volume_last=2_000_000, trend=0.01,
+        )
+        good_hourly = make_hourly_df(rows=300, base_price=25.0, trend=0.005)
+
+        scanner = MarketScanner(MagicMock(), db_pool=MagicMock())
+        winners = {"GOOD": {"price": 25.0}}
+        daily_frames = {"GOOD": good_daily}
+        hourly_frames = {"GOOD": good_hourly}
+
+        with patch("db.upsert_bars", new=AsyncMock(return_value=1)) as mock_upsert:
+            await scanner._persist_winner_bars(winners, daily_frames, hourly_frames)
+            await scanner._persist_winner_bars(winners, daily_frames, hourly_frames)
+
+        assert mock_upsert.call_count == 4  # 2 intervals x 2 runs, no dedup
+        print("  repeat persist calls re-upsert every time (no client-side cache)")

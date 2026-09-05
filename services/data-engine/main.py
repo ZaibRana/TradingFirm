@@ -108,7 +108,7 @@ async def lifespan(app: FastAPI):
     app.state.provider = get_provider(settings.data_provider)
     logger.info(f"✅ Data provider: {app.state.provider.provider_name}")
 
-    app.state.scanner = MarketScanner(app.state.provider)
+    app.state.scanner = MarketScanner(app.state.provider, app.state.db_pool)
     logger.info("✅ Scanner initialized")
 
     logger.info(f"Data Engine ready on port {settings.service_port}")
@@ -383,11 +383,19 @@ async def scan_status():
     return app.state.memory.get_status()
 
 
+def normalize_ticker(ticker: str) -> str:
+    """Canonical ticker key form used everywhere ohlcv_bars/stocks are
+    written or read: upper-cased, whitespace-stripped. Shared by every
+    endpoint here and by the scan pipeline (scanners/market_scanner.py),
+    so a ticker's key can't drift between the two write paths."""
+    return ticker.upper().strip()
+
+
 @app.get("/stocks/{ticker}")
 async def get_stock(ticker: str):
     """Get enriched data for a specific stock ticker."""
     # Validate ticker format
-    ticker = ticker.upper().strip()
+    ticker = normalize_ticker(ticker)
     if not ticker.isalpha() or len(ticker) > 5:
         raise HTTPException(status_code=400, detail="Invalid ticker format")
 
@@ -418,24 +426,6 @@ async def get_stock(ticker: str):
         )
 
 
-def _bar_records_from_df(df) -> list[dict]:
-    """Convert a provider OHLCV DataFrame (Open/High/Low/Close/Volume,
-    datetime index) into the lowercase dict shape upsert_bars() expects."""
-    if df is None or df.empty:
-        return []
-    return [
-        {
-            "ts": ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts,
-            "open": float(row["Open"]),
-            "high": float(row["High"]),
-            "low": float(row["Low"]),
-            "close": float(row["Close"]),
-            "volume": int(row["Volume"]),
-        }
-        for ts, row in df.iterrows()
-    ]
-
-
 @app.post("/stock/{ticker}/refresh")
 async def refresh_stock(ticker: str):
     """
@@ -446,7 +436,7 @@ async def refresh_stock(ticker: str):
     down). Returns 503 if the database is unavailable — bars are never
     fetched and silently discarded.
     """
-    ticker = ticker.upper().strip()
+    ticker = normalize_ticker(ticker)
     if not ticker.isalpha() or len(ticker) > 5:
         raise HTTPException(status_code=400, detail="Invalid ticker format")
 
@@ -487,12 +477,13 @@ async def refresh_stock(ticker: str):
             )
         raise HTTPException(status_code=502, detail=f"Data provider error for {ticker}: {e}")
 
+    from db import bar_records_from_df, upsert_bars
+
     df_daily = app.state.provider.extract_ticker_df(bulk_daily, ticker)
     df_hourly = app.state.provider.extract_ticker_df(bulk_hourly, ticker)
-    daily_bars = _bar_records_from_df(df_daily)
-    hourly_bars = _bar_records_from_df(df_hourly)
+    daily_bars = bar_records_from_df(df_daily)
+    hourly_bars = bar_records_from_df(df_hourly)
 
-    from db import upsert_bars
     daily_count = await upsert_bars(app.state.db_pool, ticker, "1d", daily_bars)
     hourly_count = await upsert_bars(app.state.db_pool, ticker, "1h", hourly_bars)
 

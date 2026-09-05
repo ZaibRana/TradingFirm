@@ -107,13 +107,19 @@ FastAPI app. Key pieces:
   `GET /stocks/{ticker}`, `POST /stock/{ticker}/refresh`, `GET /market/status`,
   `GET /health`.
 - **`data_engine.ohlcv_bars`** (Postgres) — daily/hourly OHLCV per ticker,
-  written by `db.upsert_bars()` / read by `db.get_bars()`.
+  written by `db.upsert_bars()` / read by `db.get_bars()`, with bar-shaping
+  logic (`db.bar_records_from_df()`) shared by every write path.
   `POST /stock/{ticker}/refresh` downloads daily (2y) + hourly (3mo) bars
   for one ticker via the provider and upserts them; a 15-minute
   Redis-backed cooldown per ticker rejects repeat calls with 429 (falls
   back to an in-memory cooldown if Redis is down), and the endpoint
   returns 503 rather than silently discarding fetched bars if Postgres is
-  unavailable.
+  unavailable. The scan pipeline (`scanners/market_scanner.py`) also
+  upserts daily + hourly bars — for final scan winners only, once hourly
+  filtering is done — best-effort: a missing db pool or a failed upsert
+  for one ticker is logged and skipped, never aborts the scan. Both write
+  paths key rows on `main.normalize_ticker()` (upper-cased, stripped) so
+  a ticker can't land under two different casings.
 - **Storage fallback chain**: results are always kept in an in-memory store;
   Redis and Postgres are optional — the service degrades gracefully and
   keeps working (from memory only) if either is unavailable at startup.

@@ -183,6 +183,24 @@ async def upsert_stocks(pool: asyncpg.Pool, stocks: list[dict]) -> int:
 
 # ── OHLCV Bars ───────────────────────────────────────────────────
 
+def bar_records_from_df(df) -> list[dict]:
+    """Convert a provider OHLCV DataFrame (Open/High/Low/Close/Volume,
+    datetime index) into the lowercase dict shape upsert_bars() expects."""
+    if df is None or df.empty:
+        return []
+    return [
+        {
+            "ts": ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts,
+            "open": float(row["Open"]),
+            "high": float(row["High"]),
+            "low": float(row["Low"]),
+            "close": float(row["Close"]),
+            "volume": int(row["Volume"]),
+        }
+        for ts, row in df.iterrows()
+    ]
+
+
 async def upsert_bars(
     pool: asyncpg.Pool,
     ticker: str,

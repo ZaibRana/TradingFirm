@@ -7,6 +7,7 @@ Orchestrates the full scan flow (optimized: daily first, filter, then hourly):
   3. Apply daily-only filters (ATRP, RVOL, 52w, IPO) → ~20-40 winners
   4. Download HOURLY ONLY for daily winners (~95% fewer API calls)
   5. Apply hourly filters (4H price > 50 EMA, 1H EMA20 > EMA50)
+     — persist daily+hourly bars for the final winners (best-effort)
   6. Enrich final winners (name, sector, float, news) + fundamental gates
   7. Sort by quality score (RVOL × ATRP)
 
@@ -63,8 +64,9 @@ class MarketScanner:
      10. Float 20M–1B (enrichment gate)
     """
 
-    def __init__(self, provider: DataProvider):
+    def __init__(self, provider: DataProvider, db_pool=None):
         self.provider = provider
+        self.db_pool = db_pool
 
     async def run_scan(
         self,
@@ -126,7 +128,12 @@ class MarketScanner:
 
         # ── Step 3: Apply DAILY-ONLY filters ──
         logger.info(f"Step 3/7: Applying daily filters ({market_status} mode)...")
+        from main import normalize_ticker  # deferred: main.py is the entrypoint,
+
+        # already loaded by the time run_scan() executes; avoids a duplicate
+        # normalization rule (see main.py's normalize_ticker docstring / G1.5)
         daily_winners = {}
+        daily_frames = {}
         daily_rejections = {}
 
         for ticker in tickers:
@@ -137,7 +144,9 @@ class MarketScanner:
             passed, result = self._apply_daily_filters(ticker, daily_df, market_status)
 
             if passed:
-                daily_winners[ticker] = result
+                key = normalize_ticker(ticker)
+                daily_winners[key] = result
+                daily_frames[key] = daily_df
                 logger.debug(
                     f"  ✅ {ticker:6s}  ATRP {result['atrp']:>5.1f}%  "
                     f"RVOL {result['rvol']:>5.2f}x  52w {result['pos52w']:>3d}%"
@@ -155,7 +164,7 @@ class MarketScanner:
 
         if not daily_winners:
             logger.warning("No tickers passed daily filters. Returning empty result.")
-            del daily_data
+            del daily_data, daily_frames
             gc.collect()
             return self._empty_result(t0, market_status, total_scanned=len(tickers))
 
@@ -187,11 +196,14 @@ class MarketScanner:
         # ── Step 5: Apply HOURLY filters ──
         logger.info(f"Step 5/7: Applying hourly filters to {len(daily_winners)} daily winners...")
         winners = {}
+        hourly_frames = {}
         hourly_rejections = {}
 
         for ticker, daily_filter_data in daily_winners.items():
             if hourly_failed:
-                # Degraded mode: skip hourly filters, pass through daily winners
+                # Degraded mode: skip hourly filters, pass through daily winners.
+                # No hourly_df exists to capture in this branch — "1h" bars for
+                # these tickers simply won't be persisted this run.
                 winners[ticker] = daily_filter_data
                 continue
 
@@ -208,6 +220,7 @@ class MarketScanner:
 
             if passed:
                 winners[ticker] = result
+                hourly_frames[ticker] = hourly_df
                 logger.debug(f"  ✅ {ticker:6s}  Passed hourly filters")
             else:
                 key = result.split("(")[0].split("<")[0].strip()
@@ -220,9 +233,13 @@ class MarketScanner:
         for reason, count in sorted(hourly_rejections.items(), key=lambda x: -x[1])[:5]:
             logger.info(f"  {count:>4d}×  {reason}")
 
-        # ⚠️ GARBAGE: release hourly data before enrichment
+        # ── Persist bars for final winners only (best-effort) ──
+        await self._persist_winner_bars(winners, daily_frames, hourly_frames)
+
+        # ⚠️ GARBAGE: release hourly data + winner frames before enrichment
         if not hourly_failed:
             del hourly_data
+        del daily_frames, hourly_frames
         gc.collect()
         logger.debug("Released hourly DataFrames from memory")
 
@@ -287,6 +304,42 @@ class MarketScanner:
             passed_count=0,
             stocks=[],
         )
+
+    async def _persist_winner_bars(
+        self,
+        winners: dict,
+        daily_frames: dict,
+        hourly_frames: dict,
+    ) -> None:
+        """
+        Upsert daily + hourly bars for final scan winners into
+        data_engine.ohlcv_bars. Winner-only, best-effort: a missing db_pool
+        or a failed upsert for one ticker is logged and skipped, never
+        aborts the scan (the scan's job is to return ScanResult; bar
+        persistence is a side effect of it).
+
+        `winners`/`daily_frames`/`hourly_frames` keys are already
+        normalized (see normalize_ticker() applied when a ticker enters
+        daily_winners in Step 3) — no re-normalization needed here.
+        """
+        if self.db_pool is None or not winners:
+            return
+
+        from db import bar_records_from_df, upsert_bars
+
+        for ticker in winners:
+            for interval, frame in (
+                ("1d", daily_frames.get(ticker)),
+                ("1h", hourly_frames.get(ticker)),
+            ):
+                if frame is None:
+                    continue
+                try:
+                    await upsert_bars(
+                        self.db_pool, ticker, interval, bar_records_from_df(frame)
+                    )
+                except Exception as e:
+                    logger.warning(f"Bar persist failed for {ticker} ({interval}): {e}")
 
     # ── Private: Daily-Only Filters (split from old _apply_filters) ──
 
