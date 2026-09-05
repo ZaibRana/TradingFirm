@@ -1,0 +1,25 @@
+{
+  "name": "Microsoft Corporation",
+  "sector": "Technology",
+  "industry": "Software - Infrastructure",
+  "marketCap": 3710545172496,
+  "floatShares": 7414332917,
+  "floatStr": "7.4B",
+  "news": [
+    {
+      "title": "What Move Will SpaceX Stock Make After Sept. 9? The Evidence Is Piling Up, and Here\u2019s What It Shows.",
+      "url": "https://www.fool.com/investing/2026/09/05/what-move-will-spacex-stock-make-after-sept-9-the-evidence-is-piling-up-and-here-s-what-it-shows/",
+      "publisher": "Motley Fool"
+    },
+    {
+      "title": "Seattle Times, Newsday sue OpenAI and Microsoft over AI training",
+      "url": "https://finance.yahoo.com/technology/ai/articles/seattle-times-newsday-sue-openai-062913073.html",
+      "publisher": "Investing.com"
+    },
+    {
+      "title": "Satya Nadella Sold $43 Million of Microsoft Under a Trading Plan. Is the Insider Signal Really Bearish?",
+      "url": "https://finance.yahoo.com/markets/stocks/articles/satya-nadella-sold-43-million-054924928.html",
+      "publisher": "Insider Monkey"
+    }
+  ]
+}

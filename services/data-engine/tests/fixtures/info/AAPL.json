@@ -1,0 +1,25 @@
+{
+  "name": "Apple Inc.",
+  "sector": "Technology",
+  "industry": "Consumer Electronics",
+  "marketCap": 4669699792415,
+  "floatShares": 14569078010,
+  "floatStr": "14.6B",
+  "news": [
+    {
+      "title": "Apple's John Ternus needs to be his own type of CEO and 'not Tim Cook 2'",
+      "url": "https://finance.yahoo.com/video/apples-john-ternus-needs-own-203847038.html",
+      "publisher": "Yahoo Finance Video"
+    },
+    {
+      "title": "Foxconn says third quarter to outperform market expectations on AI strength",
+      "url": "https://finance.yahoo.com/technology/ai/articles/foxconn-says-third-quarter-outperform-081331124.html",
+      "publisher": "Reuters"
+    },
+    {
+      "title": "Self-Driving\u2019s Next Task: Potholes",
+      "url": "https://www.barrons.com/articles/self-drivings-next-task-potholes-a696a3f5?siteid=yhoof2&yptr=yahoo",
+      "publisher": "Barrons.com"
+    }
+  ]
+}
