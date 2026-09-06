@@ -132,8 +132,14 @@ FastAPI app. Key pieces:
 - **`requirements-dev.txt`** — `pytest` + `pytest-asyncio` on top of
   `requirements.txt`; not in the prod image, installed into the dev
   container to run tests (see `CLAUDE.md` Commands).
-- **`indicators/technical.py`** — ATR, ATRP, RVOL, EMA, 52-week position,
-  4H aggregation from hourly bars.
+- **`indicators/`** — pure, no-I/O indicator functions, imported from the
+  package (`from indicators import ...`; the submodule split is an
+  implementation detail): `moving_averages.py` (EMA, 4H aggregation from
+  hourly bars), `volatility.py` (ATR, ATRP, extension from an MA in ATR
+  units, opening gap %), `momentum.py` (RSI — SMA-seeded Wilder, MACD,
+  relative strength vs a benchmark in percentage points, 52-week position),
+  `volume.py` (RVOL, 20-day average dollar volume). Conventions in
+  `docs/decisions.md` 2026-09-06.
 - **`scanners/models.py`** — Pydantic models with `by_alias` field aliases
   (e.g. `market_cap` → `marketCap`) so FastAPI's snake_case internals
   serialize as the camelCase JSON the frontend expects.

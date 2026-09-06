@@ -23,7 +23,7 @@ session.headers.update({
 
 # Add the service code to path
 sys.path.insert(0, ".")
-from indicators.technical import calc_atr, calc_atrp, calc_rvol, ema, aggregate_4h, check_52w_position
+from indicators import calc_atr, calc_atrp, calc_rvol, ema, aggregate_4h, check_52w_position
 from scanners.market_scanner import MarketScanner
 from scanners.market_status import get_market_status
 

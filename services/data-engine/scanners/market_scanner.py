@@ -29,7 +29,7 @@ from typing import Optional
 
 import numpy as np
 
-from indicators.technical import (
+from indicators import (
     aggregate_4h,
     calc_atr,
     calc_atrp,
