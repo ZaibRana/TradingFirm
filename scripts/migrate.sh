@@ -10,6 +10,8 @@
 # ones already recorded. Every migration file must be safe to re-run
 # (CREATE ... IF NOT EXISTS) since a fresh volume applies 001 via
 # docker-entrypoint-initdb.d before this script ever sees it.
+# Target database: POSTGRES_DB (prod) unless MIGRATE_DB is set on the host,
+# e.g. MIGRATE_DB=tradingfirm_dev (used by scripts/dev-db.sh, Part 0.7).
 set -euo pipefail
 
 CONTAINER="${POSTGRES_CONTAINER:-tf-postgres}"
@@ -23,11 +25,13 @@ fi
 # Runs a psql command inside the container, mapping its POSTGRES_* env vars
 # to the PG* names psql expects.
 psql_in() {
-  docker exec -i "$CONTAINER" bash -c '
-    PGUSER="$POSTGRES_USER" PGPASSWORD="$POSTGRES_PASSWORD" PGDATABASE="$POSTGRES_DB" \
+  docker exec -i -e MIGRATE_DB="${MIGRATE_DB:-}" "$CONTAINER" bash -c '
+    PGUSER="$POSTGRES_USER" PGPASSWORD="$POSTGRES_PASSWORD" PGDATABASE="${MIGRATE_DB:-$POSTGRES_DB}" \
       exec psql -v ON_ERROR_STOP=1 "$@"
   ' _ "$@"
 }
+
+echo "target database: ${MIGRATE_DB:-<container POSTGRES_DB>}"
 
 psql_in -q -c "CREATE TABLE IF NOT EXISTS public.schema_migrations (filename text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());"
 

@@ -130,8 +130,11 @@ FastAPI app. Key pieces:
   `tests/fixtures/{daily,hourly,info}/<TICKER>.json` with no network — for
   tests only, selectable via `DATA_PROVIDER=fixture`).
 - **`requirements-dev.txt`** — `pytest` + `pytest-asyncio` on top of
-  `requirements.txt`; not in the prod image, installed into the dev
-  container to run tests (see `CLAUDE.md` Commands).
+  `requirements.txt`; baked into the Dockerfile's `dev` stage only (the
+  `prod` stage never sees it). Tests run in `tf-data-engine-dev`, see
+  Infrastructure below and `CLAUDE.md` Commands. `pytest.ini` restricts
+  discovery to `tests/test_*.py` so a bare `pytest` cannot collect the
+  live-scan script `tests/full_scan_test.py`.
 - **`indicators/`** — pure, no-I/O indicator functions, imported from the
   package (`from indicators import ...`; the submodule split is an
   implementation detail): `moving_averages.py` (EMA, 4H aggregation from
@@ -173,6 +176,16 @@ Google-sign-in scaffolding under `web/lib/firebase/` has been removed.
   all 7 containers (postgres, redis, 4 FastAPI services, web) prod-like;
   `docker-compose.dev.yml` adds hot-reload. Requires `DB_PASSWORD` set in
   `.env` — compose fails fast without it.
+- **`tf-data-engine-dev`** — opt-in eighth container (compose profile
+  `dev`, `docker compose --profile dev up -d data-engine-dev`, host port
+  8011) for running data-engine tests without touching prod
+  `tf-data-engine`. Built from the data-engine Dockerfile's `dev` stage
+  (dev deps, no code — the source tree is volume-mounted), provider
+  hard-coded to `fixture`, its own database `tradingfirm_dev` and Redis
+  DB 1, no `depends_on`. `scripts/dev-db.sh` creates that database and
+  applies migrations to it (via `MIGRATE_DB=` in `scripts/migrate.sh`);
+  until it runs the dev API reports `db_connected: false`. Conventions in
+  `docs/decisions.md` 2026-09-06 (Part 0.7 entry).
 
 ## Where things stand
 

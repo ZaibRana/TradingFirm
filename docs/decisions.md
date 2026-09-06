@@ -87,3 +87,20 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 **Why:** Under the previous rule a lone volume node with one nearby swing scored 55 and outranked two clean swings (50). The reviewer flagged that as a design smell at spec time; the user chose to fix it now rather than carry it into 1.7 and 4.3.
 
 **Supersedes:** the "Three methods" and "Scoring" bullets of the 2026-09-06 "Support/resistance zone conventions (Part 1.6)" entry. The `Zone` dataclass gains a trailing `volume_node` field; `methods` never contains `"volume"`.
+
+---
+
+## 2026-09-06 — Part 0.7 added: `tf-data-engine-dev` service, pytest discovery lock, rule G13
+
+**Decision:**
+
+- **Part 0.7 exists.** The plan is read-only, so this entry adds it under Phase 0: a compose service `data-engine-dev` (container `tf-data-engine-dev`, profile `dev`, host port 8011) built from a new `dev` stage of the data-engine Dockerfile, so tests run with one `docker exec` while prod `tf-data-engine` keeps running. Recorded in `docs/progress.md` as row 0.7; there is no §17 checkbox for it.
+- **Dockerfile has three stages** — `base` (system + runtime deps), `dev` (`FROM base` + `requirements-dev.txt`, deliberately no `COPY . .`: the image is inert without the source mount, which also supplies `tests/` since `.dockerignore` excludes it from every image), `prod` (`FROM base` + `COPY . .`, last stage so an untargeted build still yields prod). The `data-engine` service names `target: prod` explicitly.
+- **The dev service is isolated by construction, not by convention.** Hard-coded in compose, not read from `.env`: `DATA_PROVIDER=fixture` (nothing on 8011 can reach Finviz or yfinance; the only Finviz caller is `YFinanceProvider.get_candidates`), database `tradingfirm_dev` (not `POSTGRES_DB`), Redis `redis://redis:6379/1` (not DB 0). It has **no `depends_on`** — tests mock Postgres and Redis, and the API tolerates both being absent — and joins the default compose network like every other service. Until `scripts/dev-db.sh` has been run the dev API starts with `db_connected=false` and every DB path fails closed (503 / persistence skipped), which is itself the guarantee that it cannot touch prod's tables.
+- **`scripts/dev-db.sh`** creates `tradingfirm_dev` if absent (via `docker exec` into `tf-postgres`, same pattern as `migrate.sh`, name validated against `^[a-z_][a-z0-9_]*$`) and applies migrations to it through a new `MIGRATE_DB` override in `scripts/migrate.sh` (default unchanged: the container's `POSTGRES_DB`). Idempotent. Not run automatically by the container: the image has no `psql`, and service code should not create databases.
+- **pytest discovery is locked** by `services/data-engine/pytest.ini`: `testpaths = tests`, `python_files = test_*.py`. A bare `pytest` can no longer collect `tests/full_scan_test.py` (which matched the default `*_test.py` pattern and fired a live scan on import). Naming the test files stays as habit; it is no longer the only guard.
+- **Rule G13 — Verify Edits Landed** added to `.agents/AGENTS.md` (numbered G13, not G6: G6 is Protect External APIs): absolute paths for every edit, prove scripted edits applied before the next step, end every completion report with `git diff --stat <base>..HEAD`.
+
+**Why:** Parts 1.5 and 1.6 each displaced the prod container to run tests (the `docker-compose.dev.yml` overlay redefines the same service). The first draft of this part's G1.5 writes table said "no state written" and missed that a dev API carrying prod's `DATABASE_URL`/`REDIS_URL` could upsert fixture bars into prod's tables and write prod's cooldown keys — exactly the gap G1.5 exists to catch; the separate database and Redis index close it. G13 exists because 1.6 and its follow-up each had a scripted edit pass silently not apply (a missing `python` alias, then a persisted `cd`), caught only by re-checking.
+
+**Supersedes:** N/A — adds Part 0.7 and rule G13; no D-number changes. `docker-compose.dev.yml` is untouched and remains the full-stack hot-reload path.

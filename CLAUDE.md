@@ -10,7 +10,7 @@ TradingFirm — a day-trading system that screens the market, applies technical 
 
 ## Read `.agents/AGENTS.md` first
 
-12 global rules + project rules take priority over generic habits. The ones most likely to bite:
+13 global rules + project rules take priority over generic habits. The ones most likely to bite:
 
 - **G1 — Ask before building.** 3-sentence spec approved before touching files for any new feature/service.
 - **G1.5 — Spec tables.** Stateful parts: writes table + failure-branch table in the spec, each branch naming its test function. Keys go through one shared normalization function.
@@ -18,6 +18,7 @@ TradingFirm — a day-trading system that screens the market, applies technical 
 - **G6 — Protect external APIs.** Never run untested code against live yfinance/Finviz at scale; delays and canary batches are mandatory. Getting the user's IP rate-limited is the #1 thing to avoid.
 - **G7 — Tests alongside code.** Every module gets a unit test; tests never call external APIs (mock the provider).
 - **G8 — Clean up memory.** `del` DataFrames + `gc.collect()` after use; never store raw DataFrames in `app.state`.
+- **G13 — Verify edits landed.** Absolute paths for every edit; prove scripted edits applied; end each completion report with `git diff --stat <base>..HEAD`.
 
 ## Docs discipline
 
@@ -36,12 +37,11 @@ cd services/data-engine
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8001
 ```
-Tests run inside the dev container (host pandas ≠ pinned version); deps in `requirements-dev.txt`, not the prod image:
+Tests run inside `tf-data-engine-dev` (host pandas ≠ pinned version). It is a separate container from prod `tf-data-engine`, so prod keeps running: fixture provider, its own database `tradingfirm_dev`, Redis DB 1, pytest baked in via the Dockerfile `dev` stage. Rebuild with `--build` after changing `requirements*.txt`:
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d data-engine
-docker exec tf-data-engine pip install -r requirements-dev.txt
-docker exec tf-data-engine pytest tests/test_fixture_provider.py tests/test_provider_factory.py tests/test_scanner_pipeline.py -v
-docker compose up -d data-engine     # restore prod build
+docker compose --profile dev up -d data-engine-dev
+docker exec tf-data-engine-dev pytest tests/test_fixture_provider.py tests/test_provider_factory.py tests/test_scanner_pipeline.py -v
+./scripts/dev-db.sh                  # once: create tradingfirm_dev + apply migrations (only needed to poke the dev API on :8011)
 ```
 
 ### Web dashboard (Next.js)
@@ -74,7 +74,7 @@ Requires `.env` with `DB_PASSWORD` set — compose fails fast without it.
 
 ## Never touch / handle with care
 
-- **Never run bare `pytest` or `pytest tests/`** in `services/data-engine`: `tests/full_scan_test.py` matches discovery and fires a real Finviz + yfinance scan on collection. Always name the `test_*.py` files.
+- **Name the `test_*.py` files when running pytest** in `services/data-engine`. `pytest.ini` (`testpaths = tests`, `python_files = test_*.py`) now keeps a bare `pytest` from collecting `tests/full_scan_test.py`, which fires a real Finviz + yfinance scan on import — naming files is habit and belt-and-braces, no longer the only guard.
 - **`tests/smoke_test_pipeline.py`, `tests/full_scan_test.py`, `tests/record_fixture_live.py`** are live-API scripts. Run manually and deliberately, never in CI.
 - **One live scan pipeline: `services/data-engine`** (proxied by `web/app/api/scanner/pro/route.js`). `scanner/` is a frozen reference — don't build on it (`scanner/README.md`). Its `results.json`/`status.json` are generated output.
 - **Migrations must be re-runnable**: `IF NOT EXISTS` everywhere, no plain `INSERT` seeds. Why: `scripts/migrate.sh` header, `docs/decisions.md` 2026-09-05.

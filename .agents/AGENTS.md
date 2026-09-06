@@ -110,6 +110,13 @@
 → Never let more than 1 task go uncommitted
 → Push regularly — unsaved work is lost work
 
+### G13: Verify Edits Landed
+**When:** Any file edit — especially scripted or batched ones — and every completion report
+→ Edit with absolute paths. Never rely on a `cd` that persisted from an earlier command
+→ After a scripted edit, show the grep or diff that proves it applied BEFORE taking the next step
+→ End every completion report with `git diff --stat <base>..HEAD`, where `<base>` is the last commit before the part
+→ Why: two consecutive parts each had an edit pass silently not apply. A passing test is not proof that the intended edit is what got committed
+
 ---
 
 ## PART 2: PROJECT RULES — TradingFirm

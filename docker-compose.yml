@@ -38,6 +38,7 @@ services:
     build:
       context: ./services/data-engine
       dockerfile: Dockerfile
+      target: prod
     container_name: tf-data-engine
     ports:
       - "8001:8001"
@@ -53,6 +54,41 @@ services:
       REDIS_URL: redis://redis:6379
       DATA_PROVIDER: ${DATA_PROVIDER:-yfinance}
     restart: unless-stopped
+
+  # Dev/test twin of data-engine (Part 0.7). Opt-in: not started by a plain
+  # `docker compose up -d`; use `docker compose --profile dev up -d data-engine-dev`
+  # (naming the service also activates its profile). Runs the Dockerfile's
+  # `dev` stage — dev deps baked in, NO application code, so the image is
+  # inert without the source mount below (which also supplies tests/, which
+  # .dockerignore keeps out of every image). Hard-coded, not from .env:
+  #   DATA_PROVIDER=fixture  → nothing on 8011 can reach Finviz/yfinance
+  #   database tradingfirm_dev, Redis DB 1 → can never write prod's tables or
+  #                                          prod's cache keys
+  # Create the dev database once with scripts/dev-db.sh; until then the API
+  # starts with db_connected=false and every DB path fails closed. No
+  # depends_on on purpose: tests mock Postgres/Redis. Joins the default
+  # compose network like every other service. A bare `pytest` in here is
+  # safe (pytest.ini restricts discovery), but still name the test files.
+  data-engine-dev:
+    profiles: ["dev"]
+    build:
+      context: ./services/data-engine
+      dockerfile: Dockerfile
+      target: dev
+    container_name: tf-data-engine-dev
+    ports:
+      - "8011:8001"
+    volumes:
+      - ./services/data-engine:/app
+    environment:
+      SERVICE_NAME: data-engine-dev
+      SERVICE_PORT: "8001"
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tf_user}:${DB_PASSWORD:?Set DB_PASSWORD in .env}@postgres:5432/tradingfirm_dev
+      REDIS_URL: redis://redis:6379/1
+      DATA_PROVIDER: fixture
+      DEBUG: "true"
+    command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+    restart: "no"
 
   signal-engine:
     build:
