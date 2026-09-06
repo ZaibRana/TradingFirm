@@ -104,3 +104,20 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 **Why:** Parts 1.5 and 1.6 each displaced the prod container to run tests (the `docker-compose.dev.yml` overlay redefines the same service). The first draft of this part's G1.5 writes table said "no state written" and missed that a dev API carrying prod's `DATABASE_URL`/`REDIS_URL` could upsert fixture bars into prod's tables and write prod's cooldown keys — exactly the gap G1.5 exists to catch; the separate database and Redis index close it. G13 exists because 1.6 and its follow-up each had a scripted edit pass silently not apply (a missing `python` alias, then a persisted `cd`), caught only by re-checking.
 
 **Supersedes:** N/A — adds Part 0.7 and rule G13; no D-number changes. `docker-compose.dev.yml` is untouched and remains the full-stack hot-reload path.
+
+---
+
+## 2026-09-06 — Indicators endpoint conventions (Part 1.7)
+
+**Decision:**
+
+- **Field → function.** `ema20/50/200` = `ema` last value; `atr14` = `calc_atr`; `rsi14` = `rsi`; `macd/macdSignal/macdHist` = `macd` last row; `ext20/ext50` = `extension` against EMA 20/50 and ATR 14; `gapPct` = `gap` last value, `gaps20` = its last 20 values; `rvol` = `calc_rvol(volume, last volume, 20, scale 1.0)`; `avgDollarVolume20` = `avg_dollar_volume`; `rsSpy5/20`, `rsSector5/20` = `relative_strength` with period 5 / 20 (stock % return − benchmark % return over the window, in percentage points, aligned on bar timestamp). All over the full stored daily history.
+- **52-week window.** `pos52w` and `zones` are computed on the last 252 stored bars only; everything else uses the full history (EMA 200 and MACD need the warm-up). New arithmetic beyond the 1.5/1.6 functions is exactly this window plus the gap-history slice, both hand-tested in `test_indicators.py`.
+- **Null and 0.0.** Every NaN serializes as JSON `null`; no minimum bar count. `rvol` is `0.0` on fewer than 21 bars (1.5 convention, do not "fix"); its scale factor is 1.0 because stored bars carry no minutes-since-open.
+- **Benchmarks come from the bar store, never the provider.** SPY and the sector ETF (`data_engine.stocks.sector` → `indicators/sectors.py`, 11 yfinance names → SPDR ETFs, case/whitespace-insensitive, unknown → none) are read with `get_bars`; a missing one nulls its RS fields and reports `bars: 0` under `benchmarks`.
+- **Cache.** Key `tf:cache:indicators:{normalized ticker}`, TTL 900 s, body = the camelCase response without `cached`; `cached` is set on retrieval. Unparseable or schema-mismatched bodies are a miss (recompute, overwrite). Refresh deletes the key after a successful upsert.
+- **Failure policy.** Any DB read raising (bars, benchmark bars, stocks row) is 503; no daily bars is 404; Redis absent or failing at GET or SET is a computed 200 with `cached: false`.
+
+**Why:** the plan row names the endpoint and the cache TTL only; every bullet is a choice 4.3 plan math and the analyst prompt will read.
+
+**Supersedes:** N/A.

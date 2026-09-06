@@ -19,6 +19,7 @@ import pytest
 
 import indicators
 from indicators import (
+    Zone,
     aggregate_4h,
     avg_dollar_volume,
     calc_atr,
@@ -31,6 +32,10 @@ from indicators import (
     macd,
     relative_strength,
     rsi,
+    sector_etf,
+    support_resistance,
+    swing_snapshot,
+    zone_to_dict,
 )
 
 # ── Shared tiny frames ────────────────────────────────────────────────────
@@ -184,10 +189,11 @@ def test_gap_matches_hand_computed():
 
 def test_package_exports_all_public_names():
     expected = [
-        "Zone", "aggregate_4h", "avg_dollar_volume", "calc_atr", "calc_atrp",
-        "calc_rvol", "check_52w_position", "ema", "extension", "fractal_swings",
-        "gap", "macd", "merge_levels", "relative_strength", "rsi", "score_zones",
-        "support_resistance", "volume_nodes",
+        "IndicatorsResponse", "Zone", "aggregate_4h", "avg_dollar_volume", "calc_atr",
+        "calc_atrp", "calc_rvol", "check_52w_position", "ema", "extension",
+        "fractal_swings", "gap", "macd", "merge_levels", "relative_strength", "rsi",
+        "score_zones", "sector_etf", "support_resistance", "swing_snapshot",
+        "volume_nodes", "zone_to_dict",
     ]
     assert sorted(indicators.__all__) == expected
     for name in expected:
@@ -334,3 +340,174 @@ def test_gap_zero_prev_close_returns_nan():
     )
     assert np.isnan(out.iloc[1]) and not np.isinf(out.iloc[1])
     assert out.iloc[2] == pytest.approx(-10.0)
+
+
+# ── Part 1.7: sector ETF map ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "sector, etf",
+    [
+        ("Technology", "XLK"),
+        ("Healthcare", "XLV"),
+        ("Financial Services", "XLF"),
+        ("Consumer Cyclical", "XLY"),
+        ("Consumer Defensive", "XLP"),
+        ("Energy", "XLE"),
+        ("Industrials", "XLI"),
+        ("Utilities", "XLU"),
+        ("Real Estate", "XLRE"),
+        ("Basic Materials", "XLB"),
+        ("Communication Services", "XLC"),
+        ("Unknown Sector", None),
+    ],
+)
+def test_sector_etf_map(sector, etf):
+    assert sector_etf(sector) == etf
+
+
+def test_sector_etf_normalizes_case_and_whitespace():
+    assert sector_etf("  technology ") == "XLK"
+    assert sector_etf("FINANCIAL SERVICES") == "XLF"
+    assert sector_etf(None) is None
+    assert sector_etf("") is None
+    assert sector_etf("Other") is None  # the scanner's placeholder
+
+
+# ── Part 1.7: swing_snapshot (the endpoint's math, minus I/O) ─────────────
+#
+# Only the arithmetic the snapshot adds on top of the 1.5/1.6 functions is
+# hand-computed here: the 52-week window, the gap-history slice, the RS
+# wiring and the null / 0.0 conventions. Fixed-period fields are checked
+# for equality with the package function they wrap.
+
+
+def _frame(close, open_=None, high=None, low=None, volume=None) -> pd.DataFrame:
+    close = pd.Series(close, dtype=float)
+    n = len(close)
+    return pd.DataFrame(
+        {
+            "Open": pd.Series(open_, dtype=float) if open_ is not None else close,
+            "High": pd.Series(high, dtype=float) if high is not None else close + 1,
+            "Low": pd.Series(low, dtype=float) if low is not None else close - 1,
+            "Close": close,
+            "Volume": pd.Series(volume, dtype=float) if volume is not None else pd.Series([1000.0] * n),
+        }
+    ).set_index(pd.date_range("2026-01-01", periods=n, freq="D"))
+
+
+def test_swing_snapshot_pos52w_uses_window():
+    # closes 10,20,30,40,22. Full series: hi 40, lo 10 -> (22-10)/30 = 0.4.
+    # window 3 -> [30, 40, 22]: hi 40, lo 22 -> (22-22)/18 = 0.
+    df = _frame([10.0, 20.0, 30.0, 40.0, 22.0])
+    assert swing_snapshot(df, window_52w=5)["pos_52w"] == pytest.approx(0.4)
+    assert swing_snapshot(df, window_52w=3)["pos_52w"] == pytest.approx(0.0)
+
+
+def test_swing_snapshot_gap_history_is_last_n_gaps():
+    # gaps: NaN, (12-11)/11*100, (9-10)/10*100, (11-10)/10*100
+    df = _frame(close=[11.0, 10.0, 10.0, 12.0], open_=[10.0, 12.0, 9.0, 11.0])
+    snap = swing_snapshot(df, gap_history=2)
+    assert snap["gap_pct"] == pytest.approx(10.0)
+    assert snap["gaps20"] == [pytest.approx(-10.0), pytest.approx(10.0)]
+    full = swing_snapshot(df, gap_history=4)["gaps20"]
+    assert full[0] is None  # first bar has no previous close -> null, not NaN
+    assert full[1:] == [pytest.approx(100 / 11), pytest.approx(-10.0), pytest.approx(10.0)]
+
+
+def test_swing_snapshot_relative_strength_hand_computed():
+    # 5-bar window: stock 100 -> 121 (+21%), SPY 200 -> 220 (+10%) -> +11.0
+    # sector 50 -> 60 (+20%) -> +1.0. 20-bar RS needs 21 aligned rows -> None.
+    df = _frame([100.0, 105.0, 103.0, 108.0, 110.0, 121.0])
+    spy = pd.Series([200.0, 205.0, 210.0, 215.0, 218.0, 220.0], index=df.index)
+    sector = pd.Series([50.0, 52.0, 55.0, 54.0, 58.0, 60.0], index=df.index)
+    snap = swing_snapshot(df, spy, sector)
+    assert snap["rs_spy_5"] == pytest.approx(11.0)
+    assert snap["rs_sector_5"] == pytest.approx(1.0)
+    assert snap["rs_spy_20"] is None and snap["rs_sector_20"] is None
+
+
+def test_swing_snapshot_missing_benchmark_nulls_rs():
+    df = _frame([100.0, 105.0, 103.0, 108.0, 110.0, 121.0])
+    snap = swing_snapshot(df)
+    assert snap["rs_spy_5"] is None and snap["rs_sector_5"] is None
+    assert snap["ema20"] is not None
+
+
+def test_swing_snapshot_last_values_match_package_functions():
+    n = 30
+    close = [100 + i + (i % 3) for i in range(n)]
+    volume = [1000 + 10 * i for i in range(n)]
+    df = _frame(close, volume=volume)
+    c, h, lo, v = df["Close"], df["High"], df["Low"], df["Volume"]
+    snap = swing_snapshot(df)
+
+    ema20, ema50 = ema(c, 20), ema(c, 50)
+    atr14 = calc_atr(h, lo, c, 14)
+    macd_df = macd(c)
+    assert snap["bars"] == n and snap["close"] == c.iloc[-1]
+    assert snap["ema20"] == pytest.approx(ema20.iloc[-1])
+    assert snap["ema50"] == pytest.approx(ema50.iloc[-1])
+    assert snap["ema200"] == pytest.approx(ema(c, 200).iloc[-1])
+    assert snap["atr14"] == pytest.approx(atr14.iloc[-1])
+    assert snap["rsi14"] == pytest.approx(rsi(c, 14).iloc[-1])
+    assert snap["macd"] == pytest.approx(macd_df["macd"].iloc[-1])
+    assert snap["macd_signal"] == pytest.approx(macd_df["signal"].iloc[-1])
+    assert snap["macd_hist"] == pytest.approx(macd_df["hist"].iloc[-1])
+    assert snap["ext20"] == pytest.approx(extension(c, ema20, atr14).iloc[-1])
+    assert snap["ext50"] == pytest.approx(extension(c, ema50, atr14).iloc[-1])
+    assert snap["avg_dollar_volume_20"] == pytest.approx(avg_dollar_volume(c, v, 20))
+    assert snap["rvol"] == pytest.approx(calc_rvol(v, float(v.iloc[-1]), lookback=20))
+    assert snap["rvol"] > 0
+
+
+def test_swing_snapshot_zones_use_window():
+    # 8 leading bars far below, then the 17-bar test_levels series. With
+    # window 17 the zones must equal support_resistance() on those 17 bars
+    # alone (default 1.6 parameters); the leading bars change the volume
+    # bins and must be excluded.
+    lead = 8
+    high = [50.0 + i for i in range(lead)] + [103, 102, 101.5, 103, 105, 110, 106, 103, 102, 103, 104, 106, 108, 107, 103, 104, 106]
+    low = [48.0 + i for i in range(lead)] + [101, 100.5, 100, 100.8, 102, 106, 101, 99, 95, 98, 100, 102, 104, 100.5, 99.6, 101, 103]
+    close = [49.0 + i for i in range(lead)] + [102, 101, 100.5, 102, 104, 108, 102, 100, 96, 101, 103, 104, 106, 107, 100, 103, 105]
+    volume = [1.0] * lead + [1] * 13 + [100] + [1] * 3
+    df = _frame(close, high=high, low=low, volume=volume)
+
+    tail = df.tail(17)
+    expected = support_resistance(tail["High"], tail["Low"], tail["Close"], tail["Volume"])
+    snap = swing_snapshot(df, window_52w=17)
+    for side in ("support", "resistance"):
+        assert snap["zones"][side] == [zone_to_dict(z) for z in expected[side]]
+    assert snap["zones"]["support"]  # the known pivots produce zones
+
+    full = support_resistance(df["High"], df["Low"], df["Close"], df["Volume"])
+    assert [z.price for z in full["support"]] != [z.price for z in expected["support"]]
+
+
+def test_zone_to_dict_shape():
+    z = Zone(low=1.0, high=2.0, price=1.5, score=25, methods=("swing_low",), tests=1, recent=False, volume_node=True)
+    assert zone_to_dict(z) == {
+        "low": 1.0, "high": 2.0, "price": 1.5, "score": 25, "methods": ["swing_low"],
+        "tests": 1, "recent": False, "volume_node": True,
+    }
+
+
+def test_swing_snapshot_short_history_nulls():
+    snap = swing_snapshot(_frame([10.0, 11.0, 12.0]))
+    assert snap["bars"] == 3
+    for key in ("atr14", "rsi14", "ext20", "ext50", "avg_dollar_volume_20"):
+        assert snap[key] is None, key
+    assert snap["rvol"] == 0.0  # 1.5 convention: 0.0 on short input, never null
+    assert snap["ema20"] is not None and snap["macd"] is not None
+    assert snap["pos_52w"] == pytest.approx(1.0)
+    assert len(snap["gaps20"]) == 3 and snap["gaps20"][0] is None
+
+
+def test_swing_snapshot_empty_returns_nulls():
+    for df in (None, _frame([])):
+        snap = swing_snapshot(df)
+        assert snap["bars"] == 0 and snap["close"] is None
+        assert snap["rvol"] == 0.0
+        assert snap["gaps20"] == []
+        assert snap["zones"] == {"support": [], "resistance": []}
+        assert all(snap[k] is None for k in ("ema20", "atr14", "rsi14", "macd", "pos_52w", "rs_spy_5"))

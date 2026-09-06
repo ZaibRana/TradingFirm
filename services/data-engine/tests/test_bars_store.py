@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from db import get_bars, upsert_bars
+from db import bar_records_from_df, bars_to_df, get_bars, get_stock, upsert_bars
 
 
 def _make_pool(fetch_return=None):
@@ -20,6 +20,7 @@ def _make_pool(fetch_return=None):
     conn = AsyncMock()
     conn.executemany = AsyncMock()
     conn.fetch = AsyncMock(return_value=fetch_return or [])
+    conn.fetchrow = AsyncMock(return_value=None)
 
     pool = MagicMock()
     acquire_cm = AsyncMock()
@@ -93,3 +94,53 @@ async def test_get_bars_with_since_filters_and_maps_rows():
     assert "ts >= $3" in query
     assert args == ["AAPL", "1d", since]
     assert result == [fake_row]
+
+
+# ── Part 1.7: stocks lookup + bars → DataFrame ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_stock_sql():
+    pool, conn = _make_pool()
+    ts = datetime(2026, 9, 6, tzinfo=timezone.utc)
+    conn.fetchrow = AsyncMock(return_value={
+        "ticker": "AAPL", "name": "Apple Inc.", "sector": "Technology",
+        "industry": "Consumer Electronics", "market_cap": 1, "float_shares": 2, "updated_at": ts,
+    })
+
+    result = await get_stock(pool, "AAPL")
+
+    conn.fetchrow.assert_awaited_once()
+    query, *args = conn.fetchrow.await_args.args
+    assert "FROM data_engine.stocks" in query
+    assert "WHERE ticker = $1" in query
+    assert args == ["AAPL"]
+    assert result["sector"] == "Technology" and result["updated_at"] == ts
+
+
+@pytest.mark.asyncio
+async def test_get_stock_missing_returns_none():
+    pool, _conn = _make_pool()
+    assert await get_stock(pool, "ZZZZ") is None
+
+
+def test_bars_to_df_roundtrip():
+    ts1 = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    ts2 = datetime(2026, 8, 2, tzinfo=timezone.utc)
+    records = [
+        {"ts": ts1, "open": 10.0, "high": 11.0, "low": 9.5, "close": 10.5, "volume": 1_000_000},
+        {"ts": ts2, "open": 10.5, "high": 12.0, "low": 10.0, "close": 11.5, "volume": 2_000_000},
+    ]
+
+    df = bars_to_df(records)
+
+    assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
+    assert df.index.name == "Date"
+    assert df["Close"].tolist() == [10.5, 11.5]
+    assert bar_records_from_df(df) == records  # inverse of the write-direction helper
+
+
+def test_bars_to_df_empty():
+    df = bars_to_df([])
+    assert df.empty
+    assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]

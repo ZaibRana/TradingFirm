@@ -9,6 +9,7 @@ FastAPI application with endpoints:
   GET  /stocks/{ticker} — enriched data for one stock
   POST /stock/{ticker}/refresh — download + persist bars for one stock
   GET  /stock/{ticker}/bars — stored bars for one stock (DB only)
+  GET  /indicators/{ticker} — swing indicator set + zones from stored bars (Redis 15 min)
   GET  /market/status  — current market session
   GET  /health         — health check
   GET  /               — service info
@@ -30,6 +31,7 @@ from config import settings
 from providers import get_provider
 from scanners.market_scanner import MarketScanner
 from scanners.market_status import get_market_status
+from indicators import IndicatorsResponse, sector_etf, swing_snapshot
 from scanners.models import ScanRequest, ScanResult
 
 # ── Logging ──────────────────────────────────────────────────────
@@ -251,6 +253,8 @@ async def root():
             "GET  /scan/status",
             "GET  /stocks/{ticker}",
             "POST /stock/{ticker}/refresh",
+            "GET  /stock/{ticker}/bars",
+            "GET  /indicators/{ticker}",
             "GET  /market/status",
             "GET  /health",
         ],
@@ -492,6 +496,15 @@ async def refresh_stock(ticker: str):
     del bulk_daily, bulk_hourly, df_daily, df_hourly, daily_bars, hourly_bars
     gc.collect()
 
+    # New bars make any cached indicator snapshot stale: drop it now so a
+    # refresh is never followed by up to 15 min of old numbers. Best-effort.
+    if app.state.redis:
+        try:
+            from cache import delete_cached_indicators
+            await delete_cached_indicators(app.state.redis, ticker)
+        except Exception as e:
+            logger.warning(f"Indicators cache invalidation failed for {ticker}: {e}")
+
     # Cooldown starts only now — after a successful fetch + persist.
     if app.state.redis:
         try:
@@ -566,6 +579,105 @@ async def get_bars_endpoint(ticker: str, interval: str, since: Optional[str] = N
         "interval": interval,
         "bars": [bar_record_to_json(b) for b in bars],
     }
+
+
+@app.get("/indicators/{ticker}", response_model=IndicatorsResponse)
+async def get_indicators(ticker: str):
+    """
+    Plan §3 swing indicator set + support/resistance zones for one ticker,
+    computed from stored daily bars only — never calls the provider.
+
+    Benchmarks (SPY and the sector ETF from `data_engine.stocks.sector`)
+    are read from the same bar store; a missing one nulls its RS fields
+    and shows `bars: 0` under `benchmarks`. Cached in Redis for 15 min;
+    `cached` is set on the way out, not stored. 404 if the ticker has no
+    daily bars; 503 if the database is unavailable or any read fails.
+    """
+    ticker = normalize_ticker(ticker)
+    if not ticker.isalpha() or len(ticker) > 5:
+        raise HTTPException(status_code=400, detail="Invalid ticker format")
+
+    if not app.state.db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+
+    from cache import get_cached_indicators, set_cached_indicators
+
+    if app.state.redis:
+        try:
+            cached = await get_cached_indicators(app.state.redis, ticker)
+        except Exception as e:
+            logger.warning(f"Indicators cache read failed for {ticker}: {e}")
+            cached = None
+        if cached is not None:
+            try:
+                return IndicatorsResponse.model_validate({**cached, "cached": True})
+            except Exception as e:
+                logger.warning(f"Indicators cache for {ticker} does not match the schema, recomputing: {e}")
+
+    from db import bars_to_df, get_bars, get_stock
+
+    try:
+        daily_rows = await get_bars(app.state.db_pool, ticker, "1d")
+        if not daily_rows:
+            raise HTTPException(status_code=404, detail=f"No stored '1d' bars for '{ticker}'.")
+        spy_rows = daily_rows if ticker == "SPY" else await get_bars(app.state.db_pool, "SPY", "1d")
+        stock = await get_stock(app.state.db_pool, ticker)
+        sector_name = stock.get("sector") if stock else None
+        etf = sector_etf(sector_name)
+        if etf is None:
+            etf_rows = []
+        elif etf == ticker:
+            etf_rows = daily_rows
+        else:
+            etf_rows = await get_bars(app.state.db_pool, etf, "1d")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Indicators DB read failed for {ticker}: {e}")
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+
+    daily_df = bars_to_df(daily_rows)
+    spy_df = bars_to_df(spy_rows)
+    etf_df = bars_to_df(etf_rows)
+    snapshot = swing_snapshot(
+        daily_df,
+        spy_df["Close"] if len(spy_df) else None,
+        etf_df["Close"] if len(etf_df) else None,
+    )
+    as_of = daily_rows[-1]["ts"]
+    benchmarks = {
+        "spy": {"ticker": "SPY", "bars": len(spy_rows)},
+        "sector": {"ticker": etf, "bars": len(etf_rows)},
+    }
+    del daily_df, spy_df, etf_df, daily_rows, spy_rows, etf_rows
+    gc.collect()
+
+    logger.info(
+        f"Indicators {ticker}: bars={snapshot['bars']} close={snapshot['close']} "
+        f"ema20={snapshot['ema20']} rsi14={snapshot['rsi14']} spy={'yes' if snapshot['rs_spy_20'] is not None else 'no'} "
+        f"sector={sector_name!r}->{etf}"
+    )
+
+    response = IndicatorsResponse(
+        ticker=ticker,
+        as_of=as_of,
+        sector=sector_name,
+        benchmarks=benchmarks,
+        computed_at=datetime.now(timezone.utc),
+        cached=False,
+        **snapshot,
+    )
+
+    # Cache the body without `cached`: that flag describes the retrieval,
+    # not the data, and is set on the way out (True on a hit, False here).
+    if app.state.redis:
+        try:
+            body = response.model_dump(mode="json", by_alias=True, exclude={"cached"})
+            await set_cached_indicators(app.state.redis, ticker, body)
+        except Exception as e:
+            logger.warning(f"Indicators cache write failed for {ticker}: {e}")
+
+    return response
 
 
 @app.get("/market/status")

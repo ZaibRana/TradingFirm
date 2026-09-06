@@ -9,12 +9,11 @@ tests exercise the real route logic without needing Redis/Postgres to be
 reachable, matching this repo's "test the logic, not the framework" style
 (see test_bars_store.py).
 
-The 429 cooldown tests use a tiny in-process fake Redis (get/set/ttl only)
-rather than a mocked-away client, so the real cache.py cooldown code path
-actually runs — a mock would make the cooldown untestable.
+The 429 cooldown tests use the tiny in-process fake Redis in
+tests/fake_redis.py rather than a mocked-away client, so the real cache.py
+cooldown code path actually runs — a mock would make the cooldown untestable.
 """
 
-import time as _time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -22,6 +21,7 @@ from fastapi import HTTPException
 
 import main
 from providers.fixture_provider import FixtureProvider
+from tests.fake_redis import FakeRedis
 
 
 def _make_pool():
@@ -36,39 +36,6 @@ def _make_pool():
     acquire_cm.__aexit__ = AsyncMock(return_value=None)
     pool.acquire = MagicMock(return_value=acquire_cm)
     return pool, conn
-
-
-class _FakeRedis:
-    """Minimal async Redis stand-in: only get/set/ttl, matching what
-    cache.py's cooldown helpers use. Not a mock — a real (if tiny)
-    implementation, so the cooldown logic actually executes in tests."""
-
-    def __init__(self):
-        self._store: dict[str, tuple[str, float | None]] = {}
-
-    async def set(self, key, value, ex=None):
-        expires_at = _time.time() + ex if ex else None
-        self._store[key] = (value, expires_at)
-
-    async def get(self, key):
-        entry = self._store.get(key)
-        if entry is None:
-            return None
-        value, expires_at = entry
-        if expires_at is not None and _time.time() > expires_at:
-            del self._store[key]
-            return None
-        return value
-
-    async def ttl(self, key):
-        entry = self._store.get(key)
-        if entry is None:
-            return -2
-        _value, expires_at = entry
-        if expires_at is None:
-            return -1
-        remaining = expires_at - _time.time()
-        return int(remaining) if remaining > 0 else -2
 
 
 @pytest.fixture(autouse=True)
@@ -123,7 +90,7 @@ async def test_refresh_db_unavailable_returns_503():
 async def test_refresh_within_cooldown_returns_429_via_redis():
     pool, _conn = _make_pool()
     main.app.state.db_pool = pool
-    main.app.state.redis = _FakeRedis()
+    main.app.state.redis = FakeRedis()
 
     first = await main.refresh_stock("MSFT")
     assert first["ticker"] == "MSFT"
@@ -154,7 +121,7 @@ async def test_refresh_failed_fetch_does_not_start_cooldown():
     """A provider failure must not lock the ticker out for 15 minutes."""
     pool, _conn = _make_pool()
     main.app.state.db_pool = pool
-    main.app.state.redis = _FakeRedis()
+    main.app.state.redis = FakeRedis()
 
     failing_provider = MagicMock()
     failing_provider.download_daily = AsyncMock(side_effect=RuntimeError("boom"))

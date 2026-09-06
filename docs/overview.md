@@ -104,8 +104,8 @@ FastAPI app. Key pieces:
 
 - **Endpoints**: `POST /scan/run` (kicks off a background scan, 202
   Accepted), `GET /scan/status`, `GET /scan/results`, `GET /scan/history`,
-  `GET /stocks/{ticker}`, `POST /stock/{ticker}/refresh`, `GET /market/status`,
-  `GET /health`.
+  `GET /stocks/{ticker}`, `POST /stock/{ticker}/refresh`, `GET /stock/{ticker}/bars`,
+  `GET /indicators/{ticker}`, `GET /market/status`, `GET /health`.
 - **`data_engine.ohlcv_bars`** (Postgres) — daily/hourly OHLCV per ticker,
   written by `db.upsert_bars()` / read by `db.get_bars()`, with bar-shaping
   logic (`db.bar_records_from_df()`) shared by every write path.
@@ -145,8 +145,18 @@ FastAPI app. Key pieces:
   (support/resistance zones: strict fractal swings + close-binned volume
   nodes, merged within 0.5% of the group's running mean, scored 0–90,
   top 3 per side relative to the last close, returned as `Zone`
-  dataclasses). Conventions in `docs/decisions.md` 2026-09-06 (two
-  entries: indicator package, zones).
+  dataclasses), `snapshot.py` (`swing_snapshot`: the plan §3 swing set +
+  zones as one dict from a daily frame and optional benchmark closes),
+  `sectors.py` (11 yfinance sector names → SPDR sector ETFs), `models.py`
+  (`IndicatorsResponse`, camelCase aliases). Conventions in
+  `docs/decisions.md` 2026-09-06 (indicator package, zones, endpoint).
+- **`GET /indicators/{ticker}`** — the swing set + zones for one ticker,
+  computed from stored daily bars only (never the provider). SPY and the
+  sector ETF (from `data_engine.stocks.sector`, read by `db.get_stock()`)
+  come from the same bar store for relative strength; a missing one nulls
+  its fields and shows `bars: 0` under `benchmarks`. Cached in Redis for
+  15 min (`tf:cache:indicators:{ticker}`); `cached` is set on the way out,
+  and `POST /stock/{ticker}/refresh` drops the key after writing bars.
 - **`scanners/models.py`** — Pydantic models with `by_alias` field aliases
   (e.g. `market_cap` → `marketCap`) so FastAPI's snake_case internals
   serialize as the camelCase JSON the frontend expects.

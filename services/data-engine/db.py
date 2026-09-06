@@ -181,6 +181,32 @@ async def upsert_stocks(pool: asyncpg.Pool, stocks: list[dict]) -> int:
     return len(records)
 
 
+async def get_stock(pool: asyncpg.Pool, ticker: str) -> Optional[dict]:
+    """
+    One row from data_engine.stocks (written by the scan pipeline), or
+    None if the ticker was never scanned. Read-only.
+    """
+    query = """
+        SELECT ticker, name, sector, industry, market_cap, float_shares, updated_at
+        FROM data_engine.stocks
+        WHERE ticker = $1
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(query, ticker)
+
+    if row is None:
+        return None
+    return {
+        "ticker": row["ticker"],
+        "name": row["name"],
+        "sector": row["sector"],
+        "industry": row["industry"],
+        "market_cap": row["market_cap"],
+        "float_shares": row["float_shares"],
+        "updated_at": row["updated_at"],
+    }
+
+
 # ── OHLCV Bars ───────────────────────────────────────────────────
 
 def bar_records_from_df(df) -> list[dict]:
@@ -259,6 +285,29 @@ def bar_record_to_json(bar: dict) -> dict:
         "close": bar["close"],
         "volume": bar["volume"],
     }
+
+
+def bars_to_df(bars: list[dict]):
+    """Inverse of bar_records_from_df(): row dicts from get_bars() → a
+    provider-shaped DataFrame (Open/High/Low/Close/Volume columns,
+    DatetimeIndex named 'Date', oldest first). Empty list → empty frame
+    with the same columns."""
+    import pandas as pd
+
+    columns = ["Open", "High", "Low", "Close", "Volume"]
+    if not bars:
+        return pd.DataFrame(columns=columns, index=pd.DatetimeIndex([], name="Date"))
+    index = pd.DatetimeIndex([b["ts"] for b in bars], name="Date")
+    return pd.DataFrame(
+        {
+            "Open": [float(b["open"]) for b in bars],
+            "High": [float(b["high"]) for b in bars],
+            "Low": [float(b["low"]) for b in bars],
+            "Close": [float(b["close"]) for b in bars],
+            "Volume": [int(b["volume"]) for b in bars],
+        },
+        index=index,
+    )
 
 
 async def get_bars(

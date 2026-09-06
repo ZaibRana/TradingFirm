@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 CACHE_LAST_SCAN = "tf:cache:last_scan"
 CACHE_SCAN_STATUS = "tf:cache:scan_status"
 CACHE_REFRESH_PREFIX = "tf:cache:refresh:"
+CACHE_INDICATORS_PREFIX = "tf:cache:indicators:"
 
 # Pub/sub channels
 CHANNEL_SCAN_COMPLETE = "tf:scan:complete"
@@ -27,6 +28,7 @@ CHANNEL_SCAN_COMPLETE = "tf:scan:complete"
 TTL_SCAN_RESULT = 3600      # 1 hour
 TTL_SCAN_STATUS = 600       # 10 minutes
 TTL_REFRESH_COOLDOWN = 900  # 15 minutes
+TTL_INDICATORS = 900        # 15 minutes
 
 
 # ── Connection ───────────────────────────────────────────────────
@@ -116,6 +118,50 @@ async def set_refresh_cooldown(
     doesn't lock the ticker out with nothing to show for it.
     """
     await r.set(f"{CACHE_REFRESH_PREFIX}{ticker}", "1", ex=ttl)
+
+
+# ── Per-Ticker Indicator Snapshot (Part 1.7) ─────────────────────
+
+def indicators_key(ticker: str) -> str:
+    """Cache key for one ticker's indicator snapshot. Caller passes the
+    normalized ticker (main.normalize_ticker)."""
+    return f"{CACHE_INDICATORS_PREFIX}{ticker}"
+
+
+async def get_cached_indicators(r: aioredis.Redis, ticker: str) -> Optional[dict]:
+    """
+    Cached indicator body for `ticker`, or None on a miss. A stored value
+    that is not valid JSON (or not a JSON object) is treated as a miss and
+    logged — the caller recomputes and overwrites it.
+    """
+    data = await r.get(indicators_key(ticker))
+    if data is None:
+        return None
+    try:
+        body = json.loads(data)
+    except (TypeError, ValueError) as e:
+        logger.warning(f"Indicators cache for {ticker} is not valid JSON, ignoring: {e}")
+        return None
+    if not isinstance(body, dict):
+        logger.warning(f"Indicators cache for {ticker} is not an object, ignoring")
+        return None
+    return body
+
+
+async def set_cached_indicators(
+    r: aioredis.Redis,
+    ticker: str,
+    body: dict,
+    ttl: int = TTL_INDICATORS,
+) -> None:
+    """Cache one ticker's indicator body (JSON-ready dict) with TTL."""
+    await r.set(indicators_key(ticker), json.dumps(body, default=str), ex=ttl)
+
+
+async def delete_cached_indicators(r: aioredis.Redis, ticker: str) -> int:
+    """Drop the cached snapshot (after a refresh wrote new bars). Returns
+    the number of keys removed (0 or 1)."""
+    return int(await r.delete(indicators_key(ticker)))
 
 
 # ── Pub/Sub Events ───────────────────────────────────────────────
