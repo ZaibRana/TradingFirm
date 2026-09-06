@@ -8,6 +8,7 @@ FastAPI application with endpoints:
   GET  /scan/status    — current scan status (idle/running/completed)
   GET  /stocks/{ticker} — enriched data for one stock
   POST /stock/{ticker}/refresh — download + persist bars for one stock
+  GET  /stock/{ticker}/bars — stored bars for one stock (DB only)
   GET  /market/status  — current market session
   GET  /health         — health check
   GET  /               — service info
@@ -20,6 +21,7 @@ import logging
 import time as _time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -504,6 +506,65 @@ async def refresh_stock(ticker: str):
         "ticker": ticker,
         "dailyBars": daily_count,
         "hourlyBars": hourly_count,
+    }
+
+
+@app.get("/stock/{ticker}/bars")
+async def get_bars_endpoint(ticker: str, interval: str, since: Optional[str] = None):
+    """
+    Fetch stored OHLCV bars for one ticker/interval. DB only — never
+    falls through to the live provider.
+
+    404 if the ticker/interval has no stored bars at all. 200 with an
+    empty `bars` list if bars exist but `since` filters all of them out
+    (those are different states: absent vs. filtered-empty).
+    """
+    ticker = normalize_ticker(ticker)
+    if not ticker.isalpha() or len(ticker) > 5:
+        raise HTTPException(status_code=400, detail="Invalid ticker format")
+
+    if interval not in ("1d", "1h"):
+        raise HTTPException(status_code=400, detail="interval must be '1d' or '1h'")
+
+    since_dt = None
+    if since is not None:
+        try:
+            since_dt = datetime.fromisoformat(since)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid 'since' value: {since}")
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+
+    if not app.state.db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+
+    from db import bar_record_to_json, get_bars
+
+    try:
+        bars_all = await get_bars(app.state.db_pool, ticker, interval)
+    except Exception as e:
+        logger.error(f"Bars query failed for {ticker}/{interval}: {e}")
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+
+    if not bars_all:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No stored '{interval}' bars for '{ticker}'.",
+        )
+
+    if since_dt is not None:
+        try:
+            bars = await get_bars(app.state.db_pool, ticker, interval, since=since_dt)
+        except Exception as e:
+            logger.error(f"Bars query failed for {ticker}/{interval}: {e}")
+            raise HTTPException(status_code=503, detail="Database unavailable.")
+    else:
+        bars = bars_all
+
+    return {
+        "ticker": ticker,
+        "interval": interval,
+        "bars": [bar_record_to_json(b) for b in bars],
     }
 
 

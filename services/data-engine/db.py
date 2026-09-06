@@ -247,6 +247,20 @@ async def upsert_bars(
     return len(records)
 
 
+def bar_record_to_json(bar: dict) -> dict:
+    """Convert one row dict from get_bars() (datetime ts) into a
+    JSON-ready dict (ISO string ts) for API responses. Read-direction
+    counterpart to bar_records_from_df()."""
+    return {
+        "ts": bar["ts"].isoformat(),
+        "open": bar["open"],
+        "high": bar["high"],
+        "low": bar["low"],
+        "close": bar["close"],
+        "volume": bar["volume"],
+    }
+
+
 async def get_bars(
     pool: asyncpg.Pool,
     ticker: str,
