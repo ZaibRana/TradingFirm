@@ -19,6 +19,8 @@ Conventions (docs/decisions.md, Part 1.6):
   - Volume nodes bin each bar's volume by its close over [min low, max high];
     bars with NaN close or NaN volume are skipped.
   - Merge anchor is the running mean of the group, inclusive of merge_pct.
+  - "methods" are swing_high / swing_low only; a volume node is reported
+    separately (Zone.volume_node) and scores +25 but is not a method.
   - "tests" = number of swing members in a zone; "recent" = newest swing
     member within the last `recent_bars` bars of the full series (NaN tail
     included).
@@ -47,6 +49,7 @@ class Zone:
     methods: tuple[str, ...]
     tests: int
     recent: bool
+    volume_node: bool
 
 
 # ── Stage 1a: fractal swings ──────────────────────────────────────────────
@@ -191,9 +194,10 @@ def score_zones(
     """
     Score each merged group and turn it into a Zone.
 
-    Rubric (plan §6, Part 1.6):
-      +30  two or more methods among swing_high / swing_low / volume
-      +25  contains a volume node
+    Rubric (plan §6, Part 1.6; methods rule per docs/decisions.md
+    2026-09-06 "volume is not a method"):
+      +30  two methods: swing_high and swing_low both present
+      +25  contains a volume node (not a method — a swing plus a node is 25)
       +20  tested two or more times (two or more swing members)
       +15  recent (newest swing member within the last `recent_bars` bars
            of the full series, NaN tail included)
@@ -203,7 +207,8 @@ def score_zones(
     zones: list[Zone] = []
     for group in groups:
         prices = [lv[0] for lv in group]
-        methods = tuple(sorted({lv[1] for lv in group}))
+        methods = tuple(sorted({lv[1] for lv in group if lv[1] != VOLUME}))
+        volume_node = any(lv[1] == VOLUME for lv in group)
         swing_idx = [lv[2] for lv in group if lv[1] != VOLUME and lv[2] is not None]
         tests = len(swing_idx)
         recent = any(i >= n_bars - recent_bars for i in swing_idx)
@@ -211,7 +216,7 @@ def score_zones(
         score = 0
         if len(methods) >= 2:
             score += 30
-        if VOLUME in methods:
+        if volume_node:
             score += 25
         if tests >= 2:
             score += 20
@@ -226,6 +231,7 @@ def score_zones(
             methods=methods,
             tests=tests,
             recent=recent,
+            volume_node=volume_node,
         ))
     return zones
 

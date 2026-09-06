@@ -8,7 +8,8 @@ Conventions under test (docs/decisions.md, Part 1.6):
   - strict fractals; NaN high/low disqualifies the bar and its window
   - volume nodes bin by close over [min low, max high]; NaN close/volume skipped
   - running-mean merge, inclusive of merge_pct
-  - rubric: +30 two methods, +25 volume node, +20 tested twice, +15 recent
+  - rubric: +30 both swing methods, +25 volume node (not a method),
+    +20 tested twice, +15 recent
   - split on last valid close; zone price == close is resistance
 """
 
@@ -41,7 +42,7 @@ from indicators import (
 # Scores with recent_bars=5 (recent = idx >= 12):
 #   95      swing_low idx 8                 -> 0
 #   99.8    2 swing lows, idx 14 recent     -> 20 + 15 = 35
-#   107.75  swing_high idx 12 + volume      -> 30 + 25 + 15 = 70
+#   107.75  swing_high idx 12 + volume      -> 25 + 15 = 40 (one method)
 #   110     swing_high idx 5                -> 0
 # Last close 105: support = [99.8, 95], resistance = [107.75, 110].
 
@@ -128,27 +129,27 @@ def test_merge_levels_does_not_merge_beyond_half_percent():
     [
         pytest.param(
             [(100.0, "swing_low", 3)],
-            Zone(100.0, 100.0, 100.0, 0, ("swing_low",), 1, False),
+            Zone(100.0, 100.0, 100.0, 0, ("swing_low",), 1, False, False),
             id="swing_only_single_not_recent_0",
         ),
         pytest.param(
             [(100.0, "volume", None)],
-            Zone(100.0, 100.0, 100.0, 25, ("volume",), 0, False),
+            Zone(100.0, 100.0, 100.0, 25, (), 0, False, True),
             id="volume_only_25",
         ),
         pytest.param(
             [(100.0, "swing_low", 3), (100.3, "volume", None)],
-            Zone(100.0, 100.3, 100.15, 55, ("swing_low", "volume"), 1, False),
-            id="swing_plus_volume_double_counts_55",
+            Zone(100.0, 100.3, 100.15, 25, ("swing_low",), 1, False, True),
+            id="swing_plus_volume_is_one_method_25",
         ),
         pytest.param(
             [(100.0, "swing_high", 3), (100.3, "swing_low", 6)],
-            Zone(100.0, 100.3, 100.15, 50, ("swing_high", "swing_low"), 2, False),
+            Zone(100.0, 100.3, 100.15, 50, ("swing_high", "swing_low"), 2, False, False),
             id="two_swing_methods_tested_twice_50",
         ),
         pytest.param(
             [(100.0, "swing_high", 28), (100.3, "swing_low", 6), (100.2, "volume", None)],
-            Zone(100.0, 100.3, 300.5 / 3, 90, ("swing_high", "swing_low", "volume"), 2, True),
+            Zone(100.0, 100.3, 300.5 / 3, 90, ("swing_high", "swing_low"), 2, True, True),
             id="all_four_90",
         ),
     ],
@@ -159,7 +160,7 @@ def test_score_zones_rubric(group, expected):
     assert zone.price == pytest.approx(expected.price)
     assert zone == Zone(
         expected.low, expected.high, zone.price, expected.score,
-        expected.methods, expected.tests, expected.recent,
+        expected.methods, expected.tests, expected.recent, expected.volume_node,
     )
 
 
@@ -171,10 +172,10 @@ def test_support_resistance_splits_by_last_close_and_ranks_by_score():
     assert _prices(out["support"]) == pytest.approx([99.8, 95.0])
     assert [z.score for z in out["support"]] == [35, 0]
     assert _prices(out["resistance"]) == pytest.approx([107.75, 110.0])
-    assert [z.score for z in out["resistance"]] == [70, 0]
+    assert [z.score for z in out["resistance"]] == [40, 0]
 
     top = out["resistance"][0]
-    assert top == Zone(107.5, 108.0, 107.75, 70, ("swing_high", "volume"), 1, True)
+    assert top == Zone(107.5, 108.0, 107.75, 40, ("swing_high",), 1, True, True)
 
     # Zone price == last close -> resistance, not support. Moving the last
     # close onto the 107.75 zone changes only that bar's bin (still bin
@@ -237,7 +238,7 @@ def test_support_resistance_returns_fewer_than_three_when_scarce():
     flat = pd.Series([50, 50, 50], dtype=float)
     out = support_resistance(flat, flat, flat, pd.Series([1, 2, 3], dtype=float))
     assert out["support"] == []
-    assert out["resistance"] == [Zone(50.0, 50.0, 50.0, 25, ("volume",), 0, False)]
+    assert out["resistance"] == [Zone(50.0, 50.0, 50.0, 25, (), 0, False, True)]
 
 
 def test_support_resistance_is_deterministic():
