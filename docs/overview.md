@@ -138,8 +138,12 @@ FastAPI app. Key pieces:
   hourly bars), `volatility.py` (ATR, ATRP, extension from an MA in ATR
   units, opening gap %), `momentum.py` (RSI — SMA-seeded Wilder, MACD,
   relative strength vs a benchmark in percentage points, 52-week position),
-  `volume.py` (RVOL, 20-day average dollar volume). Conventions in
-  `docs/decisions.md` 2026-09-06.
+  `volume.py` (RVOL, 20-day average dollar volume), `levels.py`
+  (support/resistance zones: strict fractal swings + close-binned volume
+  nodes, merged within 0.5% of the group's running mean, scored 0–90,
+  top 3 per side relative to the last close, returned as `Zone`
+  dataclasses). Conventions in `docs/decisions.md` 2026-09-06 (two
+  entries: indicator package, zones).
 - **`scanners/models.py`** — Pydantic models with `by_alias` field aliases
   (e.g. `market_cap` → `marketCap`) so FastAPI's snake_case internals
   serialize as the camelCase JSON the frontend expects.
