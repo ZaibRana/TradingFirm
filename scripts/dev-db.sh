@@ -31,3 +31,7 @@ fi
 EOS
 
 MIGRATE_DB="$DEV_DB" POSTGRES_CONTAINER="$CONTAINER" "$(dirname "$0")/migrate.sh"
+
+# The dev API connects to Postgres only at startup (no lazy reconnect), so
+# restart it to pick up a database that did not exist when it booted.
+docker compose --profile dev restart data-engine-dev
