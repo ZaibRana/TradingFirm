@@ -113,6 +113,13 @@ async def lifespan(app: FastAPI):
     app.state.provider = get_provider(settings.data_provider)
     logger.info(f"✅ Data provider: {app.state.provider.provider_name}")
 
+    # Alpha Vantage: fallback source for past earnings dates (Part 2.3).
+    # An empty key is normal (dev twin): the client raises before any HTTP
+    # and the earnings step reports the source as unavailable.
+    from providers.context.alphavantage_client import AlphaVantageClient
+    app.state.av_client = AlphaVantageClient(settings.alphavantage_api_key)
+    logger.info(f"✅ Alpha Vantage configured: {app.state.av_client.configured}")
+
     app.state.scanner = MarketScanner(app.state.provider, app.state.db_pool)
     logger.info("✅ Scanner initialized")
 
@@ -126,6 +133,10 @@ async def lifespan(app: FastAPI):
         logger.info("Database pool closed")
     if app.state.redis:
         await app.state.redis.close()
+
+    av_client = getattr(app.state, "av_client", None)
+    if av_client:
+        await av_client.aclose()
         logger.info("Redis connection closed")
 
 
@@ -489,6 +500,22 @@ async def refresh_stock(ticker: str):
     del bulk_daily, bulk_hourly, df_daily, df_hourly, daily_bars, hourly_bars
     gc.collect()
 
+    # Earnings report dates (Part 2.3): runs after the bars are stored, so
+    # it validates report dates against a store that already includes this
+    # refresh. Bars are the product — any failure here is logged and the
+    # refresh still returns 200 with a reason the caller can read.
+    earnings = {"source": None, "stored": 0, "dropped": 0, "reason": "error"}
+    try:
+        from providers.context.earnings import sync_earnings_dates
+        earnings = await sync_earnings_dates(
+            app.state.provider,
+            getattr(app.state, "av_client", None),
+            ticker,
+            app.state.db_pool,
+        )
+    except Exception as e:
+        logger.warning(f"Earnings dates step failed for {ticker}: {type(e).__name__}: {e}")
+
     # New bars make any cached indicator snapshot stale: drop it now so a
     # refresh is never followed by up to 15 min of old numbers. Best-effort.
     if app.state.redis:
@@ -512,6 +539,7 @@ async def refresh_stock(ticker: str):
         "ticker": ticker,
         "dailyBars": daily_count,
         "hourlyBars": hourly_count,
+        "earningsDates": earnings,
     }
 
 

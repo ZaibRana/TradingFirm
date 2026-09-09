@@ -83,3 +83,22 @@ class FixtureProvider(DataProvider):
         if not path.exists():
             return dict(DEFAULT_INFO)
         return json.loads(path.read_text())
+
+    async def get_earnings_dates(self, ticker: str) -> Optional[pd.DataFrame]:
+        """
+        Recorded earnings dates from tests/fixtures/earnings_dates/<T>.json.
+
+        A file holding the literal `null` means "recorded, and yfinance
+        returned None for this ticker" (SPY: an ETF has no earnings) and
+        gives None. A *missing* file is a different thing — never recorded
+        — and raises, so a test can never silently pass on absent data.
+        """
+        path = self.fixtures_dir / "earnings_dates" / f"{ticker}.json"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"No earnings-dates fixture for {ticker} at {path}; "
+                f"record it with tests/record_earnings_live.py"
+            )
+        if json.loads(path.read_text()) is None:
+            return None
+        return pd.read_json(path, orient="table")

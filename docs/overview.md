@@ -161,6 +161,24 @@ FastAPI app. Key pieces:
   `cache.cached_json()` (read-through, fail-open on Redis, wrong-shaped
   bodies are a miss) and `tickers.validate_ticker()` (1–5 letters; class
   shares deferred, `docs/decisions.md` 2026-09-09).
+  `alphavantage_client.py` + `earnings.py` (Part 2.3, spec `docs/specs/2.3.md`):
+  past earnings report dates, which the Finnhub free calendar does not
+  carry. Primary is `DataProvider.get_earnings_dates()` (yfinance
+  `Ticker.get_earnings_dates(limit=12)`; the fixture provider replays
+  `tests/fixtures/earnings_dates/<T>.json`, where `null` records "this
+  ticker has no earnings feed" and a missing file raises); the fallback is
+  Alpha Vantage `EARNINGS`, called only when the primary yields no usable
+  past date — never on a rate limit (`ProviderRateLimited`) and never when
+  the bar store is empty. Report dates are validated against the stored
+  daily bars (a bar date, or within one day of one) before they are written
+  as `('earnings', date)` rows with `meta.earnings.{source, validated,
+  hour, epsEstimate, epsReported, surprisePct}`, which merges beside 2.1's
+  `meta.calendar`. `POST /stock/{ticker}/refresh` runs the step after the
+  bar upserts and always answers `earningsDates: {source, stored, dropped,
+  reason}`; a failure there never fails a refresh whose bars were stored.
+  The Alpha Vantage key travels as the `apikey` query parameter (no header
+  form exists) under the two conditions in that client module: the `httpx`
+  logger pinned to WARNING and typed errors raised `from None`.
 - **Storage fallback chain**: results are always kept in an in-memory store;
   Redis and Postgres are optional — the service degrades gracefully and
   keeps working (from memory only) if either is unavailable at startup.

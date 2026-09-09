@@ -189,3 +189,21 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 - **Finnhub limiter is per-client** (`FinnhubClient.__init__` builds one when none is injected), unlike the module-level EDGAR limiter. Not touched in 2.2.
 - **One uvicorn worker assumed** for the module-level EDGAR limiter; the Dockerfile CMD has no `--workers`. If that changes, the limiter must move out of process (Redis).
 
+---
+
+## 2026-09-09 — Earnings report dates: yfinance primary, Alpha Vantage fallback (Part 2.3, commit 1)
+
+**Decision:**
+
+- **Two sources, one direction.** yfinance `Ticker.get_earnings_dates(limit=12)` through `DataProvider.get_earnings_dates()` is primary; Alpha Vantage `EARNINGS` is the fallback, called only when the primary yields no usable *past* date. The fallback is never called on a rate limit (the source refused, which says nothing about its data) and never when the bar store is empty (validation is then impossible, so the call is wasted). `providers/base.ProviderRateLimited` is what carries that difference; `yfinance.exceptions.YFRateLimitError` maps onto it (confirmed present on the pinned 1.5.1).
+- **Live findings (plan §18, four calls).** yfinance 1.5.1 columns are `EPS Estimate`, `Reported EPS`, `Surprise(%)`; the index is tz-aware `America/New_York`, so the `amc`/`bmo`/`dmh` hour is derived, not guessed. `limit=12` actually returned **25 rows** for AAPL and MSFT, spanning six years. SPY (an ETF) returns `None` — recorded as the literal `null` in its fixture, which is a different fact from a missing file. Alpha Vantage `quarterlyEarnings` items carry `fiscalDateEnding`, `reportedDate`, `reportedEPS`, `estimatedEPS`, `surprise`, `surprisePercentage`, `reportTime` — every value a **string**, with `"None"` as the null sentinel, and `reportTime` is present (`post-market` / `pre-market`).
+- **Validation reads the store, not the refresh frame.** A past report date must be a stored daily bar date or within one calendar day of one. Refresh downloads two years while the feed reaches six back, so validating against the frame would drop older reports the store can still explain. One `db.get_bars(pool, ticker, "1d")` with no `since` at the top of the sync.
+- **"Out of range" is not "dropped".** Rows older than the stored bar history are counted separately and reported only in the log. Against a two-year store the live AAPL feed puts 20 of 25 rows there; folding them into `dropped` would make the dossier's `dataQuality` alarming and meaningless. `dropped` counts only dates inside the stored window that are not a trading day or adjacent to one.
+- **One response shape.** `POST /stock/{ticker}/refresh` gains `earningsDates: {source, stored, dropped, reason}`, never null, `reason` ∈ `null` / `rate_limited` / `down` / `no_bars` / `error`, so 2.4 handles one object. A failure in the step never fails a refresh whose bars were stored.
+- **`meta.earnings` is the one nested key** this part writes (`source`, `validated`, `hour`, `epsEstimate`, `epsReported`, `surprisePct`), so 2.1's `meta.calendar` survives the `existing || new` merge. All three writers (Finnhub calendar, yfinance, Alpha Vantage) build `event_at` as midnight UTC of the Eastern calendar date and therefore collide on the PK by design.
+- **Alpha Vantage key in the query string** is an approved, narrow exception to G14, held by two conditions in the client module: the `httpx` logger pinned to WARNING, and typed errors raised `from None` with messages built from `function` + `symbol` only. Free tier 5/min (in-process limiter) and 25/day, the daily cap arriving as HTTP 200 with an `Information` body rather than a 429.
+
+**Why:** the plan row for 2.3 assumes stored earnings dates exist; they do not, because the Finnhub free calendar returns only the upcoming report (2026-09-09 entry above). Everything here is a choice that entry left to this part, plus three facts only a live call could settle (the real column names, the 25-row `limit`, and the string-typed Alpha Vantage payload).
+
+**Supersedes:** N/A. Extends the 2026-09-09 Finnhub entry, which named Part 2.3 as the place the past-report-date gap gets closed.
+

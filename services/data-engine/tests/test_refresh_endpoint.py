@@ -64,6 +64,10 @@ async def test_refresh_success_returns_counts_and_persists():
         "ticker": "AAPL",
         "dailyBars": len(daily_df),
         "hourlyBars": len(hourly_df),
+        # Part 2.3: the earnings step always reports one shape. This pool
+        # returns no stored bars, so report dates cannot be validated and
+        # the step stops before either source is called.
+        "earningsDates": {"source": None, "stored": 0, "dropped": 0, "reason": "no_bars"},
     }
     assert conn.executemany.await_count == 2
 

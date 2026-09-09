@@ -1,0 +1,113 @@
+{
+ "symbol": "AAPL",
+ "quarterlyEarnings": [
+  {
+   "fiscalDateEnding": "2026-06-30",
+   "reportedDate": "2026-07-30",
+   "reportedEPS": "2.02",
+   "estimatedEPS": "1.88",
+   "surprise": "0.14",
+   "surprisePercentage": "7.4468",
+   "reportTime": "post-market"
+  },
+  {
+   "fiscalDateEnding": "2026-03-31",
+   "reportedDate": "2026-04-30",
+   "reportedEPS": "2.01",
+   "estimatedEPS": "1.94",
+   "surprise": "0.07",
+   "surprisePercentage": "3.6082",
+   "reportTime": "post-market"
+  },
+  {
+   "fiscalDateEnding": "2025-12-31",
+   "reportedDate": "2026-01-29",
+   "reportedEPS": "2.84",
+   "estimatedEPS": "2.67",
+   "surprise": "0.17",
+   "surprisePercentage": "6.367",
+   "reportTime": "post-market"
+  },
+  {
+   "fiscalDateEnding": "2025-09-30",
+   "reportedDate": "2025-10-30",
+   "reportedEPS": "1.85",
+   "estimatedEPS": "1.77",
+   "surprise": "0.08",
+   "surprisePercentage": "4.5198",
+   "reportTime": "post-market"
+  },
+  {
+   "fiscalDateEnding": "2025-06-30",
+   "reportedDate": "2025-07-31",
+   "reportedEPS": "1.57",
+   "estimatedEPS": "1.43",
+   "surprise": "0.14",
+   "surprisePercentage": "9.7902",
+   "reportTime": "post-market"
+  },
+  {
+   "fiscalDateEnding": "2025-03-31",
+   "reportedDate": "2025-05-01",
+   "reportedEPS": "1.65",
+   "estimatedEPS": "1.62",
+   "surprise": "0.03",
+   "surprisePercentage": "1.8519",
+   "reportTime": "post-market"
+  },
+  {
+   "fiscalDateEnding": "2024-12-31",
+   "reportedDate": "2025-01-30",
+   "reportedEPS": "2.4",
+   "estimatedEPS": "2.34",
+   "surprise": "0.06",
+   "surprisePercentage": "2.5641",
+   "reportTime": "post-market"
+  },
+  {
+   "fiscalDateEnding": "2024-09-30",
+   "reportedDate": "2024-10-31",
+   "reportedEPS": "0.97",
+   "estimatedEPS": "0.95",
+   "surprise": "0.02",
+   "surprisePercentage": "2.1053",
+   "reportTime": "post-market"
+  },
+  {
+   "fiscalDateEnding": "2024-06-30",
+   "reportedDate": "2024-08-01",
+   "reportedEPS": "1.4",
+   "estimatedEPS": "1.34",
+   "surprise": "0.06",
+   "surprisePercentage": "4.4776",
+   "reportTime": "post-market"
+  },
+  {
+   "fiscalDateEnding": "2024-03-31",
+   "reportedDate": "2024-05-02",
+   "reportedEPS": "1.53",
+   "estimatedEPS": "1.5",
+   "surprise": "0.03",
+   "surprisePercentage": "2",
+   "reportTime": "post-market"
+  },
+  {
+   "fiscalDateEnding": "2023-12-31",
+   "reportedDate": "2024-02-01",
+   "reportedEPS": "2.18",
+   "estimatedEPS": "2.11",
+   "surprise": "0.07",
+   "surprisePercentage": "3.3175",
+   "reportTime": "post-market"
+  },
+  {
+   "fiscalDateEnding": "2023-09-30",
+   "reportedDate": "2023-11-02",
+   "reportedEPS": "1.46",
+   "estimatedEPS": "1.39",
+   "surprise": "0.07",
+   "surprisePercentage": "5.036",
+   "reportTime": "post-market"
+  }
+ ]
+}

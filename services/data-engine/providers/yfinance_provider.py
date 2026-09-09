@@ -27,8 +27,9 @@ from typing import Any, Optional
 import pandas as pd
 import yfinance as yf
 from finvizfinance.screener.overview import Overview
+from yfinance.exceptions import YFRateLimitError
 
-from providers.base import DataProvider
+from providers.base import DataProvider, ProviderRateLimited
 from scanners.market_status import get_market_status
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ FINVIZ_DELAY_MAX = 2.5       # Maximum seconds between Finviz calls
 YF_BATCH_SIZE = 20            # Max tickers per yf.download() call
 YF_BATCH_DELAY = 3.0          # Seconds between download batches
 YF_INFO_DELAY = 1.5           # Seconds between Ticker.info calls
+YF_EARNINGS_LIMIT = 12        # Rows per get_earnings_dates() call (Part 2.3)
 MAX_RETRIES = 3               # Max retries for API calls
 RETRY_BACKOFF = [1, 2, 4]     # Backoff schedule in seconds
 
@@ -373,6 +375,46 @@ class YFinanceProvider(DataProvider):
                     )
                     await asyncio.sleep(wait)
         raise last_error
+
+    # ── Earnings dates (Part 2.3) ─────────────────────────────────
+
+    async def get_earnings_dates(self, ticker: str) -> Optional[pd.DataFrame]:
+        """
+        Past + upcoming report dates via yfinance Ticker.get_earnings_dates().
+
+        One call, no retries (G6): a rate limit here must stop the caller,
+        not start a retry storm. YFRateLimitError becomes ProviderRateLimited
+        so providers/context/earnings.py can tell "no data" from "refused"
+        and skip the Alpha Vantage fallback. Every other failure is logged
+        and returns None, which does trigger the fallback.
+        """
+        return await asyncio.to_thread(self._get_earnings_dates_sync, ticker)
+
+    def _get_earnings_dates_sync(self, ticker: str) -> Optional[pd.DataFrame]:
+        """Synchronous earnings-date fetch. No session= (yfinance 1.x
+        manages its own), one Ticker call after the standard info delay."""
+        time.sleep(YF_INFO_DELAY)
+        try:
+            df = yf.Ticker(ticker).get_earnings_dates(limit=YF_EARNINGS_LIMIT)
+        except YFRateLimitError:
+            raise ProviderRateLimited(
+                f"yfinance rate limited on earnings dates for {ticker}"
+            ) from None
+        except Exception as e:
+            # Belt and braces: some 1.x paths surface a rate limit as a
+            # generic exception rather than YFRateLimitError.
+            msg = str(e).lower()
+            if "rate" in msg or "too many" in msg or "429" in msg:
+                raise ProviderRateLimited(
+                    f"yfinance rate limited on earnings dates for {ticker}"
+                ) from None
+            logger.warning(f"get_earnings_dates({ticker}) failed: {type(e).__name__}: {e}")
+            return None
+
+        if df is None or getattr(df, "empty", True):
+            logger.info(f"get_earnings_dates({ticker}): no rows")
+            return None
+        return df
 
     def _get_stock_info_sync(self, ticker: str) -> dict:
         """Synchronous stock info fetch.

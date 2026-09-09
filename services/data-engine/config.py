@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     # twin is always empty.
     edgar_user_agent: str = ""
 
+    # Alpha Vantage (Part 2.3): fallback source for past earnings report
+    # dates when yfinance has none. Empty = AlphaVantageNotConfigured
+    # before any HTTP; the dev twin is always empty.
+    alphavantage_api_key: str = ""
+
     # Scanner defaults
     default_price_min: float = 10.0
     default_price_max: float = 40.0

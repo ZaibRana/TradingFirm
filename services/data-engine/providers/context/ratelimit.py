@@ -64,3 +64,15 @@ class RateLimiter:
 # clock (EdgarClient(limiter=...)).
 EDGAR_MAX_CALLS_PER_SECOND = 10
 edgar_limiter = RateLimiter(max_calls=EDGAR_MAX_CALLS_PER_SECOND, window=1.0, min_gap=0.0)
+
+
+# ── Part 2.3: the Alpha Vantage limiter ──────────────────────────────────
+# Free tier: 5 requests per minute (and 25 per day, which is not a rate
+# and is detected by body shape in alphavantage_client, not tracked here).
+# No minimum gap: five calls may go out back to back, the sixth waits.
+# Module-level so every AlphaVantageClient in the process shares it; same
+# one-uvicorn-worker assumption as the EDGAR limiter above.
+ALPHAVANTAGE_MAX_CALLS_PER_MINUTE = 5
+alphavantage_limiter = RateLimiter(
+    max_calls=ALPHAVANTAGE_MAX_CALLS_PER_MINUTE, window=60.0, min_gap=0.0
+)

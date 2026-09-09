@@ -11,6 +11,20 @@ from typing import Any, Optional
 import pandas as pd
 
 
+class ProviderError(Exception):
+    """Base class for provider failures that callers branch on."""
+
+
+class ProviderRateLimited(ProviderError):
+    """
+    The upstream data source rate limited us (Part 2.3).
+
+    Raised instead of returning empty so a caller can tell "the source has
+    no data" (fall back to another source) from "the source refused to
+    answer" (stop, never fall back, never retry — G6).
+    """
+
+
 class DataProvider(ABC):
     """
     Abstract interface for market data providers.
@@ -111,3 +125,22 @@ class DataProvider(ABC):
             floatStr, news (list of {title, url, publisher})
         """
         ...
+
+    async def get_earnings_dates(self, ticker: str) -> Optional[pd.DataFrame]:
+        """
+        Past and upcoming earnings report dates for one ticker (Part 2.3).
+
+        Concrete, not abstract, and returns None by default: a provider
+        that has no earnings feed stays a valid DataProvider, and the
+        caller treats None as "this source has nothing" and falls back.
+
+        Returns:
+            DataFrame indexed by report timestamp (tz-aware, exchange
+            local time) with EPS estimate / reported / surprise columns,
+            or None when the provider has no data for the ticker.
+
+        Raises:
+            ProviderRateLimited: the source rate limited us. The caller
+            must stop, not fall back, and not retry.
+        """
+        return None
