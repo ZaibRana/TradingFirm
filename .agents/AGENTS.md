@@ -126,6 +126,13 @@
 → The user pastes keys; never type, echo or read one. If one leaks into a transcript, say so and ask for rotation
 → Why: Part 2.1 masked `docker compose config` expecting quotes; compose prints unquoted, the key leaked, rotation needed
 
+### G15: Production Changes Only On Explicit Go
+**When:** Anything that changes production state and cannot be undone by `git revert` — schema migrations, data deletes, prod rebuilds/redeploys, secret rotation
+→ Runs only on the user's explicit go in chat, given for that specific action
+→ Never inside a part's verification — verify on the dev twin, mocks or fixtures instead
+→ The completion report lists what is ready and waiting for a go, one line per action
+→ Why: Parts 1.6–2.1 each recreated the prod container and applied migrations without asking. Harmless while prod holds no data; not once real scans are in it
+
 ---
 
 ## PART 2: PROJECT RULES — TradingFirm
@@ -167,10 +174,14 @@ Reference implementation: `scanner/pro_scan.py` (523 lines)
 - **Cache results**: Never re-scrape if data is < 1 hour old.
 - **One scan at a time**: Never run concurrent Finviz scans.
 
+### Production Changes (G15 in this repo)
+- **Needs a go**: `./scripts/migrate.sh` against prod (`tradingfirm`), and `docker compose up -d [--build] data-engine` or any other prod service recreate/rebuild. Also `.env` secret rotation and any `DELETE`/`TRUNCATE` on prod tables.
+- **Needs no ask**: `scripts/dev-db.sh`, anything on the dev twin (`tf-data-engine-dev`, `tradingfirm_dev`, Redis DB 1), tests, fixtures.
+- **Prod migrations applied before this rule existed**: 0.2 (`001_initial_schema.sql`), 1.1 (`002_bars.sql`), 2.1 (`003_context.sql`). Prod container recreated without asking by 1.6, 1.6 follow-up, 1.7, 2.1.
+
 ### Operations
 - **Scan cooldown**: Minimum 10 minutes between full scans. API endpoint rejects if < 10 min since last scan.
 - **Concurrency**: Only one scan at a time — check `tf:cache:scan_status` before starting. Return 409 if already running.
 - **Error isolation**: If one ticker fails during enrichment, skip it — never crash the whole scan. Log ticker name + error.
 - **Resource cleanup**: Close DB pools, Redis, HTTP sessions on shutdown. `del` large DataFrames + `gc.collect()` after processing.
 - **No raw storage**: Never store DataFrames in app.state — only lightweight dicts/results.
-- **Prod migrations only on explicit go**: `./scripts/migrate.sh` against prod runs only when the user says so in the conversation, never as part of a part's verification. `scripts/dev-db.sh` (dev DB) needs no ask. Applied to prod before this rule: 0.2 (`001`), 1.1 (`002`), 2.1 (`003`).

@@ -10,7 +10,7 @@ TradingFirm — a day-trading system that screens the market, applies technical 
 
 ## Read `.agents/AGENTS.md` first
 
-14 global rules + project rules take priority over generic habits. The ones most likely to bite:
+15 global rules + project rules take priority over generic habits. The ones most likely to bite:
 
 - **G1 — Ask before building.** 3-sentence spec approved before touching files for any new feature/service.
 - **G1.5 — Spec tables.** Stateful parts: writes table + failure-branch table in the spec, each branch naming its test function. Keys go through one shared normalization function.
@@ -20,6 +20,7 @@ TradingFirm — a day-trading system that screens the market, applies technical 
 - **G8 — Clean up memory.** `del` DataFrames + `gc.collect()` after use; never store raw DataFrames in `app.state`.
 - **G13 — Verify edits landed.** Absolute paths for every edit; prove scripted edits applied; end each completion report with `git diff --stat <base>..HEAD`.
 - **G14 — Never print secrets.** No `docker compose config` / `env` / `cat .env`; check keys by shape only. A mask is not a safeguard.
+- **G15 — Production changes only on explicit go.** Migrations, data deletes, prod rebuilds/redeploys, secret rotation: never inside a part's verification; the report lists what is waiting for a go.
 
 ## Docs discipline
 
@@ -80,6 +81,6 @@ Requires `.env` with `DB_PASSWORD` set — compose fails fast without it.
 - **Name the `test_*.py` files when running pytest** in `services/data-engine`. `pytest.ini` (`testpaths = tests`, `python_files = test_*.py`) now keeps a bare `pytest` from collecting `tests/full_scan_test.py`, which fires a real Finviz + yfinance scan on import — naming files is habit and belt-and-braces, no longer the only guard.
 - **`tests/smoke_test_pipeline.py`, `tests/full_scan_test.py`, `tests/record_fixture_live.py`, `tests/record_finnhub_live.py`** are live-API scripts. Run manually and deliberately, never in CI.
 - **One live scan pipeline: `services/data-engine`** (proxied by `web/app/api/scanner/pro/route.js`). `scanner/` is a frozen reference — don't build on it (`scanner/README.md`). Its `results.json`/`status.json` are generated output.
-- **Prod migrations run only on the user's explicit go.** `./scripts/migrate.sh` against prod is never part of a part's verification; `scripts/dev-db.sh` (dev DB) needs no ask. Applied before this rule: 0.2, 1.1, 2.1.
+- **G15 here means**: prod `./scripts/migrate.sh` and `docker compose up -d data-engine` (any prod service) wait for a go. `scripts/dev-db.sh` and the dev twin need no ask. Parts that applied prod migrations before the rule: 0.2, 1.1, 2.1.
 - **Migrations must be re-runnable**: `IF NOT EXISTS` everywhere, no plain `INSERT` seeds. Why: `scripts/migrate.sh` header, `docs/decisions.md` 2026-09-05.
 - **Never write into another service's Postgres schema** (`data_engine`, `signals`, `risk`, `users`, `ai`). Cross-service communication is HTTP + Redis pub/sub only.
