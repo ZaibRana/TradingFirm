@@ -53,3 +53,14 @@ class RateLimiter:
                     return waited
                 await self._sleep(wait)
                 waited += wait
+
+
+# ── Part 2.2: the EDGAR limiter ──────────────────────────────────────────
+# One mechanism: a rolling window of 10 per second (the SEC fair-access
+# cap), no minimum gap. Module-level so every EdgarClient in the process
+# shares it. One uvicorn worker is assumed (the Dockerfile CMD has no
+# --workers); more workers would multiply the rate — deferred, see
+# docs/progress.md row 2.2. Tests inject their own instance with a fake
+# clock (EdgarClient(limiter=...)).
+EDGAR_MAX_CALLS_PER_SECOND = 10
+edgar_limiter = RateLimiter(max_calls=EDGAR_MAX_CALLS_PER_SECOND, window=1.0, min_gap=0.0)

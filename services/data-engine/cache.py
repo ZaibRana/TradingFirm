@@ -21,6 +21,7 @@ CACHE_SCAN_STATUS = "tf:cache:scan_status"
 CACHE_REFRESH_PREFIX = "tf:cache:refresh:"
 CACHE_INDICATORS_PREFIX = "tf:cache:indicators:"
 CACHE_FINNHUB_PREFIX = "tf:cache:finnhub:"
+CACHE_EDGAR_PREFIX = "tf:cache:edgar:"
 
 # Pub/sub channels
 CHANNEL_SCAN_COMPLETE = "tf:scan:complete"
@@ -32,6 +33,8 @@ TTL_REFRESH_COOLDOWN = 900  # 15 minutes
 TTL_INDICATORS = 900        # 15 minutes
 TTL_FINNHUB_NEWS = 900      # 15 minutes
 TTL_FINNHUB_CONTEXT = 86400 # 24 hours (recommendations, earnings, profile)
+TTL_EDGAR_CIK_MAP = 86400   # 24 hours (ticker → CIK map, plan 2.2)
+TTL_EDGAR_FILINGS = 900     # 15 minutes (recent filings per ticker, same as news)
 
 
 # ── Connection ───────────────────────────────────────────────────
@@ -200,11 +203,15 @@ async def cached_json(
     key: str,
     ttl: int,
     fetch: Callable[[], Awaitable[Any]],
+    *,
+    valid: Optional[Callable[[Any], bool]] = None,
 ) -> tuple[Any, bool]:
     """
     Read-through cache shared by the context fetchers: return
     (body, from_cache). On a miss, `fetch()` runs and its result is cached
-    for `ttl` seconds. Fail-open on Redis: `r` may be None, and a raise on
+    for `ttl` seconds. A cached body that fails `valid` (wrong shape) is a
+    miss too: logged, refetched, overwritten — the get_cached_indicators()
+    rule (Part 2.2). Fail-open on Redis: `r` may be None, and a raise on
     get or set is logged and ignored so the caller still gets a body. A
     raise inside `fetch()` propagates and nothing is cached.
     """
@@ -213,6 +220,9 @@ async def cached_json(
             body = await get_cached_json(r, key)
         except Exception as e:
             logger.warning(f"Cache read failed for {key}: {e}")
+            body = None
+        if body is not None and valid is not None and not valid(body):
+            logger.warning(f"Cache at {key} has the wrong shape, ignoring")
             body = None
         if body is not None:
             return body, True
@@ -225,6 +235,17 @@ async def cached_json(
         except Exception as e:
             logger.warning(f"Cache write failed for {key}: {e}")
     return body, False
+
+
+# ── EDGAR keys (Part 2.2) ─────────────────────────────────────────
+
+EDGAR_CIK_MAP_KEY = f"{CACHE_EDGAR_PREFIX}cik_map"
+
+
+def edgar_key(kind: str, ticker: str) -> str:
+    """Cache key for one EDGAR per-ticker result (kind: 'filings'). Caller
+    passes the normalized ticker (tickers.normalize_ticker)."""
+    return f"{CACHE_EDGAR_PREFIX}{kind}:{ticker}"
 
 
 # ── Pub/Sub Events ───────────────────────────────────────────────

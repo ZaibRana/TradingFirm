@@ -136,7 +136,31 @@ FastAPI app. Key pieces:
   key reaches prod `data-engine` only via `FINNHUB_API_KEY`; the dev twin
   has it hard-coded empty. Tests mock HTTP with `respx` and replay
   `tests/fixtures/finnhub/AAPL_*.json`, recorded once by
-  `tests/record_finnhub_live.py`.
+  `tests/record_finnhub_live.py`. `edgar_client.py` (Part 2.2, spec
+  `docs/specs/2.2.md`): SEC EDGAR over the same shape — no key, a declared
+  `User-Agent` "<app> <email>" from `EDGAR_USER_AGENT` (empty →
+  `EdgarNotConfigured` before any HTTP), one process-wide limiter
+  `ratelimit.edgar_limiter` (rolling window, 10 per second), 403/429 →
+  `EdgarRateLimited` (stop, no retry), 404 → `EdgarNotFound`. `edgar.py`:
+  `cik_map()` (whole `company_tickers.json` → `{ticker: cik}`, Redis
+  `tf:cache:edgar:cik_map`, 24 h), `recent_filings(ticker, forms=('8-K',
+  '4'), days=30)` → `(rows, truncated)` (submissions `filings.recent`
+  parsed to the rows filed within the last 90 days plus the block's oldest
+  date, cached 15 min under `tf:cache:edgar:filings:{T}`; forms/days
+  filtered in-process, `days` 1–90, amendments fold into the base form;
+  `truncated` only when the block does not reach back to `today − days`;
+  not-in-map and submissions-404 both return empty), pure
+  `parse_submissions` / `filter_filings` / `filing_records`, and
+  `sync_filings()` storing rows via `db.upsert_filings()` into
+  `data_engine.filings` (migration `004_filings.sql`, PK `(ticker,
+  accession)`, `filed_on DATE` = official filing date, `accepted_at`
+  nullable, `ON CONFLICT DO NOTHING`). Fixtures
+  `tests/fixtures/edgar/{company_tickers,AAPL_submissions}.json` recorded
+  once by `tests/record_edgar_live.py`. Shared by both fetchers:
+  `providers/context/ratelimit.py` (`RateLimiter`, injectable clock),
+  `cache.cached_json()` (read-through, fail-open on Redis, wrong-shaped
+  bodies are a miss) and `tickers.validate_ticker()` (1–5 letters; class
+  shares deferred, `docs/decisions.md` 2026-09-09).
 - **Storage fallback chain**: results are always kept in an in-memory store;
   Redis and Postgres are optional — the service degrades gracefully and
   keeps working (from memory only) if either is unavailable at startup.

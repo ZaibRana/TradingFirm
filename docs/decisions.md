@@ -159,3 +159,33 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 
 **Supersedes:** the G1 wording of 2026-09-04 (first entry); G1.5 unchanged.
 
+---
+
+## 2026-09-09 — SEC EDGAR filings fetcher (Part 2.2)
+
+**Decision:** the approved spec is `docs/specs/2.2.md`; the choices the plan row left open, as approved after review:
+
+- **Two modules** (`edgar_client.py`, `edgar.py`) like 2.1, over the shared `ratelimit.RateLimiter`, `cache.cached_json()` and `tickers.validate_ticker()` (refactor commit before this part).
+- **Limiter:** one mechanism, a rolling window of 10 per second, no gap, one module-level instance `ratelimit.edgar_limiter` shared by every client in the process; one uvicorn worker assumed.
+- **Verified live (plan §18):** two calls for AAPL with the declared User-Agent answered 200. `company_tickers.json` has 10,407 entries; the submissions `filings.recent` block is 16 parallel arrays, up to 1,000 rows, newest first. `acceptanceDateTime` is genuine UTC (a Form 4 accepted 18:30 ET shows `22:30:44.000Z`).
+- **Dates:** `filed_on DATE NOT NULL` is the official `filingDate` — what `days` filters on and what 2.3/2.4 join daily bars on. `accepted_at TIMESTAMPTZ` is `acceptanceDateTime`, NULL when EDGAR gives none, never fabricated.
+- **Blocked means stop.** SEC answers 403 for an undeclared client and for "Request Rate Threshold Exceeded"; 403 and 429 both raise `EdgarRateLimited`, nothing retries.
+- **Cache shape.** Whole ticker → CIK map under one key, 24 h; an empty map raises and is never cached. Per ticker, the parsed rows of `recent` with `filingDate` inside `today − 90` (the `days` maximum; bounded by date, not count), every form, plus the block's oldest `filingDate`, for 15 min. `forms` / `days` (1..90) filter in-process. A cached body of the wrong shape is a miss (`valid` predicate on `cached_json`).
+- **Truncation** is real only when the block's oldest row, before form filtering, is newer than `today − days`: `recent_filings` returns `(rows, truncated)`, warns then and never otherwise; 2.4 surfaces the flag in `dataQuality`.
+- **Unequal `recent` columns fail closed** (`EdgarError`, nothing cached): a short middle array would pair every later accession with the wrong form. Absent columns read as all-None; missing values inside an aligned row are dropped and logged.
+- **Nothing at the SEC fails open:** not in the map, or CIK known but submissions 404 → `([], False)` at warning, so 2.4 keeps the section. The client still raises `EdgarNotFound`; the fetcher catches it.
+- **Table.** `data_engine.filings` PK `(ticker, accession)` (the same accession appears under GOOG and GOOGL); `ON CONFLICT DO NOTHING` because a filed accession never changes — a future derivation change is a one-off backfill with its own entry. Amendments fold into the base form for matching (`8-K/A` matches `'8-K'`); the row keeps the literal form.
+
+**Why:** the plan row names the endpoints, the User-Agent rule and the 10 req/s cap only; every bullet is a choice 2.3, 2.4 and Phase 6 (an 8-K is a wake trigger) build on.
+
+**Supersedes:** N/A.
+
+---
+
+## 2026-09-09 — Deferred from Part 2.2
+
+- **Class shares unreachable through both context fetchers.** `validate_ticker` is letters-only, so `BRK-B` (SEC) and `BRK.B` (Finnhub) both raise before HTTP, although `BRK-B` is a key in the CIK map. Fix, as its own future `refactor:`: one canonical form in `validate_ticker`, hyphen/dot mapped per provider at the call site. Not inside 2.2.
+- **2.1 Finnhub fetchers coerce a wrong-shaped cached body** to `[]` / `{}` instead of refetching; the `valid` predicate on `cached_json` is the same fix. Not touched in 2.2.
+- **Finnhub limiter is per-client** (`FinnhubClient.__init__` builds one when none is injected), unlike the module-level EDGAR limiter. Not touched in 2.2.
+- **One uvicorn worker assumed** for the module-level EDGAR limiter; the Dockerfile CMD has no `--workers`. If that changes, the limiter must move out of process (Redis).
+

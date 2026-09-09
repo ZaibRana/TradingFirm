@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     # FinnhubNotConfigured before any HTTP; the dev twin is always empty.
     finnhub_api_key: str = ""
 
+    # SEC EDGAR (Part 2.2) requires a declared User-Agent "<app> <email>".
+    # Empty = the client raises EdgarNotConfigured before any HTTP; the dev
+    # twin is always empty.
+    edgar_user_agent: str = ""
+
     # Scanner defaults
     default_price_min: float = 10.0
     default_price_max: float = 40.0

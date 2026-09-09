@@ -306,6 +306,68 @@ async def upsert_events(pool: asyncpg.Pool, events: list[dict]) -> int:
     return len(records)
 
 
+# ── Context: filings (Part 2.2) ──────────────────────────────────
+
+async def upsert_filings(pool: asyncpg.Pool, filings: list[dict]) -> int:
+    """
+    Insert rows into data_engine.filings, skipping any (ticker, accession)
+    already stored — ON CONFLICT DO NOTHING, because a filed accession
+    never changes (docs/decisions.md 2026-09-09, Part 2.2). Each item:
+    ticker, form, filed_on (date, the official filingDate), accepted_at
+    (aware datetime or None), accession, url, meta (dict). Items missing
+    ticker / form / filed_on / accession / url are dropped and counted in
+    the log; duplicates inside one batch are collapsed (first kept, the
+    same answer DO NOTHING gives).
+
+    Returns the number of rows sent (executemany reports no insert count).
+    Same no-transaction caveat as upsert_news(): a raise mid-batch can
+    leave earlier rows inserted; a rerun dedups.
+    """
+    if not filings:
+        return 0
+
+    query = """
+        INSERT INTO data_engine.filings
+            (ticker, form, filed_on, accepted_at, accession, url, meta)
+        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+        ON CONFLICT (ticker, accession) DO NOTHING
+    """
+    records: list[tuple] = []
+    seen: set[tuple[str, str]] = set()
+    dropped = 0
+    for item in filings:
+        ticker = item.get("ticker") or ""
+        form = (item.get("form") or "").strip()
+        accession = (item.get("accession") or "").strip()
+        url = (item.get("url") or "").strip()
+        if not ticker or not form or not accession or not url or item.get("filed_on") is None:
+            dropped += 1
+            continue
+        key = (ticker, accession)
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append((
+            ticker,
+            form[:20],
+            item["filed_on"],
+            item.get("accepted_at"),
+            accession,
+            url,
+            json.dumps(item.get("meta") or {}, default=str),
+        ))
+    if dropped:
+        logger.warning(f"upsert_filings: dropped {dropped} item(s) missing ticker/form/filed_on/accession/url")
+    if not records:
+        return 0
+
+    async with pool.acquire() as conn:
+        await conn.executemany(query, records)
+
+    logger.info(f"Sent {len(records)} filing rows ({len(filings) - len(records)} dup/dropped)")
+    return len(records)
+
+
 # ── OHLCV Bars ───────────────────────────────────────────────────
 
 def bar_records_from_df(df) -> list[dict]:
