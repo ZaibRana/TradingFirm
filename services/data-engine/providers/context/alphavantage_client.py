@@ -107,8 +107,9 @@ class AlphaVantageClient:
                 f"{self.base_url}/query",
                 params={"function": function, "symbol": symbol, "apikey": self.api_key},
             )
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, OSError) as e:
             # `from None`: HTTPStatusError/RequestError reprs embed the URL.
+            # OSError too — see the note in finnhub_client.get().
             raise AlphaVantageError(f"{where}: transport error: {type(e).__name__}") from None
         finally:
             self.calls_made += 1

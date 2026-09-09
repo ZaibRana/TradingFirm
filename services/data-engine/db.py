@@ -20,9 +20,15 @@ logger = logging.getLogger(__name__)
 # Every exception that means "the database, not an upstream source, failed"
 # (Part 2.4). Named here so the dossier's section boundary re-raises exactly
 # what a test raises: a DB failure is a 503 for the whole document, never a
-# degraded section. `OSError` covers a socket dying mid-query; the HTTP
-# clients map their own OSErrors to typed errors so none can land here.
-DB_ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
+# degraded section.
+#
+# ConnectionError, not OSError: a socket dying mid-query is a database
+# failure, but the wider OSError family is not. asyncio.TimeoutError *is*
+# the builtin TimeoutError, which subclasses OSError — with OSError here,
+# every section that ran out of budget would have been reported as a dead
+# database. The HTTP clients map their own OSErrors to typed errors, so no
+# upstream failure reaches this tuple either.
+DB_ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, ConnectionError)
 
 
 # ── Connection Pool ──────────────────────────────────────────────

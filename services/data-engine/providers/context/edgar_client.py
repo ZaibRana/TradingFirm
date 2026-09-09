@@ -91,7 +91,9 @@ class EdgarClient:
         headers = {"User-Agent": self.user_agent, "Accept": "application/json"}
         try:
             resp = await self._http.get(url, headers=headers)
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, OSError) as e:
+            # OSError too — see the note in finnhub_client.get(): an unmapped
+            # OSError would read as a database failure in Part 2.4.
             raise EdgarError(f"{url}: transport error: {type(e).__name__}: {e}") from e
         finally:
             self.calls_made += 1

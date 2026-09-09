@@ -84,7 +84,11 @@ class FinnhubClient:
             resp = await self._http.get(
                 url, params=params, headers={"X-Finnhub-Token": self.api_key}
             )
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, OSError) as e:
+            # OSError as well as httpx's own errors: a bare socket error must
+            # not escape the client. Part 2.4 keys "the database failed" on
+            # OSError (db.DB_ERRORS), so an unmapped OSError from here would
+            # turn an upstream hiccup into a 503 instead of a degraded section.
             raise FinnhubError(f"{path}: transport error: {type(e).__name__}: {e}") from e
         finally:
             self.calls_made += 1
