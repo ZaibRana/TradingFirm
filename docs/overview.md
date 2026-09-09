@@ -43,7 +43,7 @@ pub/sub, never by writing into another service's tables.
 |---|---|---|---|
 | `data-engine` | 8001 | **Functional** | Finviz screening → yfinance OHLCV → technical filters → enrichment. The only backend service with real logic. |
 | `signal-engine` | 8002 | Empty scaffold | Intended for entry/exit signal detection (zones, patterns). Only `/health` and `/` exist. |
-| `risk-shield` | 8003 | Empty scaffold | Intended for position sizing, drawdown monitoring, kill switches. Only `/health` and `/` exist. |
+| `risk-shield` | 8003 | **Skeleton** | Market health scoring and regime detection (Phase 3). Part 3.1 gave it `config.py` / `db.py` / `cache.py`, a bounded fail-open lifespan and the `risk.macro_briefs` table; the endpoints are still `/health` (now reporting `db_connected` / `redis_connected` / `fredConfigured`) and `/`. Monitors, scoring and `/market/*` land in 3.2–3.4. |
 | `ai-agent` | 8004 | Empty scaffold | Intended for trade grading via an LLM (`LLM_PROVIDER` env var supports Gemini/Anthropic). Only `/health` and `/` exist. |
 | `web` (dashboard) | 3000 | **Functional** | Next.js UI showing scan results, stock cards, market status. |
 
@@ -294,14 +294,29 @@ Google-sign-in scaffolding under `web/lib/firebase/` has been removed.
   applies migrations to it (via `MIGRATE_DB=` in `scripts/migrate.sh`);
   until it runs the dev API reports `db_connected: false`. Conventions in
   `docs/decisions.md` 2026-09-06 (Part 0.7 entry).
+- **`tf-risk-shield-dev` (port 8013)** is the same arrangement for
+  risk-shield (Part 3.1): profile `dev`, the Dockerfile's `dev` stage,
+  source volume-mounted, `tradingfirm_dev` + Redis DB 1, `FRED_API_KEY`
+  hard-coded empty, and `infra/supabase/migrations` mounted read-only at
+  `/migrations` for the tests that assert migration text. Phase 3 tests run
+  there:
+  `docker exec tf-risk-shield-dev pytest tests/test_config.py ... -v`.
+- **Startup bounds differ between the two services.** risk-shield wraps
+  each dependency connection in `asyncio.wait_for(config.STARTUP_TIMEOUT)`
+  (5 s, worst-case boot ~10 s); data-engine does not, and a slow-but-not-
+  refusing Postgres can stall its boot for up to a minute. `docs/decisions.md`
+  2026-09-09 (Part 3.1) records the reasoning and leaves data-engine to a
+  later refactor.
 
 ## Where things stand
 
 The **data-engine + web dashboard** loop is the one real, working path today:
 screen the market, filter candidates, enrich, display them. Everything
-downstream of that — actually generating trade signals (`signal-engine`),
-managing risk (`risk-shield`), and grading trades with AI (`ai-agent`) — is
-still an empty FastAPI scaffold with no business logic. The `scanner/`
+downstream of that — actually generating trade signals (`signal-engine`)
+and grading trades with AI (`ai-agent`) — is still an empty FastAPI
+scaffold with no business logic. `risk-shield` has its infrastructure
+(config, pool, cache, migration, dev twin) as of Part 3.1 but no market
+logic yet. The `scanner/`
 standalone scripts predate the data-engine port and stay only as a frozen
 reference — see [`.agents/AGENTS.md`](../.agents/AGENTS.md) for the full
 rationale.
