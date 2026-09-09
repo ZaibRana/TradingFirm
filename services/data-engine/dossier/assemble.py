@@ -123,10 +123,38 @@ class DossierContext:
     refresh: Optional[Callable[[str], Awaitable[dict]]] = None
     now: Optional[datetime] = None
     calls: dict = field(default_factory=dict)
+    _marks: dict = field(default_factory=dict)
 
     def count(self, source: str, n: int = 1) -> None:
+        """Add calls a caller counted itself (the refresh helper reports the
+        provider calls it made; nothing else uses this)."""
         if n:
             self.calls[source] = self.calls.get(source, 0) + n
+
+    def mark_clients(self) -> None:
+        """Snapshot each HTTP client's call counter.
+
+        One delta per source for the whole dossier, not one per section:
+        sections run concurrently and share a client, so a per-section
+        `before`/`after` pair counts calls the *other* sections made in
+        between (the 2.5 live check reported 14 upstream calls for 10).
+
+        KNOWN LIMIT: `calls_made` is per client object, and the app holds one
+        client per process, so two dossiers assembled at the same moment
+        still cross-count each other. Acceptable while one caller uses the
+        endpoint; a contextvars counter inside the clients is the fix if that
+        changes (deferred, docs/progress.md).
+        """
+        self._marks = {
+            SOURCE_FINNHUB: getattr(self.finnhub, "calls_made", 0),
+            SOURCE_EDGAR: getattr(self.edgar, "calls_made", 0),
+        }
+
+    def collect_clients(self) -> None:
+        """Fold the marked clients' deltas into `calls`."""
+        for source, client in ((SOURCE_FINNHUB, self.finnhub), (SOURCE_EDGAR, self.edgar)):
+            spent = getattr(client, "calls_made", 0) - self._marks.get(source, 0)
+            self.count(source, spent)
 
     def now_utc(self) -> datetime:
         return self.now or datetime.now(timezone.utc)
@@ -273,9 +301,7 @@ async def build_news(ctx: DossierContext, ticker: str, profile: dict) -> NewsSec
     from providers.context.finnhub import company_news, news_records
 
     await _check_cooldown(ctx, SOURCE_FINNHUB, TTL_COOLDOWN_FINNHUB)
-    before = ctx.finnhub.calls_made
     raw = await company_news(ctx.finnhub, ticker, redis=ctx.redis, days=profile["news_days"])
-    ctx.count(SOURCE_FINNHUB, ctx.finnhub.calls_made - before)
 
     rows = news_records(ticker, raw)
     if ctx.pool is not None and rows:
@@ -318,12 +344,10 @@ async def build_events(ctx: DossierContext, ticker: str, profile: dict) -> Event
     )
 
     fetch_error: Optional[Exception] = None
-    before = ctx.finnhub.calls_made
     try:
         await _check_cooldown(ctx, SOURCE_FINNHUB, TTL_COOLDOWN_FINNHUB)
         cal_raw = await earnings_calendar(ctx.finnhub, ticker, redis=ctx.redis)
         sur_raw = await earnings_surprises(ctx.finnhub, ticker, redis=ctx.redis)
-        ctx.count(SOURCE_FINNHUB, ctx.finnhub.calls_made - before)
         rows = calendar_events(ticker, cal_raw) + surprise_events(ticker, sur_raw)
         if ctx.pool is not None and rows:
             from db import upsert_events
@@ -331,8 +355,6 @@ async def build_events(ctx: DossierContext, ticker: str, profile: dict) -> Event
     except DB_ERRORS:
         raise
     except Exception as e:
-        # Count what the failed attempt already spent before it raised.
-        ctx.count(SOURCE_FINNHUB, ctx.finnhub.calls_made - before)
         fetch_error = e
         await _cooldown_for(e, ctx)
         logger.warning(f"dossier events {ticker}: fetch failed, serving the store — {safe_detail(e)}")
@@ -362,9 +384,7 @@ async def build_recommendations(ctx: DossierContext, ticker: str) -> Recommendat
     from providers.context.finnhub import recommendations
 
     await _check_cooldown(ctx, SOURCE_FINNHUB, TTL_COOLDOWN_FINNHUB)
-    before = ctx.finnhub.calls_made
     rows = await recommendations(ctx.finnhub, ticker, redis=ctx.redis)
-    ctx.count(SOURCE_FINNHUB, ctx.finnhub.calls_made - before)
     return RecommendationsSection(status=STATUS_OK, items=list(rows))
 
 
@@ -372,9 +392,7 @@ async def build_profile(ctx: DossierContext, ticker: str) -> ProfileSection:
     from providers.context.finnhub import profile as fetch_profile
 
     await _check_cooldown(ctx, SOURCE_FINNHUB, TTL_COOLDOWN_FINNHUB)
-    before = ctx.finnhub.calls_made
     raw = await fetch_profile(ctx.finnhub, ticker, redis=ctx.redis)
-    ctx.count(SOURCE_FINNHUB, ctx.finnhub.calls_made - before)
     return ProfileSection(
         status=STATUS_OK,
         name=raw.get("name"),
@@ -397,7 +415,6 @@ async def build_filings(ctx: DossierContext, ticker: str, profile: dict) -> Fili
     from providers.context.edgar import recent_filings
 
     await _check_cooldown(ctx, SOURCE_EDGAR, TTL_COOLDOWN_EDGAR)
-    before = ctx.edgar.calls_made
     rows, block_truncated = await recent_filings(
         ctx.edgar,
         ticker,
@@ -405,7 +422,6 @@ async def build_filings(ctx: DossierContext, ticker: str, profile: dict) -> Fili
         days=profile["filing_days"],
         redis=ctx.redis,
     )
-    ctx.count(SOURCE_EDGAR, ctx.edgar.calls_made - before)
 
     rows = sorted(rows, key=lambda r: r.get("filed_on") or "", reverse=True)
     capped = len(rows) > MAX_FILINGS
@@ -466,8 +482,13 @@ async def bars_step(ctx: DossierContext, ticker: str, profile: dict) -> BarsSect
     refreshed = False
     if stale and ctx.refresh is not None:
         try:
-            await asyncio.wait_for(ctx.refresh(ticker), REFRESH_BUDGET)
+            outcome = await asyncio.wait_for(ctx.refresh(ticker), REFRESH_BUDGET)
             refreshed = True
+            # The refresh helper is the only caller that knows what it spent
+            # on yfinance and Alpha Vantage: it returns (body, {source: n}).
+            if isinstance(outcome, tuple) and len(outcome) == 2 and isinstance(outcome[1], dict):
+                for source, spent in outcome[1].items():
+                    ctx.count(source, spent)
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError as e:
@@ -515,6 +536,7 @@ async def assemble(
     profile = HORIZON_PROFILES[horizon]
 
     started = _time.perf_counter()
+    ctx.mark_clients()
     bars = await bars_step(ctx, t, profile)
 
     builders = [
@@ -557,6 +579,7 @@ async def assemble(
         by_name[name] = result
 
     sections = Sections(bars=bars, **by_name)
+    ctx.collect_clients()
     elapsed_ms = int((_time.perf_counter() - started) * 1000)
     budget = Budget(
         upstream_calls=sum(ctx.calls.values()),

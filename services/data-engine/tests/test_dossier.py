@@ -466,14 +466,36 @@ async def test_nan_serializes_as_null(_no_network):
 
 @pytest.mark.asyncio
 async def test_budget_counts_upstream_calls(_no_network):
-    """Spec decision 13's table is the oracle: 7 cold, 2 warm, 0 cached."""
+    """Spec decision 13's table is the oracle: 7 cold, 2 warm, 0 cached.
+
+    Every route answers slowly enough that the four Finnhub sections are in
+    flight at the same time, sharing one client: the count must be of calls
+    actually made, not of per-section deltas on a shared counter (which the
+    2.5 live check caught reporting 14 for 10 calls).
+    """
+    async def _slow(request):
+        await asyncio.sleep(0.05)
+        return None      # filled in per route below
+
     _mount_all(_no_network)
+    for path, body in (
+        ("/company-news", _fixture("finnhub", "AAPL_news.json")),
+        ("/calendar/earnings", _fixture("finnhub", "AAPL_earnings_calendar.json")),
+        ("/stock/earnings", _fixture("finnhub", "AAPL_earnings_surprises.json")),
+        ("/stock/recommendation", _fixture("finnhub", "AAPL_recommendations.json")),
+        ("/stock/profile2", _fixture("finnhub", "AAPL_profile.json")),
+    ):
+        async def _delayed(request, _body=body):
+            await asyncio.sleep(0.05)
+            return httpx.Response(200, json=_body)
+        _no_network.get(f"{FINNHUB}{path}").mock(side_effect=_delayed)
+
     redis = FakeRedis()
     ctx = _ctx(redis=redis)
     d = await assemble(ctx, TICKER, HORIZON_SWING)
 
     assert len(_no_network.calls) == 7
-    assert d.budget.upstream_calls == 7
+    assert d.budget.upstream_calls == 7          # not 14: concurrent sections
     assert d.budget.by_source == {SOURCE_EDGAR: 2, SOURCE_FINNHUB: 5}
     assert d.budget.elapsed_ms >= 0
 
@@ -495,6 +517,26 @@ async def test_budget_counts_upstream_calls(_no_network):
     assert len(_no_network.calls) - before == 0
     assert d3.budget.upstream_calls == 0
     assert d3.budget.by_source == {}
+
+
+@pytest.mark.asyncio
+async def test_budget_counts_refresh_provider_calls(_no_network):
+    """The refresh helper is the only caller that knows what it spent on
+    yfinance and Alpha Vantage, so it returns (body, {source: calls}) and the
+    assembly folds them in. This is spec decision 13's stale-cold row: 11."""
+    _mount_all(_no_network)
+    pool = FakePool(bars={(TICKER, "1d"): _bars(60, date(2026, 9, 4))})
+
+    async def _refresh(ticker):
+        pool.bars[(TICKER, "1d")] = _bars(60, TODAY)
+        return {"dailyBars": 60}, {"yfinance": 3, "alphavantage": 1}
+
+    d = await assemble(_ctx(pool=pool, refresh=_refresh), TICKER, HORIZON_SWING)
+
+    assert d.budget.by_source == {
+        SOURCE_EDGAR: 2, SOURCE_FINNHUB: 5, "alphavantage": 1, "yfinance": 3}
+    assert d.budget.upstream_calls == 11
+    assert len(_no_network.calls) == 7          # the other 4 are not HTTP here
 
 
 # ── Cooldowns and budgets ────────────────────────────────────────────────
@@ -797,9 +839,16 @@ def test_cache_hit_no_upstream_calls(_no_network, app_state):
     assert second["cached"] is True
     assert len(_no_network.calls) == calls_after_first
     assert len(pool.reads) == reads_after_first
-    # The body is identical apart from the retrieval flag.
-    assert {k: v for k, v in second.items() if k != "cached"} == \
-           {k: v for k, v in first.items() if k != "cached"}
+
+    # `cached` and `budget` both describe the retrieval, not the data: a hit
+    # reports no upstream calls, no sources, and only the time it took to
+    # read Redis. Everything else is byte-identical to the stored document.
+    assert second["budget"]["upstreamCalls"] == 0
+    assert second["budget"]["bySource"] == {}
+    assert second["budget"]["elapsedMs"] < first["budget"]["elapsedMs"] + 1000
+    assert first["budget"]["upstreamCalls"] == 7
+    assert {k: v for k, v in second.items() if k not in ("cached", "budget")} == \
+           {k: v for k, v in first.items() if k not in ("cached", "budget")}
 
 
 def test_error_section_short_ttl(_no_network, app_state):

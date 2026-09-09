@@ -253,3 +253,18 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 **Why:** the plan row names the sections, the caps and the TTLs and leaves every failure question open; Phase 4 reads this document to build a verdict, so "which source was missing and why" has to survive into the JSON rather than being flattened into an empty list.
 
 **Supersedes:** N/A.
+
+---
+
+## 2026-09-09 — The dossier budget is counted once per source, and is not part of the document (Part 2.4, after 2.5)
+
+**Decision:**
+
+- **One `calls_made` delta per source per dossier**, marked before the bars step and collected after the fan-out. Per-section deltas were wrong by construction: sections run concurrently and share one client, so each section's `after` read included the calls the others made in between. The 2.5 live check on prod reported **14 upstream calls for 10 actually made** (`finnhub: 12` for 5 calls). `test_budget_counts_upstream_calls` now makes every mocked route slow enough to overlap, and fails on the old code.
+- **The refresh helper reports its own spend.** `refresh_ticker_bars` returns `(response body, {source: calls})`, so yfinance and Alpha Vantage appear in `bySource` — nothing else knows what the refresh cost. `POST /stock/{ticker}/refresh` keeps exactly Part 1.2's response shape; the counts are the second half of the tuple, not a new field.
+- **Known limit, accepted:** `calls_made` lives on the client object and the app holds one client per process, so two dossiers assembled at the same instant cross-count each other. Fine while one caller uses the endpoint; the fix, if the scanner ever fans out over `/dossier`, is a `contextvars` counter inside the clients (deferred, `docs/progress.md`).
+- **`budget` is not part of the cached document.** It describes the retrieval, like `cached`, so it is excluded from the stored body and set on the way out: a hit reports `upstreamCalls: 0`, `bySource: {}`, `elapsedMs` = the read time. Before the fix a cached dossier replayed the build's budget and claimed 14 upstream calls on a request that made none.
+
+**Why:** the budget exists so a caller can reason about the Finnhub 60/min limiter and the Alpha Vantage 25/day cap before pointing the scanner at this endpoint. A number that is 40% high, and that a cache hit repeats as though the calls happened again, is worse than no number.
+
+**Supersedes:** the counting half of the 2026-09-09 "Dossier: sections degrade" entry ("`test_budget_counts_upstream_calls` asserts those numbers from the respx call log" — it did, but only because the mocked calls never overlapped).

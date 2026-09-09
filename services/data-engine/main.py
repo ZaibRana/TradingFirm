@@ -35,7 +35,7 @@ from scanners.market_scanner import MarketScanner
 from scanners.market_status import get_market_status
 from indicators import IndicatorsResponse
 from dossier import HORIZON_PROFILES, HORIZON_SWING
-from dossier.models import DossierResponse
+from dossier.models import Budget, DossierResponse
 from scanners.models import ScanRequest, ScanResult
 from tickers import normalize_ticker, validate_ticker
 
@@ -455,6 +455,11 @@ async def refresh_ticker_bars(ticker: str) -> dict:
     same HTTPExceptions the endpoint returns (429 on cooldown, 502/429 on a
     provider problem, 503 with no database); the dossier catches them and
     serves what is stored.
+
+    Returns `(response body, {source: calls})`. The counts are the second
+    half because they are the dossier's business, not the endpoint's: only
+    this helper knows what it spent on yfinance and Alpha Vantage, and the
+    HTTP response keeps exactly the shape Part 1.2 defined.
     """
     ticker = normalize_ticker(ticker)
     if not ticker.isalpha() or len(ticker) > 5:
@@ -515,6 +520,9 @@ async def refresh_ticker_bars(ticker: str) -> dict:
     # it validates report dates against a store that already includes this
     # refresh. Bars are the product — any failure here is logged and the
     # refresh still returns 200 with a reason the caller can read.
+    provider_calls = {"yfinance": 2}   # the two downloads above
+    av_before = getattr(getattr(app.state, "av_client", None), "calls_made", 0)
+
     earnings = {"source": None, "stored": 0, "dropped": 0, "reason": "error"}
     try:
         from providers.context.earnings import sync_earnings_dates
@@ -528,6 +536,13 @@ async def refresh_ticker_bars(ticker: str) -> dict:
         )
     except Exception as e:
         logger.warning(f"Earnings dates step failed for {ticker}: {type(e).__name__}: {e}")
+
+    # One `Ticker` call unless the step stopped before it (an empty bar store).
+    if earnings.get("reason") != "no_bars":
+        provider_calls["yfinance"] += 1
+    av_spent = getattr(getattr(app.state, "av_client", None), "calls_made", 0) - av_before
+    if av_spent:
+        provider_calls["alphavantage"] = av_spent
 
     # New bars make any cached indicator snapshot stale: drop it now so a
     # refresh is never followed by up to 15 min of old numbers. Best-effort.
@@ -548,7 +563,7 @@ async def refresh_ticker_bars(ticker: str) -> dict:
         "dailyBars": daily_count,
         "hourlyBars": hourly_count,
         "earningsDates": earnings,
-    }
+    }, provider_calls
 
 @app.post("/stock/{ticker}/refresh")
 async def refresh_stock(ticker: str):
@@ -560,7 +575,8 @@ async def refresh_stock(ticker: str):
     down). Returns 503 if the database is unavailable — bars are never
     fetched and silently discarded.
     """
-    return await refresh_ticker_bars(ticker)
+    body, _provider_calls = await refresh_ticker_bars(ticker)
+    return body
 
 
 @app.get("/stock/{ticker}/bars")
@@ -700,13 +716,19 @@ async def get_dossier(ticker: str, horizon: str = Query(HORIZON_SWING)):
         refresh=refresh_ticker_bars,
     )
 
+    built: dict = {}
+
     async def build() -> dict:
         response = await assemble(ctx, ticker, horizon)
-        # Store the body without `cached`: the flag describes the retrieval,
-        # not the data (the 1.7 convention).
-        return response.model_dump(mode="json", by_alias=True, exclude={"cached"})
+        built["budget"] = response.budget
+        # Store the body without `cached` *or* `budget`: both describe the
+        # retrieval, not the data (the 1.7 convention). A cached hit that
+        # replayed the build's budget would claim upstream calls it never
+        # made — the Part 2.5 live check caught exactly that.
+        return response.model_dump(mode="json", by_alias=True, exclude={"cached", "budget"})
 
     market_open = get_market_status()[0] == "market_open"
+    started = _time.perf_counter()
     try:
         body, from_cache = await cached_json(
             app.state.redis,
@@ -725,12 +747,23 @@ async def get_dossier(ticker: str, horizon: str = Query(HORIZON_SWING)):
         logger.error(f"Dossier DB read failed for {ticker}: {type(e).__name__}: {e}")
         raise HTTPException(status_code=503, detail="Database unavailable.")
 
+    elapsed_ms = int((_time.perf_counter() - started) * 1000)
+    budget = built.get("budget")
+    if from_cache or budget is None:
+        # Served from Redis: no upstream call was made, and the only time
+        # spent was the retrieval.
+        budget = Budget(upstream_calls=0, elapsed_ms=elapsed_ms, by_source={})
+
     logger.info(
         f"Dossier {ticker}/{horizon}: cached={from_cache} "
-        f"calls={body.get('budget', {}).get('upstreamCalls')} "
-        f"elapsed={body.get('budget', {}).get('elapsedMs')}ms"
+        f"calls={budget.upstream_calls} bySource={budget.by_source} "
+        f"elapsed={budget.elapsed_ms}ms"
     )
-    return DossierResponse.model_validate({**body, "cached": from_cache})
+    return DossierResponse.model_validate({
+        **body,
+        "cached": from_cache,
+        "budget": budget.model_dump(by_alias=True),
+    })
 
 
 @app.get("/market/status")
