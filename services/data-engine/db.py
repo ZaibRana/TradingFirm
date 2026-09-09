@@ -17,6 +17,13 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+# Every exception that means "the database, not an upstream source, failed"
+# (Part 2.4). Named here so the dossier's section boundary re-raises exactly
+# what a test raises: a DB failure is a 503 for the whole document, never a
+# degraded section. `OSError` covers a socket dying mid-query; the HTTP
+# clients map their own OSErrors to typed errors so none can land here.
+DB_ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
+
 
 # ── Connection Pool ──────────────────────────────────────────────
 

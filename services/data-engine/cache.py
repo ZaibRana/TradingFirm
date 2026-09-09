@@ -7,6 +7,7 @@ and pub/sub event publishing for inter-service communication.
 
 import json
 import logging
+import time as _time
 from typing import Any, Awaitable, Callable, Optional
 
 import redis.asyncio as aioredis
@@ -18,7 +19,10 @@ logger = logging.getLogger(__name__)
 # Cache keys (matching shared/constants.py)
 CACHE_LAST_SCAN = "tf:cache:last_scan"
 CACHE_SCAN_STATUS = "tf:cache:scan_status"
-CACHE_REFRESH_PREFIX = "tf:cache:refresh:"
+# One prefix for every cooldown (Part 2.4). "refresh:<T>" keeps the
+# Part 1.2 key `tf:cache:refresh:<T>` unchanged; sources add "edgar",
+# "finnhub", "alphavantage".
+CACHE_COOLDOWN_PREFIX = "tf:cache:"
 CACHE_INDICATORS_PREFIX = "tf:cache:indicators:"
 CACHE_FINNHUB_PREFIX = "tf:cache:finnhub:"
 CACHE_EDGAR_PREFIX = "tf:cache:edgar:"
@@ -100,30 +104,92 @@ async def get_scan_status(r: aioredis.Redis) -> dict:
     return json.loads(data)
 
 
-# ── Per-Ticker Refresh Cooldown ──────────────────────────────────
+# ── Cooldowns (refresh per ticker, sources per name) ─────────────
 
-async def get_refresh_cooldown(r: aioredis.Redis, ticker: str) -> Optional[int]:
+class MemoryCooldowns:
+    """In-memory cooldown clock used when Redis is absent or raising.
+
+    Moved out of main.py's InMemoryStore in Part 2.4 so the same pair of
+    helpers serves the per-ticker refresh cooldown (Part 1.2) and the
+    per-source cooldowns the dossier sets after a refusal (Part 2.4).
+    Names are opaque: "refresh:AAPL", "edgar", "finnhub".
     """
-    Seconds remaining before `ticker` may be refreshed again, or None
-    if it's clear to refresh now.
-    """
-    ttl = await r.ttl(f"{CACHE_REFRESH_PREFIX}{ticker}")
-    if ttl is None or ttl < 0:
+
+    def __init__(self):
+        self._started: dict[str, float] = {}
+
+    def remaining(self, name: str, ttl: int) -> Optional[int]:
+        started = self._started.get(name)
+        if started is None:
+            return None
+        elapsed = _time.time() - started
+        if elapsed < ttl:
+            return int(ttl - elapsed)
         return None
-    return ttl
+
+    def start(self, name: str) -> None:
+        self._started[name] = _time.time()
 
 
-async def set_refresh_cooldown(
-    r: aioredis.Redis,
-    ticker: str,
-    ttl: int = TTL_REFRESH_COOLDOWN,
+def cooldown_key(name: str) -> str:
+    """Redis key for one cooldown. `name` is already canonical (a
+    normalized ticker for "refresh:<T>", a source name otherwise)."""
+    return f"{CACHE_COOLDOWN_PREFIX}{name}"
+
+
+async def cooldown_remaining(
+    r: Optional[aioredis.Redis],
+    memory: Optional[MemoryCooldowns],
+    name: str,
+    ttl: int,
+) -> Optional[int]:
+    """
+    Seconds left on `name`'s cooldown, or None if it is clear now.
+
+    Redis is the source of truth; if it is absent or the read raises, the
+    in-memory clock answers (fail-open to a shorter memory of refusals,
+    never to a hard failure).
+    """
+    if r is not None:
+        try:
+            left = await r.ttl(cooldown_key(name))
+        except Exception as e:
+            logger.warning(f"Cooldown check failed for {name}: {e}")
+        else:
+            if left is None or left < 0:
+                return None
+            return left
+    if memory is None:
+        return None
+    return memory.remaining(name, ttl)
+
+
+async def start_cooldown(
+    r: Optional[aioredis.Redis],
+    memory: Optional[MemoryCooldowns],
+    name: str,
+    ttl: int,
 ) -> None:
     """
-    Start the refresh cooldown window for `ticker`. Call only after a
-    successful fetch + persist — never before, so a failed refresh
-    doesn't lock the ticker out with nothing to show for it.
+    Start `name`'s cooldown window. Call only after the thing the cooldown
+    protects actually happened — a successful refresh (Part 1.2), or a
+    refusal from a source (Part 2.4). A Redis write that raises falls back
+    to the in-memory clock.
     """
-    await r.set(f"{CACHE_REFRESH_PREFIX}{ticker}", "1", ex=ttl)
+    if r is not None:
+        try:
+            await r.set(cooldown_key(name), "1", ex=ttl)
+            return
+        except Exception as e:
+            logger.warning(f"Cooldown write failed for {name}: {e}")
+    if memory is not None:
+        memory.start(name)
+
+
+def refresh_cooldown_name(ticker: str) -> str:
+    """Cooldown name for one ticker's bar refresh. Keeps the Part 1.2 key
+    (`tf:cache:refresh:<T>`) byte-for-byte."""
+    return f"refresh:{ticker}"
 
 
 # ── Per-Ticker Indicator Snapshot (Part 1.7) ─────────────────────
@@ -201,10 +267,11 @@ async def set_cached_json(r: aioredis.Redis, key: str, body: Any, ttl: int) -> N
 async def cached_json(
     r: Optional[aioredis.Redis],
     key: str,
-    ttl: int,
+    ttl: Optional[int],
     fetch: Callable[[], Awaitable[Any]],
     *,
     valid: Optional[Callable[[Any], bool]] = None,
+    ttl_for: Optional[Callable[[Any], int]] = None,
 ) -> tuple[Any, bool]:
     """
     Read-through cache shared by the context fetchers: return
@@ -214,6 +281,11 @@ async def cached_json(
     rule (Part 2.2). Fail-open on Redis: `r` may be None, and a raise on
     get or set is logged and ignored so the caller still gets a body. A
     raise inside `fetch()` propagates and nothing is cached.
+
+    `ttl_for` (Part 2.4) decides the TTL *from the computed body*, for
+    callers whose window depends on what came back — the dossier caches a
+    document with a failed section for 2 minutes and a whole one for 15 or
+    60. It wins over `ttl` when given; `ttl` may then be None.
     """
     if r is not None:
         try:
@@ -230,8 +302,9 @@ async def cached_json(
     body = await fetch()
 
     if r is not None:
+        write_ttl = ttl_for(body) if ttl_for is not None else ttl
         try:
-            await set_cached_json(r, key, body, ttl)
+            await set_cached_json(r, key, body, write_ttl)
         except Exception as e:
             logger.warning(f"Cache write failed for {key}: {e}")
     return body, False
