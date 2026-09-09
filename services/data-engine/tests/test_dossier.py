@@ -302,6 +302,23 @@ async def test_partial_context_news_still_served(_no_network):
 
 
 @pytest.mark.asyncio
+async def test_events_error_when_store_cannot_answer(_no_network):
+    """The forgiveness rule has a floor: the calendar call fails *and* the
+    store read comes back empty, so the section reports the source instead of
+    claiming an empty `ok`. Compare test_partial_context_news_still_served,
+    where the store has a row and the section stays `ok`."""
+    _mount_all(_no_network)
+    _no_network.get(f"{FINNHUB}/calendar/earnings").mock(return_value=httpx.Response(500))
+    pool = FakePool(bars={(TICKER, "1d"): _bars(60, TODAY)}, events=[])
+    d = await assemble(_ctx(pool=pool), TICKER, HORIZON_SWING)
+
+    assert d.sections.events.status == STATUS_ERROR
+    assert d.sections.events.reason == "upstream"
+    assert d.sections.events.items == []
+    assert d.sections.news.status == STATUS_OK      # still fetched and stored
+
+
+@pytest.mark.asyncio
 async def test_section_error_shape_has_empty_payload(_no_network):
     """Every error section still carries its own payload key, empty."""
     _no_network.get(f"{FINNHUB}/company-news").mock(return_value=httpx.Response(500))
