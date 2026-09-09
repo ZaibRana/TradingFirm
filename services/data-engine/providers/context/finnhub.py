@@ -30,15 +30,9 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
-from cache import (
-    TTL_FINNHUB_CONTEXT,
-    TTL_FINNHUB_NEWS,
-    finnhub_key,
-    get_cached_json,
-    set_cached_json,
-)
+from cache import TTL_FINNHUB_CONTEXT, TTL_FINNHUB_NEWS, cached_json, finnhub_key
 from providers.context.finnhub_client import FinnhubClient
-from tickers import normalize_ticker
+from tickers import validate_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +50,7 @@ CALENDAR_LOOKAHEAD_DAYS = 120
 
 
 def _ticker(ticker: str) -> str:
-    t = normalize_ticker(ticker)
-    if not t.isalpha() or not 1 <= len(t) <= 5:
-        raise ValueError(f"Invalid ticker: {ticker!r}")
-    return t
+    return validate_ticker(ticker)
 
 
 async def _cached(
@@ -69,25 +60,9 @@ async def _cached(
     ttl: int,
     fetch: Callable[[], Awaitable[Any]],
 ) -> tuple[Any, bool]:
-    """(body, from_cache). Redis problems are logged and ignored."""
-    key = finnhub_key(kind, ticker)
-    if redis is not None:
-        try:
-            body = await get_cached_json(redis, key)
-        except Exception as e:
-            logger.warning(f"Finnhub cache read failed for {key}: {e}")
-            body = None
-        if body is not None:
-            return body, True
-
-    body = await fetch()
-
-    if redis is not None:
-        try:
-            await set_cached_json(redis, key, body, ttl)
-        except Exception as e:
-            logger.warning(f"Finnhub cache write failed for {key}: {e}")
-    return body, False
+    """(body, from_cache) via cache.cached_json; Redis problems are logged
+    and ignored there."""
+    return await cached_json(redis, finnhub_key(kind, ticker), ttl, fetch)
 
 
 # ── Fetchers (raw bodies) ────────────────────────────────────────────────

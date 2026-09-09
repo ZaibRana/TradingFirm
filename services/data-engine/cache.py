@@ -7,7 +7,7 @@ and pub/sub event publishing for inter-service communication.
 
 import json
 import logging
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import redis.asyncio as aioredis
 
@@ -193,6 +193,38 @@ async def get_cached_json(r: aioredis.Redis, key: str) -> Optional[Any]:
 async def set_cached_json(r: aioredis.Redis, key: str, body: Any, ttl: int) -> None:
     """Cache any JSON-serializable body at `key` with TTL."""
     await r.set(key, json.dumps(body, default=str), ex=ttl)
+
+
+async def cached_json(
+    r: Optional[aioredis.Redis],
+    key: str,
+    ttl: int,
+    fetch: Callable[[], Awaitable[Any]],
+) -> tuple[Any, bool]:
+    """
+    Read-through cache shared by the context fetchers: return
+    (body, from_cache). On a miss, `fetch()` runs and its result is cached
+    for `ttl` seconds. Fail-open on Redis: `r` may be None, and a raise on
+    get or set is logged and ignored so the caller still gets a body. A
+    raise inside `fetch()` propagates and nothing is cached.
+    """
+    if r is not None:
+        try:
+            body = await get_cached_json(r, key)
+        except Exception as e:
+            logger.warning(f"Cache read failed for {key}: {e}")
+            body = None
+        if body is not None:
+            return body, True
+
+    body = await fetch()
+
+    if r is not None:
+        try:
+            await set_cached_json(r, key, body, ttl)
+        except Exception as e:
+            logger.warning(f"Cache write failed for {key}: {e}")
+    return body, False
 
 
 # ── Pub/Sub Events ───────────────────────────────────────────────
