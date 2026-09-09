@@ -33,6 +33,7 @@ from scanners.market_scanner import MarketScanner
 from scanners.market_status import get_market_status
 from indicators import IndicatorsResponse, sector_etf, swing_snapshot
 from scanners.models import ScanRequest, ScanResult
+from tickers import normalize_ticker
 
 # ── Logging ──────────────────────────────────────────────────────
 
@@ -387,14 +388,6 @@ async def scan_status():
 
     # Fall back to in-memory
     return app.state.memory.get_status()
-
-
-def normalize_ticker(ticker: str) -> str:
-    """Canonical ticker key form used everywhere ohlcv_bars/stocks are
-    written or read: upper-cased, whitespace-stripped. Shared by every
-    endpoint here and by the scan pipeline (scanners/market_scanner.py),
-    so a ticker's key can't drift between the two write paths."""
-    return ticker.upper().strip()
 
 
 @app.get("/stocks/{ticker}")

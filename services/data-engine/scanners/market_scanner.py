@@ -29,6 +29,7 @@ from typing import Optional
 
 import numpy as np
 
+from tickers import normalize_ticker
 from indicators import (
     aggregate_4h,
     calc_atr,
@@ -128,10 +129,6 @@ class MarketScanner:
 
         # ── Step 3: Apply DAILY-ONLY filters ──
         logger.info(f"Step 3/7: Applying daily filters ({market_status} mode)...")
-        from main import normalize_ticker  # deferred: main.py is the entrypoint,
-
-        # already loaded by the time run_scan() executes; avoids a duplicate
-        # normalization rule (see main.py's normalize_ticker docstring / G1.5)
         daily_winners = {}
         daily_frames = {}
         daily_rejections = {}
@@ -319,7 +316,7 @@ class MarketScanner:
         persistence is a side effect of it).
 
         `winners`/`daily_frames`/`hourly_frames` keys are already
-        normalized (see normalize_ticker() applied when a ticker enters
+        normalized (see tickers.normalize_ticker() applied when a ticker enters
         daily_winners in Step 3) — no re-normalization needed here.
         """
         if self.db_pool is None or not winners:

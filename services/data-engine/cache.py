@@ -124,7 +124,7 @@ async def set_refresh_cooldown(
 
 def indicators_key(ticker: str) -> str:
     """Cache key for one ticker's indicator snapshot. Caller passes the
-    normalized ticker (main.normalize_ticker)."""
+    normalized ticker (tickers.normalize_ticker)."""
     return f"{CACHE_INDICATORS_PREFIX}{ticker}"
 
 
