@@ -268,3 +268,31 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 **Why:** the budget exists so a caller can reason about the Finnhub 60/min limiter and the Alpha Vantage 25/day cap before pointing the scanner at this endpoint. A number that is 40% high, and that a cache hit repeats as though the calls happened again, is worse than no number.
 
 **Supersedes:** the counting half of the 2026-09-09 "Dossier: sections degrade" entry ("`test_budget_counts_upstream_calls` asserts those numbers from the respx call log" — it did, but only because the mocked calls never overlapped).
+
+---
+
+## 2026-09-09 — risk-shield skeleton: 005, a bounded startup, and a dev twin (Part 3.1)
+
+**Decision:**
+
+- **The risk migration is `005_risk.sql`, not the plan's `004_risk.sql`.** `004_filings.sql` shipped with Part 2.2 and `scripts/migrate.sh` keys `public.schema_migrations` by filename. `risk.macro_briefs` carries no `user_id` (D18 covers positions, verdicts and alerts; a macro brief is one shared market view) and repeats `risk.health_checks`' regime CHECK so the two tables speak one vocabulary. The file creates its own schema, so its rerun guarantee does not depend on `001`.
+- **Startup is fail-open *and bounded*, which data-engine's is not.** `asyncpg.create_pool()` defaults to a 60 s connect timeout (`command_timeout=30` bounds queries, not connecting) and redis-py's `socket_connect_timeout` defaults to `None`. A Postgres that is restarting rather than refusing would therefore stall boot for a minute with `/health` unreachable — the opposite of what fail-open promises. Each dependency now gets `config.STARTUP_TIMEOUT` (5 s) inside one `asyncio.wait_for` covering the factory *and* its verification call, worst-case boot ~10 s, inside the healthcheck's start-period. **Data-engine keeps its unbounded startup**; fixing it is a separate `refactor:`, not smuggled into a Phase 3 feature part.
+- **`config.STARTUP_TIMEOUT` is read at call time, never `from config import`.** A from-import copies the value, so the lifespan tests' monkeypatch would not land and each slow-path test would sit for the full 5 s. Later parts that bound a wait (3.4's scheduler) read it the same way.
+- **`/health`'s `db_connected` / `redis_connected` are boot state, not a live probe** — the same contract data-engine has. A dependency that dies after boot reads `true` until a restart. Written down as a known limitation of both services rather than implied; a probing `/health` needs reconnect logic and is its own part.
+- **`FRED_API_KEY` is a `SecretStr`** (G14 by construction, not by discipline): `repr`/`str`/`model_dump` mask it and only `.get_secret_value()` yields it, so `/health` can report `fredConfigured` without a path that could ever print the key.
+- **Keys live under `tf:risk:`, never `tf:cache:`** (data-engine owns that prefix and both share Redis DB 0), through one builder `risk_key(kind, name)` over one normalizer `canonical()`.
+- **A dev twin now** (`risk-shield-dev`, 8013, `tradingfirm_dev`, Redis DB 1, empty FRED key), the Part 0.7 shape, because the plan row names a test file and Phase 3 had nowhere to run pytest. Pytest pins match data-engine's exactly so the two twins cannot drift.
+
+**Why:** the plan row says "mirroring data-engine's" and leaves every failure question open. Mirroring the startup verbatim would have copied a real defect into a service whose job is to notice when the market breaks.
+
+**Supersedes:** the plan's Part 3.1 row on the migration number only (`004_risk.sql` → `005_risk.sql`).
+
+---
+
+## 2026-09-09 — `docs/progress.md` is the done-status source of truth; the plan's §12 checkboxes are not maintained
+
+**Decision:** Part status lives in `docs/progress.md`, one row per part. The checkbox grid in `docs/plan-analyst-watcher.md` §12 is not kept up to date and is not authoritative — at the time of writing it shows Phase 0 and parts 2.3–2.5 unticked although all are done. It stays as written (plan files are read-only); nobody should tick it or read it.
+
+**Why:** two trackers means neither is trusted. §12 asks for an edit to a read-only file, so it loses to the docs-discipline rule every time; `progress.md` carries the commit, the date and the caveats anyway.
+
+**Supersedes:** the plan's §1 instruction "tick the box in §12".
