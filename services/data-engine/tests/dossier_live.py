@@ -132,8 +132,14 @@ async def main_async(ticker: str):
 
     assert second_body["cached"] is True, "second request was not served from the cache"
     assert second_body["budget"]["upstreamCalls"] == 0, "cached body reports upstream calls"
+    assert second_body["budget"]["bySource"] == {}, "cached body names sources it did not call"
     assert len(CALLS) == before, "the cached request still went upstream"
-    print("\nOK: second request cached, zero upstream calls.")
+    # The budget the first request reported must be the calls that were made.
+    assert body["budget"]["upstreamCalls"] == len(CALLS), (
+        f"budget said {body['budget']['upstreamCalls']} upstream calls, "
+        f"{len(CALLS)} were timed"
+    )
+    print("\nOK: first budget matches the timed calls; second request cached, zero calls.")
 
     await main.app.state.db_pool.close()
     await main.app.state.redis.close()
