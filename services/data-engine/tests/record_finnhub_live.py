@@ -36,6 +36,7 @@ from providers.context.finnhub_client import (  # noqa: E402
 )
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "finnhub"
+NEWS_FIXTURE_LIMIT = 20  # a week of AAPL news is ~250 items / 150 KB; the tests need a handful
 
 
 def _calls(ticker: str, today: date) -> list[tuple[str, str, dict]]:
@@ -107,7 +108,8 @@ async def main(ticker: str) -> int:
                 continue
             dt = time.monotonic() - t0
             out = FIXTURES_DIR / f"{ticker}_{kind}.json"
-            out.write_text(json.dumps(body, indent=1, default=str) + "\n")
+            to_write = body[:NEWS_FIXTURE_LIMIT] if kind == "news" and isinstance(body, list) else body
+            out.write_text(json.dumps(to_write, indent=1, default=str) + "\n")
             print(f"[{i}/5] {kind:<20} {path}: 200 in {dt:.2f}s -> {out.name} ({out.stat().st_size} B)")
             print(f"        {_summarize(kind, body)}")
             reachable.append(kind)

@@ -118,13 +118,13 @@
 → Why: two consecutive parts each had an edit pass silently not apply. A passing test is not proof that the intended edit is what got committed
 
 ### G14: Never Print Secrets
-**When:** Any command, log line, test, fixture or doc that could carry an API key, password, token or DSN
-→ Never run anything whose output can contain a secret value: no `docker compose config`, no `env`, no `cat .env`, no printing `settings.*` values
-→ Verify a secret by shape only: `grep -c "^NAME=.\+" .env` (set or empty), its length, or `print(bool(settings.name))` inside the container
-→ A masking pattern (`sed`, `grep -v`) is not a safeguard — it assumes an output format. If the check needs the value in the output at all, use a different check
-→ Secrets travel in headers and container env, never in URLs, query strings, fixtures, commit messages or progress rows
-→ The user pastes keys into `.env` themselves; never type, echo or read one. If a value does leak into a transcript, say so at once and tell the user to rotate it
-→ Why: Part 2.1 rendered `docker compose config` through a mask that expected quoted values; compose prints them unquoted, the real Finnhub key landed in the session transcript and had to be rotated
+**When:** Any command or file that could carry a key, password, token or DSN
+→ Never run a command whose output can contain a secret: no `docker compose config`, `env`, `cat .env`, printing `settings.*`
+→ Check a secret by shape only: set/empty (`grep -c "^NAME=.\+" .env`), length, or `bool(settings.name)` in the container
+→ A mask (`sed`, `grep -v`) is not a safeguard. If the value must be in the output for the check to work, use another check
+→ Secrets live in headers and container env only — never in URLs, fixtures, commits or docs
+→ The user pastes keys; never type, echo or read one. If one leaks into a transcript, say so and ask for rotation
+→ Why: Part 2.1 masked `docker compose config` expecting quotes; compose prints unquoted, the key leaked, rotation needed
 
 ---
 
@@ -173,3 +173,4 @@ Reference implementation: `scanner/pro_scan.py` (523 lines)
 - **Error isolation**: If one ticker fails during enrichment, skip it — never crash the whole scan. Log ticker name + error.
 - **Resource cleanup**: Close DB pools, Redis, HTTP sessions on shutdown. `del` large DataFrames + `gc.collect()` after processing.
 - **No raw storage**: Never store DataFrames in app.state — only lightweight dicts/results.
+- **Prod migrations only on explicit go**: `./scripts/migrate.sh` against prod runs only when the user says so in the conversation, never as part of a part's verification. `scripts/dev-db.sh` (dev DB) needs no ask. Applied to prod before this rule: 0.2 (`001`), 1.1 (`002`), 2.1 (`003`).

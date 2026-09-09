@@ -19,7 +19,7 @@ TradingFirm — a day-trading system that screens the market, applies technical 
 - **G7 — Tests alongside code.** Every module gets a unit test; tests never call external APIs (mock the provider).
 - **G8 — Clean up memory.** `del` DataFrames + `gc.collect()` after use; never store raw DataFrames in `app.state`.
 - **G13 — Verify edits landed.** Absolute paths for every edit; prove scripted edits applied; end each completion report with `git diff --stat <base>..HEAD`.
-- **G14 — Never print secrets.** No `docker compose config`, `env` or `cat .env`; verify a key by shape only (set/empty, length, boolean). A masking pattern is not a safeguard.
+- **G14 — Never print secrets.** No `docker compose config` / `env` / `cat .env`; check keys by shape only. A mask is not a safeguard.
 
 ## Docs discipline
 
@@ -80,5 +80,6 @@ Requires `.env` with `DB_PASSWORD` set — compose fails fast without it.
 - **Name the `test_*.py` files when running pytest** in `services/data-engine`. `pytest.ini` (`testpaths = tests`, `python_files = test_*.py`) now keeps a bare `pytest` from collecting `tests/full_scan_test.py`, which fires a real Finviz + yfinance scan on import — naming files is habit and belt-and-braces, no longer the only guard.
 - **`tests/smoke_test_pipeline.py`, `tests/full_scan_test.py`, `tests/record_fixture_live.py`, `tests/record_finnhub_live.py`** are live-API scripts. Run manually and deliberately, never in CI.
 - **One live scan pipeline: `services/data-engine`** (proxied by `web/app/api/scanner/pro/route.js`). `scanner/` is a frozen reference — don't build on it (`scanner/README.md`). Its `results.json`/`status.json` are generated output.
+- **Prod migrations run only on the user's explicit go.** `./scripts/migrate.sh` against prod is never part of a part's verification; `scripts/dev-db.sh` (dev DB) needs no ask. Applied before this rule: 0.2, 1.1, 2.1.
 - **Migrations must be re-runnable**: `IF NOT EXISTS` everywhere, no plain `INSERT` seeds. Why: `scripts/migrate.sh` header, `docs/decisions.md` 2026-09-05.
 - **Never write into another service's Postgres schema** (`data_engine`, `signals`, `risk`, `users`, `ai`). Cross-service communication is HTTP + Redis pub/sub only.

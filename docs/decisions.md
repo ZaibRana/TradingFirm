@@ -126,7 +126,7 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 
 ## 2026-09-09 — `normalize_ticker` moves to `tickers.py` (before Part 2.1)
 
-**Decision:** the one ticker normalizer lives in `services/data-engine/tickers.py`; `main.py` and `scanners/market_scanner.py` import it from there (the scanner's deferred `from main import` is gone). Body unchanged: upper-case, strip. Part 2.1's context fetchers import it too. The G1.5 grep becomes: `.upper()` appears in `tickers.py` only.
+**Decision:** the one ticker normalizer lives in `services/data-engine/tickers.py`; `main.py` (four callers: `/stocks/{t}`, `/stock/{t}/refresh`, `/stock/{t}/bars`, `/indicators/{t}`) and `scanners/market_scanner.py` (the fifth caller, where a ticker enters `daily_winners`; its deferred `from main import` is gone) import it from there. Body unchanged: upper-case, strip. Part 2.1's context fetchers import it too. The G1.5 grep becomes: `.upper()` appears in `tickers.py` only.
 
 **Why:** library modules (fetchers, cache helpers) cannot import the FastAPI entrypoint without a cycle, and G1.5 wants every key to pass through the same function rather than a copy.
 
