@@ -105,7 +105,8 @@ FastAPI app. Key pieces:
 - **Endpoints**: `POST /scan/run` (kicks off a background scan, 202
   Accepted), `GET /scan/status`, `GET /scan/results`, `GET /scan/history`,
   `GET /stocks/{ticker}`, `POST /stock/{ticker}/refresh`, `GET /stock/{ticker}/bars`,
-  `GET /indicators/{ticker}`, `GET /market/status`, `GET /health`.
+  `GET /indicators/{ticker}`, `GET /dossier/{ticker}`, `GET /market/status`,
+  `GET /health`.
 - **`data_engine.ohlcv_bars`** (Postgres) — daily/hourly OHLCV per ticker,
   written by `db.upsert_bars()` / read by `db.get_bars()`, with bar-shaping
   logic (`db.bar_records_from_df()`) shared by every write path.
@@ -229,6 +230,31 @@ FastAPI app. Key pieces:
   its fields and shows `bars: 0` under `benchmarks`. Cached in Redis for
   15 min (`tf:cache:indicators:{ticker}`); `cached` is set on the way out,
   and `POST /stock/{ticker}/refresh` drops the key after writing bars.
+- **`GET /dossier/{ticker}?horizon=swing`** — one document per ticker
+  (`dossier/`): the indicator snapshot and zones, Finnhub news, events,
+  recommendations and profile, EDGAR filings, and Part 2.3's earnings
+  reactions. Every section is an object with its own `status` (`ok`,
+  `truncated`, `error`, `unconfigured`), so a source that is down or
+  unconfigured degrades one section while the rest returns 200 — there is
+  no 502 on this path. A *database* failure is the exception: it is a 503
+  for the whole document (`db.DB_ERRORS`), never a degraded section. Bars
+  more than one weekday behind the last close trigger one refresh through
+  `main.refresh_ticker_bars()` first; if that fails or is on cooldown the
+  stored bars are served with `bars.status: stale`. Caps: 30 headlines, 10
+  filings, both flagged by `truncated`. Cached in Redis
+  (`tf:cache:dossier:{horizon}:{ticker}`) for 15 min in market hours, 60 min
+  outside, and 2 min when any section failed; `cached` is set on the way
+  out. Budgets: 8 s per section, 20 s for the refresh step. A cold dossier
+  costs 5 Finnhub + 2 EDGAR calls, a warm one 2, a cached one none, and the
+  response reports them under `budget`.
+- **Source cooldowns** (`cache.cooldown_remaining` / `start_cooldown`) — a
+  Finnhub 429 parks that source for 60 s, an EDGAR 403/429 for 15 min, an
+  Alpha Vantage cap for 1 h, source-wide rather than per ticker. The next
+  dossier skips the source before any HTTP (`reason: cooldown`), and
+  `sync_earnings_dates` skips its Alpha Vantage fallback the same way
+  (`earningsDates.reason: "cooldown"`). Redis is the store; an in-memory
+  clock (`cache.MemoryCooldowns`) covers Redis being absent or failing, and
+  the same pair of helpers backs the per-ticker refresh cooldown.
 - **`scanners/models.py`** — Pydantic models with `by_alias` field aliases
   (e.g. `market_cap` → `marketCap`) so FastAPI's snake_case internals
   serialize as the camelCase JSON the frontend expects.

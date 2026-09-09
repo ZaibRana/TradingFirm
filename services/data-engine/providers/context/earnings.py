@@ -43,8 +43,10 @@ from typing import Any, Optional
 from indicators.earnings import earnings_reactions
 from providers.base import ProviderRateLimited
 from providers.context.alphavantage_client import (
+    AlphaVantageCapped,
     AlphaVantageClient,
     AlphaVantageError,
+    AlphaVantageRateLimited,
 )
 from tickers import validate_ticker
 
@@ -60,6 +62,7 @@ REASON_RATE_LIMITED = "rate_limited"
 REASON_DOWN = "down"
 REASON_NO_BARS = "no_bars"
 REASON_ERROR = "error"
+REASON_COOLDOWN = "cooldown"  # Alpha Vantage refused us recently (Part 2.4)
 
 HOUR_AMC = "amc"
 HOUR_BMO = "bmo"
@@ -267,6 +270,8 @@ async def sync_earnings_dates(
     pool,
     *,
     today: Optional[date] = None,
+    redis=None,
+    cooldowns=None,
 ) -> dict:
     """
     Fetch report dates for `ticker`, validate them against the stored daily
@@ -274,7 +279,9 @@ async def sync_earnings_dates(
 
     Returns one shape, always:
         {"source": str|None, "stored": int, "dropped": int, "reason": str|None}
-    reason: None on success, else "rate_limited" | "down" | "no_bars".
+    reason: None on success, else "rate_limited" | "down" | "no_bars" |
+    "cooldown" (Alpha Vantage refused us recently, Part 2.4: the fallback
+    call is skipped rather than spent against the 25/day cap).
     """
     t = validate_ticker(ticker)
     today = today or datetime.now(timezone.utc).date()
@@ -316,12 +323,43 @@ async def sync_earnings_dates(
         result.update(source=SOURCE_YFINANCE, dropped=dropped)
     else:
         # ── Fallback: Alpha Vantage ─────────────────────────────────────
+        from cache import (  # deferred: cache.py is optional for this module
+            SOURCE_ALPHAVANTAGE as AV_COOLDOWN,
+            TTL_COOLDOWN_ALPHAVANTAGE,
+            cooldown_remaining,
+            start_cooldown,
+        )
+
         av_body = None
+        av_cooldown = None
+        tracks_cooldown = redis is not None or cooldowns is not None
+        if av_client is not None and tracks_cooldown:
+            av_cooldown = await cooldown_remaining(
+                redis, cooldowns, AV_COOLDOWN, TTL_COOLDOWN_ALPHAVANTAGE
+            )
         if av_client is None:
             logger.warning(f"sync_earnings_dates {t}: no Alpha Vantage client, fallback skipped")
+        elif av_cooldown is not None:
+            # The daily cap or the per-minute cap was hit recently: spending
+            # a call here would only confirm it (Part 2.4 decision 16).
+            logger.warning(
+                f"sync_earnings_dates {t}: Alpha Vantage on cooldown, "
+                f"{av_cooldown}s left, fallback skipped"
+            )
         else:
             try:
                 av_body = await alphavantage_earnings(av_client, t)
+            except (AlphaVantageCapped, AlphaVantageRateLimited) as e:
+                # A refusal, not a bad answer: remember it so the next
+                # refresh and the next dossier skip the call.
+                logger.warning(f"sync_earnings_dates {t}: fallback refused us: {e}")
+                if tracks_cooldown:
+                    await start_cooldown(
+                        redis, cooldowns, AV_COOLDOWN, TTL_COOLDOWN_ALPHAVANTAGE
+                    )
+                # `av_cooldown` stays None: the call *was* made and refused,
+                # which is "down" (2.3 decision 12). "cooldown" is reserved
+                # for the call we skipped because of an earlier refusal.
             except AlphaVantageError as e:
                 logger.warning(f"sync_earnings_dates {t}: fallback unavailable: {e}")
 
@@ -340,11 +378,12 @@ async def sync_earnings_dates(
             rows = kept + av_kept
             source = None
         result.update(source=source, dropped=dropped)
+        skipped_reason = REASON_COOLDOWN if av_cooldown is not None else REASON_DOWN
         if source is None and not rows:
-            result["reason"] = REASON_DOWN
+            result["reason"] = skipped_reason
             return result
         if source is None:
-            result["reason"] = REASON_DOWN
+            result["reason"] = skipped_reason
 
     for sample in rows[:3]:
         meta = sample["meta"][META_KEY]

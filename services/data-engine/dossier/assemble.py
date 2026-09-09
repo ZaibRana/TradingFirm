@@ -30,7 +30,16 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
 
-from cache import cooldown_remaining, start_cooldown
+from cache import (
+    SOURCE_ALPHAVANTAGE,
+    SOURCE_EDGAR,
+    SOURCE_FINNHUB,
+    TTL_COOLDOWN_ALPHAVANTAGE,
+    TTL_COOLDOWN_EDGAR,
+    TTL_COOLDOWN_FINNHUB,
+    cooldown_remaining,
+    start_cooldown,
+)
 from db import DB_ERRORS
 from dossier import HORIZON_PROFILES, MAX_FILINGS, MAX_HEADLINES
 from dossier.models import (
@@ -81,16 +90,9 @@ SECTION_TIMEOUT = 8.0
 FANOUT_BUDGET = 25.0
 REFRESH_BUDGET = 20.0
 
-# Source names — also the cooldown names and the `bySource` keys.
-SOURCE_FINNHUB = "finnhub"
-SOURCE_EDGAR = "edgar"
+# Source names (also the cooldown names and the `bySource` keys) and the
+# cooldown windows live in cache.py, with the other cache configuration.
 SOURCE_YFINANCE = "yfinance"
-SOURCE_ALPHAVANTAGE = "alphavantage"
-
-# Cooldown windows (seconds) after a source refuses us.
-TTL_COOLDOWN_FINNHUB = 60      # the width of Finnhub's per-minute window
-TTL_COOLDOWN_EDGAR = 900       # a 403 means blocked: stop, do not poke it
-TTL_COOLDOWN_ALPHAVANTAGE = 3600
 
 MARKET_CLOSE_HOUR = 16
 

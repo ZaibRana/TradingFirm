@@ -40,6 +40,22 @@ TTL_FINNHUB_CONTEXT = 86400 # 24 hours (recommendations, earnings, profile)
 TTL_EDGAR_CIK_MAP = 86400   # 24 hours (ticker → CIK map, plan 2.2)
 TTL_EDGAR_FILINGS = 900     # 15 minutes (recent filings per ticker, same as news)
 
+# Source cooldowns (Part 2.4): set after a source refuses us, checked before
+# any HTTP to that source. Names are also the `bySource` keys of the dossier
+# budget. EDGAR's window is long because a 403 means blocked, not throttled.
+SOURCE_FINNHUB = "finnhub"
+SOURCE_EDGAR = "edgar"
+SOURCE_ALPHAVANTAGE = "alphavantage"
+TTL_COOLDOWN_FINNHUB = 60         # the width of Finnhub's per-minute window
+TTL_COOLDOWN_EDGAR = 900          # 403 = blocked: stop, do not poke it
+TTL_COOLDOWN_ALPHAVANTAGE = 3600  # the free tier's daily cap, seen as HTTP 200
+
+# Dossier documents (Part 2.4).
+TTL_DOSSIER_MARKET = 900          # 15 min while the market is open
+TTL_DOSSIER_CLOSED = 3600         # 60 min outside market hours
+TTL_DOSSIER_ERROR = 120           # a document with a failed section: 2 min
+CACHE_DOSSIER_PREFIX = "tf:cache:dossier:"
+
 
 # ── Connection ───────────────────────────────────────────────────
 
@@ -234,6 +250,31 @@ async def delete_cached_indicators(r: aioredis.Redis, ticker: str) -> int:
     """Drop the cached snapshot (after a refresh wrote new bars). Returns
     the number of keys removed (0 or 1)."""
     return int(await r.delete(indicators_key(ticker)))
+
+
+# ── Dossier documents (Part 2.4) ─────────────────────────────────
+
+def dossier_key(ticker: str, horizon: str) -> str:
+    """Cache key for one ticker's dossier at one horizon. Both parts are
+    already canonical: the ticker through tickers.validate_ticker, the
+    horizon through the endpoint's enum check."""
+    return f"{CACHE_DOSSIER_PREFIX}{horizon}:{ticker}"
+
+
+def dossier_ttl(body: Any, market_open: bool) -> int:
+    """How long this document may be served. A dossier assembled with a
+    failed section is cached for 2 minutes, not for the full window: a
+    broken source must not be pinned for an hour."""
+    from dossier.assemble import has_error_section  # deferred: imports models
+    if has_error_section(body):
+        return TTL_DOSSIER_ERROR
+    return TTL_DOSSIER_MARKET if market_open else TTL_DOSSIER_CLOSED
+
+
+def valid_dossier(body: Any) -> bool:
+    """A cached body that is not a dossier is a miss (recomputed and
+    overwritten), the get_cached_indicators() rule."""
+    return isinstance(body, dict) and isinstance(body.get("sections"), dict)
 
 
 # ── Generic JSON cache (Part 2.1) ────────────────────────────────

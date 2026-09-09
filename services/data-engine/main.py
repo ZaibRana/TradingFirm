@@ -10,6 +10,8 @@ FastAPI application with endpoints:
   POST /stock/{ticker}/refresh — download + persist bars for one stock
   GET  /stock/{ticker}/bars — stored bars for one stock (DB only)
   GET  /indicators/{ticker} — swing indicator set + zones from stored bars (Redis 15 min)
+  GET  /dossier/{ticker}   — one document per ticker: indicators, news, events,
+                             recommendations, filings, earnings reactions, profile
   GET  /market/status  — current market session
   GET  /health         — health check
   GET  /               — service info
@@ -32,8 +34,10 @@ from providers import get_provider
 from scanners.market_scanner import MarketScanner
 from scanners.market_status import get_market_status
 from indicators import IndicatorsResponse
+from dossier import HORIZON_PROFILES, HORIZON_SWING
+from dossier.models import DossierResponse
 from scanners.models import ScanRequest, ScanResult
-from tickers import normalize_ticker
+from tickers import normalize_ticker, validate_ticker
 
 # ── Logging ──────────────────────────────────────────────────────
 
@@ -111,6 +115,19 @@ async def lifespan(app: FastAPI):
     app.state.av_client = AlphaVantageClient(settings.alphavantage_api_key)
     logger.info(f"✅ Alpha Vantage configured: {app.state.av_client.configured}")
 
+    # Context sources (Parts 2.1/2.2), built once and shared: each client
+    # owns its rate limiter, so one per process is the point. An empty key or
+    # User-Agent is normal (the dev twin) — the client raises before any HTTP
+    # and the dossier reports that section as `unconfigured`.
+    from providers.context.edgar_client import EdgarClient
+    from providers.context.finnhub_client import FinnhubClient
+    app.state.finnhub = FinnhubClient(settings.finnhub_api_key)
+    app.state.edgar = EdgarClient(settings.edgar_user_agent)
+    logger.info(
+        f"✅ Finnhub configured: {app.state.finnhub.configured}, "
+        f"EDGAR configured: {app.state.edgar.configured}"
+    )
+
     app.state.scanner = MarketScanner(app.state.provider, app.state.db_pool)
     logger.info("✅ Scanner initialized")
 
@@ -125,10 +142,11 @@ async def lifespan(app: FastAPI):
     if app.state.redis:
         await app.state.redis.close()
 
-    av_client = getattr(app.state, "av_client", None)
-    if av_client:
-        await av_client.aclose()
-        logger.info("Redis connection closed")
+    for name in ("av_client", "finnhub", "edgar"):
+        client = getattr(app.state, name, None)
+        if client is not None:
+            await client.aclose()
+    logger.info("Context clients closed")
 
 
 # ── App ──────────────────────────────────────────────────────────
@@ -258,6 +276,7 @@ async def root():
             "POST /stock/{ticker}/refresh",
             "GET  /stock/{ticker}/bars",
             "GET  /indicators/{ticker}",
+            "GET  /dossier/{ticker}",
             "GET  /market/status",
             "GET  /health",
         ],
@@ -427,15 +446,15 @@ async def get_stock(ticker: str):
         )
 
 
-@app.post("/stock/{ticker}/refresh")
-async def refresh_stock(ticker: str):
+async def refresh_ticker_bars(ticker: str) -> dict:
     """
     Download daily (2y) + hourly (3mo) bars for one ticker and persist them.
 
-    Rejects with 429 if this ticker was refreshed in the last 15 minutes
-    (Redis-backed cooldown, falling back to an in-memory one if Redis is
-    down). Returns 503 if the database is unavailable — bars are never
-    fetched and silently discarded.
+    The body of POST /stock/{ticker}/refresh, extracted in Part 2.4 so the
+    dossier can refresh stale bars without going through HTTP. Raises the
+    same HTTPExceptions the endpoint returns (429 on cooldown, 502/429 on a
+    provider problem, 503 with no database); the dossier catches them and
+    serves what is stored.
     """
     ticker = normalize_ticker(ticker)
     if not ticker.isalpha() or len(ticker) > 5:
@@ -504,6 +523,8 @@ async def refresh_stock(ticker: str):
             getattr(app.state, "av_client", None),
             ticker,
             app.state.db_pool,
+            redis=app.state.redis,
+            cooldowns=app.state.memory.cooldowns,
         )
     except Exception as e:
         logger.warning(f"Earnings dates step failed for {ticker}: {type(e).__name__}: {e}")
@@ -528,6 +549,18 @@ async def refresh_stock(ticker: str):
         "hourlyBars": hourly_count,
         "earningsDates": earnings,
     }
+
+@app.post("/stock/{ticker}/refresh")
+async def refresh_stock(ticker: str):
+    """
+    Download daily (2y) + hourly (3mo) bars for one ticker and persist them.
+
+    Rejects with 429 if this ticker was refreshed in the last 15 minutes
+    (Redis-backed cooldown, falling back to an in-memory one if Redis is
+    down). Returns 503 if the database is unavailable — bars are never
+    fetched and silently discarded.
+    """
+    return await refresh_ticker_bars(ticker)
 
 
 @app.get("/stock/{ticker}/bars")
@@ -620,6 +653,84 @@ async def get_indicators(ticker: str):
     except Exception as e:
         logger.error(f"Indicators DB read failed for {ticker}: {e}")
         raise HTTPException(status_code=503, detail="Database unavailable.")
+
+
+@app.get("/dossier/{ticker}", response_model=DossierResponse)
+async def get_dossier(ticker: str, horizon: str = Query(HORIZON_SWING)):
+    """
+    One document per ticker: indicators + zones, news, events,
+    recommendations, filings, earnings reactions and profile (spec
+    docs/specs/2.4.md).
+
+    Every section carries its own `status`, so a source that is down or
+    unconfigured degrades one section and the rest still returns 200 — there
+    is no 502 here. Stale bars (> 1 weekday behind the last close) trigger
+    one refresh first; if it fails, the stored bars are served with
+    `bars.status: stale`. Cached in Redis for 15 min in market hours, 60 min
+    outside, and 2 min when any section failed. 400 on a bad ticker or an
+    unknown horizon, 404 when there are no bars to describe, 503 when the
+    database is unavailable or a read fails.
+    """
+    from cache import cached_json, dossier_key, dossier_ttl, valid_dossier
+    from db import DB_ERRORS
+    from dossier.assemble import DossierContext, assemble
+    from dossier.sections import NoBarsStored
+
+    try:
+        ticker = validate_ticker(ticker)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ticker format")
+    if horizon not in HORIZON_PROFILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown horizon '{horizon}'. Supported: {', '.join(HORIZON_PROFILES)}.",
+        )
+
+    if not app.state.db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+
+    ctx = DossierContext(
+        pool=app.state.db_pool,
+        redis=app.state.redis,
+        cooldowns=app.state.memory.cooldowns,
+        finnhub=app.state.finnhub,
+        edgar=app.state.edgar,
+        av_client=getattr(app.state, "av_client", None),
+        provider=app.state.provider,
+        refresh=refresh_ticker_bars,
+    )
+
+    async def build() -> dict:
+        response = await assemble(ctx, ticker, horizon)
+        # Store the body without `cached`: the flag describes the retrieval,
+        # not the data (the 1.7 convention).
+        return response.model_dump(mode="json", by_alias=True, exclude={"cached"})
+
+    market_open = get_market_status()[0] == "market_open"
+    try:
+        body, from_cache = await cached_json(
+            app.state.redis,
+            dossier_key(ticker, horizon),
+            None,
+            build,
+            valid=valid_dossier,
+            ttl_for=lambda b: dossier_ttl(b, market_open),
+        )
+    except NoBarsStored:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No stored '1d' bars for '{ticker}' and the refresh produced none.",
+        )
+    except DB_ERRORS as e:
+        logger.error(f"Dossier DB read failed for {ticker}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+
+    logger.info(
+        f"Dossier {ticker}/{horizon}: cached={from_cache} "
+        f"calls={body.get('budget', {}).get('upstreamCalls')} "
+        f"elapsed={body.get('budget', {}).get('elapsedMs')}ms"
+    )
+    return DossierResponse.model_validate({**body, "cached": from_cache})
 
 
 @app.get("/market/status")

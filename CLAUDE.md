@@ -68,6 +68,7 @@ curl -X POST http://localhost:8001/scan/run -H "Content-Type: application/json" 
   -d '{"price_min": 10, "price_max": 40}'
 curl http://localhost:8001/scan/status
 curl http://localhost:8001/scan/results
+curl "http://localhost:8001/dossier/AAPL?horizon=swing"
 ```
 Requires `.env` with `DB_PASSWORD` set — compose fails fast without it.
 

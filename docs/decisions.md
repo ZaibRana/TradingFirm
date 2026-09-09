@@ -233,3 +233,22 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 
 **Supersedes:** the read-side half of the 2026-09-09 commit-1 entry's out-of-range rule, which described the write side only.
 
+
+---
+
+## 2026-09-09 — Dossier: sections degrade, the database does not (Part 2.4)
+
+**Decision:**
+
+- **Every section is an object with a `status`** (`ok` / `truncated` / `error` / `unconfigured`) and, when it fails, still carries its own payload key empty — a consumer never branches on a missing key. `unconfigured` (empty key or User-Agent) is a different fact from `error` and is the dev twin's normal state.
+- **Upstream failures degrade, database failures do not.** `db.DB_ERRORS` is re-raised through the section boundary and answered as 503 for the whole document: half a dossier that silently drops what Postgres holds is worse than an error. There is no 502 on this path.
+- **`DB_ERRORS` is `(PostgresError, InterfaceError, ConnectionError)`, not `OSError`.** `asyncio.TimeoutError` *is* the builtin `TimeoutError`, an `OSError` subclass, so an `OSError`-based tuple reported every timed-out section as a dead database. The three HTTP clients now map `OSError` to their typed errors, so no upstream socket error reaches the tuple either.
+- **Stale is a weekday rule and has four outcomes.** More than one weekday behind the reference session (today if it is a weekday past 16:00 ET, else the previous weekday) triggers one refresh. Refreshed and current → `ok`; refreshed with nothing newer (holiday week, lagging provider) → `stale` + `refreshed: true`; refresh refused, failed or on cooldown → `stale` + `refreshed: false`. Holidays are deferred to Phase 3's calendar, hence the field name `staleWeekdays`.
+- **Each section owns its calls and its write.** `sync_context` is not on the dossier path: it writes only after all three fetches succeed, so one failure would drop the news rows too. News fetches and upserts news; events fetches calendar + surprises, upserts, and reads the section back from `data_engine.events`, which is what folds 2.3's `meta.earnings` rows and 2.1's projections into one list. A failed fetch is forgiven only when the store can answer — otherwise the section reports the source, so an empty key reads as `unconfigured` rather than an empty `ok`.
+- **Call budget, stated and asserted.** 5 Finnhub + 2 EDGAR per cold dossier, 2 warm, 0 cached, 11 with a stale-bar refresh. Against the 60/min limiter that is 12 cold dossiers per minute; the binding constraint is Alpha Vantage's 25/day, reached only through refreshes. `test_budget_counts_upstream_calls` asserts those numbers from the respx call log.
+- **Cooldowns are source-wide, in `cache.py`.** Finnhub 429 → 60 s, EDGAR 403/429 → 15 min, Alpha Vantage cap → 1 h, checked before any HTTP. Alpha Vantage is not a section, so its cooldown acts inside `sync_earnings_dates`: the fallback call is skipped and the refresh reports `earningsDates.reason: "cooldown"` — a *skipped* call, never a refused one, which stays `down`.
+- **`horizon` selects a row of `HORIZON_PROFILES`** (news days, filing days and forms, reaction limit, events window, bar interval) and rides in the cache key. Phase 6's intraday mode is a second row, not a branch.
+
+**Why:** the plan row names the sections, the caps and the TTLs and leaves every failure question open; Phase 4 reads this document to build a verdict, so "which source was missing and why" has to survive into the JSON rather than being flattened into an empty list.
+
+**Supersedes:** N/A.

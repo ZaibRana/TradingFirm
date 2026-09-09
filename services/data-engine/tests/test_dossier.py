@@ -706,3 +706,281 @@ async def test_unconfigured_sections(_no_network):
     assert not _no_network.calls
     assert d.sections.indicators.status == STATUS_OK    # stored bars still work
     assert d.sections.earnings.status == STATUS_OK
+
+
+# ── The endpoint (through TestClient: real serialization) ────────────────
+
+import main  # noqa: E402  (imported here so the assembly tests above stay
+             #              independent of the FastAPI app)
+from fastapi.testclient import TestClient  # noqa: E402
+
+
+@pytest.fixture
+def app_state():
+    """Point the app at fakes and hand back the pieces a test needs to poke.
+    `TestClient` is created without the lifespan (it would open real Redis
+    and Postgres connections), so every dependency is set here."""
+    from providers.fixture_provider import FixtureProvider
+
+    pool = FakePool(bars={(TICKER, "1d"): _bars(60, TODAY)})
+    redis = FakeRedis()
+    main.app.state.provider = FixtureProvider()
+    main.app.state.db_pool = pool
+    main.app.state.redis = redis
+    main.app.state.memory = main.InMemoryStore()
+    main.app.state.finnhub = _finnhub()
+    main.app.state.edgar = _edgar()
+    main.app.state.av_client = None
+    yield pool, redis
+    main.app.state.db_pool = None
+    main.app.state.redis = None
+
+
+def _get(url: str = f"/dossier/{TICKER}"):
+    return TestClient(main.app).get(url)
+
+
+def test_dossier_camelcase_shape(_no_network, app_state):
+    _mount_all(_no_network)
+    resp = _get()
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert set(body) == {"ticker", "horizon", "asOf", "generatedAt", "cached", "sections", "budget"}
+    assert body["ticker"] == TICKER and body["horizon"] == HORIZON_SWING
+    assert body["cached"] is False
+    assert set(body["sections"]) == {
+        "bars", "indicators", "news", "events", "recommendations",
+        "filings", "earnings", "profile",
+    }
+    assert set(body["budget"]) == {"upstreamCalls", "elapsedMs", "bySource"}
+    assert body["sections"]["bars"]["staleWeekdays"] == 0
+    assert body["sections"]["bars"]["lastBarDate"] == TODAY.isoformat()
+    assert body["sections"]["earnings"]["dataQuality"] == {
+        "source": None, "dropped": 0, "disagreements": 0}
+    assert body["sections"]["indicators"]["computedAt"]
+    # No snake_case anywhere in the document.
+    flat = json.dumps(body)
+    for snake in ("last_bar_date", "stale_weekdays", "data_quality", "upstream_calls",
+                  "published_at", "filed_on", "market_cap"):
+        assert snake not in flat
+
+
+def test_cache_hit_no_upstream_calls(_no_network, app_state):
+    """The second request touches neither an upstream nor the database."""
+    _mount_all(_no_network)
+    pool, _redis = app_state
+
+    first = _get().json()
+    calls_after_first = len(_no_network.calls)
+    reads_after_first = len(pool.reads)
+    assert first["cached"] is False
+
+    second = _get().json()
+    assert second["cached"] is True
+    assert len(_no_network.calls) == calls_after_first
+    assert len(pool.reads) == reads_after_first
+    # The body is identical apart from the retrieval flag.
+    assert {k: v for k, v in second.items() if k != "cached"} == \
+           {k: v for k, v in first.items() if k != "cached"}
+
+
+def test_error_section_short_ttl(_no_network, app_state):
+    """A document with a failed section lives 2 min, not 15 or 60."""
+    from cache import TTL_DOSSIER_ERROR, dossier_key
+    _mount_all(_no_network)
+    _no_network.get(f"{FINNHUB}/stock/profile2").mock(return_value=httpx.Response(500))
+    _pool, redis = app_state
+
+    body = _get().json()
+    assert body["sections"]["profile"]["status"] == STATUS_ERROR
+    assert await_ttl(redis, dossier_key(TICKER, HORIZON_SWING)) <= TTL_DOSSIER_ERROR
+
+
+def test_ttl_market_hours_and_outside(_no_network, app_state, monkeypatch):
+    """15 min while the market is open, 60 min outside."""
+    from cache import TTL_DOSSIER_CLOSED, TTL_DOSSIER_MARKET, dossier_key
+    _mount_all(_no_network)
+    _pool, redis = app_state
+    key = dossier_key(TICKER, HORIZON_SWING)
+
+    monkeypatch.setattr(main, "get_market_status", lambda: ("market_open", NOW))
+    _get()
+    open_ttl = await_ttl(redis, key)
+    assert TTL_DOSSIER_MARKET - 5 <= open_ttl <= TTL_DOSSIER_MARKET
+
+    redis._store.pop(key, None)          # FakeRedis is a plain dict underneath
+    monkeypatch.setattr(main, "get_market_status", lambda: ("weekend", NOW))
+    _get()
+    assert await_ttl(redis, key) > TTL_DOSSIER_MARKET
+    assert await_ttl(redis, key) <= TTL_DOSSIER_CLOSED
+
+
+def await_ttl(redis: FakeRedis, key: str) -> int:
+    """FakeRedis TTL without an event loop of its own (it is pure Python)."""
+    import time as _t
+    value, expires_at = redis._store[key]
+    return int(expires_at - _t.time())
+
+
+def test_cache_absent(_no_network, app_state):
+    """No Redis at all: computed every time, still 200."""
+    _mount_all(_no_network)
+    main.app.state.redis = None
+    first, second = _get().json(), _get().json()
+    assert first["cached"] is False and second["cached"] is False
+
+
+def test_cache_get_raises(_no_network, app_state):
+    _mount_all(_no_network)
+    main.app.state.redis = FakeRedis(fail_on={"get"})
+    body = _get().json()
+    assert body["cached"] is False
+    assert body["sections"]["news"]["status"] == STATUS_OK
+
+
+def test_cache_set_raises(_no_network, app_state):
+    _mount_all(_no_network)
+    main.app.state.redis = FakeRedis(fail_on={"set"})
+    resp = _get()
+    assert resp.status_code == 200
+    assert resp.json()["cached"] is False
+
+
+def test_cache_corrupt_body_recomputes(_no_network, app_state):
+    """A cached value that is not a dossier is a miss: recomputed and
+    overwritten, never served."""
+    from cache import dossier_key
+    _mount_all(_no_network)
+    _pool, redis = app_state
+    key = dossier_key(TICKER, HORIZON_SWING)
+    redis._store[key] = ("not json at all", None)
+
+    body = _get().json()
+    assert body["cached"] is False
+    assert body["sections"]["bars"]["status"] == STATUS_OK
+    assert json.loads(redis._store[key][0])["sections"]["bars"]["status"] == STATUS_OK
+
+
+def test_bad_horizon_400(_no_network, app_state):
+    pool, _redis = app_state
+    for horizon in ("intraday", "", "SWING"):
+        resp = _get(f"/dossier/{TICKER}?horizon={horizon}")
+        assert resp.status_code == 400, horizon
+        assert "horizon" in resp.json()["detail"].lower()
+    assert not _no_network.calls
+    assert pool.reads == []
+
+
+def test_bad_ticker_400(_no_network, app_state):
+    pool, _redis = app_state
+    for bad in ("BRK.B", "TOOLONG", "12"):
+        assert _get(f"/dossier/{bad}").status_code == 400, bad
+    assert not _no_network.calls
+    assert pool.reads == []
+
+
+def test_unknown_ticker_404(_no_network, app_state):
+    """No stored bars and the refresh produces none."""
+    _mount_all(_no_network)
+    main.app.state.db_pool = FakePool(bars={})
+    resp = _get("/dossier/ZZZZ")
+    assert resp.status_code == 404
+    assert "ZZZZ" in resp.json()["detail"]
+
+
+def test_db_down_503(_no_network, app_state):
+    """No pool at all: no document to build, and nothing is fetched."""
+    main.app.state.db_pool = None
+    resp = _get()
+    assert resp.status_code == 503
+    assert not _no_network.calls
+
+
+def test_db_read_raise_503(_no_network, app_state):
+    """The pre-fan-out bars read raises: 503, and no upstream call was made."""
+    _mount_all(_no_network)
+    main.app.state.db_pool = FakePool(bars={(TICKER, "1d"): _bars(60, TODAY)},
+                                      raise_on="ohlcv_bars")
+    resp = _get()
+    assert resp.status_code == 503
+    assert not _no_network.calls
+
+
+def test_earnings_db_raise_503(_no_network, app_state):
+    """A DB read inside a section is still a 503, not a degraded section —
+    after the fan-out has spent its calls, which is accepted."""
+    _mount_all(_no_network)
+    main.app.state.db_pool = FakePool(bars={(TICKER, "1d"): _bars(60, TODAY)},
+                                      raise_on="data_engine.events")
+    resp = _get()
+    assert resp.status_code == 503
+    assert _no_network.calls        # the calls were already spent
+
+
+def test_unconfigured_sections_in_dev(_no_network, app_state):
+    """The dev twin's state: both keys empty. Every source section is
+    `unconfigured`, nothing is `error`, no HTTP happens, and the document is
+    still a 200 with real indicators from stored bars."""
+    main.app.state.finnhub = _finnhub("")
+    main.app.state.edgar = _edgar("")
+    resp = _get()
+    assert resp.status_code == 200
+    body = resp.json()
+
+    for name in ("news", "events", "recommendations", "profile", "filings"):
+        assert body["sections"][name]["status"] == STATUS_UNCONFIGURED, name
+        assert body["sections"][name]["reason"] is None
+    assert body["sections"]["indicators"]["status"] == STATUS_OK
+    assert body["sections"]["indicators"]["close"] is not None
+    assert body["budget"]["upstreamCalls"] == 0
+    assert not _no_network.calls
+
+
+def test_stale_bars_triggers_refresh_through_the_endpoint(_no_network, app_state):
+    """The endpoint injects the real refresh helper: stale bars call it once,
+    and a refusal from it is served as stale rather than failing."""
+    _mount_all(_no_network)
+    pool = FakePool(bars={(TICKER, "1d"): _bars(60, date(2026, 9, 4))})
+    main.app.state.db_pool = pool
+    calls = []
+
+    async def _refresh(ticker):
+        calls.append(ticker)
+        raise main.HTTPException(status_code=429, detail="refreshed recently")
+
+    original = main.refresh_ticker_bars
+    main.refresh_ticker_bars = _refresh
+    try:
+        body = _get().json()
+    finally:
+        main.refresh_ticker_bars = original
+
+    assert calls == [TICKER]
+    assert body["sections"]["bars"]["status"] == STATUS_STALE
+    assert body["sections"]["bars"]["refreshed"] is False
+
+
+@pytest.mark.asyncio
+async def test_alphavantage_cooldown_skips_av(_no_network):
+    """The AV cooldown acts one level down, inside the refresh's earnings
+    step: the call is skipped and the refresh reports reason 'cooldown'."""
+    from cache import SOURCE_ALPHAVANTAGE, TTL_COOLDOWN_ALPHAVANTAGE, start_cooldown
+    from providers.context.earnings import sync_earnings_dates
+
+    redis = FakeRedis()
+    cooldowns = MemoryCooldowns()
+    await start_cooldown(redis, cooldowns, SOURCE_ALPHAVANTAGE, TTL_COOLDOWN_ALPHAVANTAGE)
+
+    av = MagicMock()
+    av.get = AsyncMock(side_effect=AssertionError("Alpha Vantage must not be called"))
+    provider = MagicMock()
+    provider.get_earnings_dates = AsyncMock(return_value=None)   # primary empty
+    pool = FakePool(bars={(TICKER, "1d"): _bars(60, TODAY)})
+
+    result = await sync_earnings_dates(
+        provider, av, TICKER, pool, today=TODAY, redis=redis, cooldowns=cooldowns
+    )
+
+    assert result == {"source": None, "stored": 0, "dropped": 0, "reason": "cooldown"}
+    assert av.get.await_count == 0
