@@ -1,0 +1,38 @@
+"""
+In-process fake Redis for risk-shield tests (Part 3.1).
+
+The Part 1.7 pattern from data-engine, copied: enough of the async client
+surface for cache.py to run its real code path — no socket, no server.
+Failure modes are opt-in flags so a test can prove the fail-open branches
+without patching cache.py itself.
+"""
+
+
+class FakeRedis:
+    def __init__(self, *, fail_get=False, fail_set=False):
+        self.store: dict[str, str] = {}
+        self.ttls: dict[str, int] = {}
+        self.fail_get = fail_get
+        self.fail_set = fail_set
+        self.get_calls: list[str] = []
+        self.set_calls: list[tuple[str, str, int]] = []
+
+    async def get(self, key):
+        self.get_calls.append(key)
+        if self.fail_get:
+            raise RuntimeError("boom: redis get")
+        return self.store.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.set_calls.append((key, value, ex))
+        if self.fail_set:
+            raise RuntimeError("boom: redis set")
+        self.store[key] = value
+        self.ttls[key] = ex
+        return True
+
+    async def ping(self):
+        return True
+
+    async def close(self):
+        return None
