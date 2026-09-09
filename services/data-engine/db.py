@@ -207,6 +207,105 @@ async def get_stock(pool: asyncpg.Pool, ticker: str) -> Optional[dict]:
     }
 
 
+# ── Context: news + events (Part 2.1) ────────────────────────────
+
+# news_items.ticker is NOT NULL (a nullable column inside a UNIQUE constraint
+# does not dedup); general-market news is stored under this sentinel.
+MARKET_TICKER = "_MARKET"
+
+
+async def upsert_news(pool: asyncpg.Pool, items: list[dict]) -> int:
+    """
+    Insert news rows into data_engine.news_items, skipping any (ticker, url)
+    already stored. Each item: ticker (None → MARKET_TICKER), published_at
+    (datetime), source, title, url, summary. Items without a url or title
+    are dropped and counted in the log. Duplicates inside one batch are
+    collapsed before the statement runs.
+
+    Returns the number of rows sent (executemany reports no insert count).
+    No explicit transaction: a raise mid-batch can leave earlier rows
+    inserted — same deferred defect as upsert_bars(); a rerun dedups.
+    """
+    if not items:
+        return 0
+
+    query = """
+        INSERT INTO data_engine.news_items
+            (ticker, published_at, source, title, url, summary)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (ticker, url) DO NOTHING
+    """
+    records: list[tuple] = []
+    seen: set[tuple[str, str]] = set()
+    dropped = 0
+    for item in items:
+        url = (item.get("url") or "").strip()
+        title = (item.get("title") or "").strip()
+        if not url or not title or item.get("published_at") is None:
+            dropped += 1
+            continue
+        ticker = item.get("ticker") or MARKET_TICKER
+        key = (ticker, url)
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append((
+            ticker,
+            item["published_at"],
+            (item.get("source") or "")[:100],
+            title,
+            url,
+            item.get("summary") or "",
+        ))
+    if dropped:
+        logger.warning(f"upsert_news: dropped {dropped} item(s) without url/title/published_at")
+    if not records:
+        return 0
+
+    async with pool.acquire() as conn:
+        await conn.executemany(query, records)
+
+    logger.info(f"Sent {len(records)} news rows ({len(items) - len(records)} dup/dropped)")
+    return len(records)
+
+
+async def upsert_events(pool: asyncpg.Pool, events: list[dict]) -> int:
+    """
+    Upsert rows into data_engine.events keyed on (ticker, event_type,
+    event_at). `meta` is merged: existing || new, so a writer that owns a
+    nested key (e.g. meta.calendar, meta.surprise) replaces only its own
+    key and leaves the others intact. Duplicates inside one batch are
+    collapsed (last wins) so the statement never touches a row twice.
+
+    Returns the number of rows sent. Same no-transaction caveat as
+    upsert_news().
+    """
+    if not events:
+        return 0
+
+    query = """
+        INSERT INTO data_engine.events (ticker, event_type, event_at, meta, updated_at)
+        VALUES ($1, $2, $3, $4::jsonb, now())
+        ON CONFLICT (ticker, event_type, event_at) DO UPDATE SET
+            meta = data_engine.events.meta || EXCLUDED.meta,
+            updated_at = now()
+    """
+    by_key: dict[tuple, dict] = {}
+    for ev in events:
+        key = (ev["ticker"], ev["event_type"], ev["event_at"])
+        by_key[key] = ev
+    records = [
+        (t, et, at, json.dumps(ev.get("meta") or {}, default=str))
+        for (t, et, at), ev in by_key.items()
+    ]
+
+    async with pool.acquire() as conn:
+        await conn.executemany(query, records)
+
+    logger.info(f"Sent {len(records)} event rows")
+    return len(records)
+
+
 # ── OHLCV Bars ───────────────────────────────────────────────────
 
 def bar_records_from_df(df) -> list[dict]:

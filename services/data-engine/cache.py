@@ -20,6 +20,7 @@ CACHE_LAST_SCAN = "tf:cache:last_scan"
 CACHE_SCAN_STATUS = "tf:cache:scan_status"
 CACHE_REFRESH_PREFIX = "tf:cache:refresh:"
 CACHE_INDICATORS_PREFIX = "tf:cache:indicators:"
+CACHE_FINNHUB_PREFIX = "tf:cache:finnhub:"
 
 # Pub/sub channels
 CHANNEL_SCAN_COMPLETE = "tf:scan:complete"
@@ -29,6 +30,8 @@ TTL_SCAN_RESULT = 3600      # 1 hour
 TTL_SCAN_STATUS = 600       # 10 minutes
 TTL_REFRESH_COOLDOWN = 900  # 15 minutes
 TTL_INDICATORS = 900        # 15 minutes
+TTL_FINNHUB_NEWS = 900      # 15 minutes
+TTL_FINNHUB_CONTEXT = 86400 # 24 hours (recommendations, earnings, profile)
 
 
 # ── Connection ───────────────────────────────────────────────────
@@ -162,6 +165,34 @@ async def delete_cached_indicators(r: aioredis.Redis, ticker: str) -> int:
     """Drop the cached snapshot (after a refresh wrote new bars). Returns
     the number of keys removed (0 or 1)."""
     return int(await r.delete(indicators_key(ticker)))
+
+
+# ── Generic JSON cache (Part 2.1) ────────────────────────────────
+
+def finnhub_key(kind: str, ticker: str) -> str:
+    """Cache key for one Finnhub fetcher result. Caller passes the
+    normalized ticker (tickers.normalize_ticker)."""
+    return f"{CACHE_FINNHUB_PREFIX}{kind}:{ticker}"
+
+
+async def get_cached_json(r: aioredis.Redis, key: str) -> Optional[Any]:
+    """Decoded JSON at `key`, or None on a miss. A stored value that is
+    not valid JSON is treated as a miss and logged (caller recomputes and
+    overwrites). Unlike get_cached_indicators(), any JSON value is
+    accepted — Finnhub bodies are lists as often as objects."""
+    data = await r.get(key)
+    if data is None:
+        return None
+    try:
+        return json.loads(data)
+    except (TypeError, ValueError) as e:
+        logger.warning(f"Cache at {key} is not valid JSON, ignoring: {e}")
+        return None
+
+
+async def set_cached_json(r: aioredis.Redis, key: str, body: Any, ttl: int) -> None:
+    """Cache any JSON-serializable body at `key` with TTL."""
+    await r.set(key, json.dumps(body, default=str), ex=ttl)
 
 
 # ── Pub/Sub Events ───────────────────────────────────────────────

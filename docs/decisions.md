@@ -131,3 +131,20 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 **Why:** library modules (fetchers, cache helpers) cannot import the FastAPI entrypoint without a cycle, and G1.5 wants every key to pass through the same function rather than a copy.
 
 **Supersedes:** the "normalizer is the only place `.upper()` appears in an endpoint file" enforcement note in the 2026-09-05 spec-tables entry; the rule is the same, the file moved.
+
+---
+
+## 2026-09-09 — Finnhub context fetchers (Part 2.1)
+
+**Decision:**
+
+- **Free-tier scope verified live (plan §18):** `/stock/profile2`, `/company-news`, `/stock/recommendation`, `/calendar/earnings`, `/stock/earnings` all answer 200 with the free key. But `/calendar/earnings` returned only the *upcoming* report for a two-year `from`; past report dates are not available from it on this tier. `/stock/earnings` gives the last four surprises keyed by fiscal period end, not report date. Part 2.3 must take report dates from elsewhere (yfinance `earnings_dates`, plan fallback) or from the daily-bar gap around the period end.
+- **Events shape.** `('earnings', report date)` with `meta.calendar` from the calendar; `('earnings_surprise', period end)` with `meta.surprise` from surprises. Two rows, not one: the dates differ. `meta` is merged on conflict (`existing || new`), each writer owns a nested key, so neither order clobbers the other. Same-kind reruns replace their own key (a calendar rerun updates `epsActual` once reported).
+- **`news_items.ticker` is NOT NULL.** A nullable column inside a UNIQUE constraint does not dedup in Postgres (NULLs are distinct). General-market news is stored under the sentinel `_MARKET` (`db.MARKET_TICKER`). Verified live: two inserts of the same `_MARKET` URL leave one row.
+- **Writes are not transactional.** `upsert_news` / `upsert_events` use one `executemany` without an explicit transaction: partial rows are possible on a mid-batch raise, same deferred defect as `upsert_bars`; a rerun dedups. In-batch duplicates are collapsed first so `DO UPDATE` never touches a row twice.
+- **Fetchers return raw Finnhub bodies**; conversion to rows is separate and pure. Cache goes through `cache.py` (`finnhub_key`, generic `get_cached_json` / `set_cached_json`). Tickers pass through `tickers.normalize_ticker` and must be 1–5 letters; anything else raises `ValueError` before HTTP.
+- **Limiter** is an in-process sliding window (60 per 60 s) plus a 1.2 s minimum gap, with injectable clock and sleep so tests use a fake clock. A 429 raises and nothing retries.
+
+**Why:** the plan row names the endpoints and tables but not the free-tier limits, the date mismatch between the two earnings endpoints, or the dedup trap; all three would otherwise surface as silent bugs in 2.3 and 2.4.
+
+**Supersedes:** N/A — the plan's `news_items` column list said `ticker NULL for market news`; the sentinel replaces the NULL for the reason above.

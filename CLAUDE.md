@@ -37,6 +37,8 @@ cd services/data-engine
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8001
 ```
+**8001 is prod** (`tf-data-engine`, live yfinance, real keys); **8011 is the dev twin** (`tf-data-engine-dev`, fixture provider, empty Finnhub key, own database `tradingfirm_dev`, Redis DB 1). Verify parts on 8011; use 8001 for real scans.
+
 Tests run inside `tf-data-engine-dev` (host pandas ≠ pinned version). It is a separate container from prod `tf-data-engine`, so prod keeps running: fixture provider, its own database `tradingfirm_dev`, Redis DB 1, pytest baked in via the Dockerfile `dev` stage. Rebuild with `--build` after changing `requirements*.txt`:
 ```bash
 docker compose --profile dev up -d data-engine-dev
@@ -75,7 +77,7 @@ Requires `.env` with `DB_PASSWORD` set — compose fails fast without it.
 ## Never touch / handle with care
 
 - **Name the `test_*.py` files when running pytest** in `services/data-engine`. `pytest.ini` (`testpaths = tests`, `python_files = test_*.py`) now keeps a bare `pytest` from collecting `tests/full_scan_test.py`, which fires a real Finviz + yfinance scan on import — naming files is habit and belt-and-braces, no longer the only guard.
-- **`tests/smoke_test_pipeline.py`, `tests/full_scan_test.py`, `tests/record_fixture_live.py`** are live-API scripts. Run manually and deliberately, never in CI.
+- **`tests/smoke_test_pipeline.py`, `tests/full_scan_test.py`, `tests/record_fixture_live.py`, `tests/record_finnhub_live.py`** are live-API scripts. Run manually and deliberately, never in CI.
 - **One live scan pipeline: `services/data-engine`** (proxied by `web/app/api/scanner/pro/route.js`). `scanner/` is a frozen reference — don't build on it (`scanner/README.md`). Its `results.json`/`status.json` are generated output.
 - **Migrations must be re-runnable**: `IF NOT EXISTS` everywhere, no plain `INSERT` seeds. Why: `scripts/migrate.sh` header, `docs/decisions.md` 2026-09-05.
 - **Never write into another service's Postgres schema** (`data_engine`, `signals`, `risk`, `users`, `ai`). Cross-service communication is HTTP + Redis pub/sub only.

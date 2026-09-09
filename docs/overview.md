@@ -120,6 +120,23 @@ FastAPI app. Key pieces:
   for one ticker is logged and skipped, never aborts the scan. Both write
   paths key rows on `main.normalize_ticker()` (upper-cased, stripped) so
   a ticker can't land under two different casings.
+- **`providers/context/`** (Phase 2 context fetchers). `finnhub_client.py`:
+  thin `httpx` client, key in the `X-Finnhub-Token` header (never the URL),
+  in-process limiter of 60 calls per rolling minute plus a 1.2 s gap, typed
+  errors (`FinnhubNotConfigured` before any HTTP when the key is empty,
+  `FinnhubAuthError`, `FinnhubRateLimited`, `FinnhubError`), no retries.
+  `finnhub.py`: `company_news`, `recommendations`, `earnings_calendar`,
+  `earnings_surprises`, `profile` return raw Finnhub bodies cached in Redis
+  (`tf:cache:finnhub:{kind}:{ticker}`, news 15 min, the rest 24 h, fail-open
+  when Redis is down); pure converters turn them into rows and
+  `sync_context()` stores news and earnings events. Tables (migration
+  `003_context.sql`): `data_engine.news_items` (`ticker` NOT NULL, general
+  news under `_MARKET`, unique on `(ticker, url)`) and `data_engine.events`
+  (PK `(ticker, event_type, event_at)`, `meta` merged on conflict). The
+  key reaches prod `data-engine` only via `FINNHUB_API_KEY`; the dev twin
+  has it hard-coded empty. Tests mock HTTP with `respx` and replay
+  `tests/fixtures/finnhub/AAPL_*.json`, recorded once by
+  `tests/record_finnhub_live.py`.
 - **Storage fallback chain**: results are always kept in an in-memory store;
   Redis and Postgres are optional — the service degrades gracefully and
   keeps working (from memory only) if either is unavailable at startup.
@@ -129,7 +146,7 @@ FastAPI app. Key pieces:
   default) and `fixture` (`fixture_provider.py`, replays
   `tests/fixtures/{daily,hourly,info}/<TICKER>.json` with no network — for
   tests only, selectable via `DATA_PROVIDER=fixture`).
-- **`requirements-dev.txt`** — `pytest` + `pytest-asyncio` on top of
+- **`requirements-dev.txt`** — `pytest` + `pytest-asyncio` + `respx` on top of
   `requirements.txt`; baked into the Dockerfile's `dev` stage only (the
   `prod` stage never sees it). Tests run in `tf-data-engine-dev`, see
   Infrastructure below and `CLAUDE.md` Commands. `pytest.ini` restricts
@@ -188,7 +205,7 @@ Google-sign-in scaffolding under `web/lib/firebase/` has been removed.
   `.env` — compose fails fast without it.
 - **`tf-data-engine-dev`** — opt-in eighth container (compose profile
   `dev`, `docker compose --profile dev up -d data-engine-dev`, host port
-  8011) for running data-engine tests without touching prod
+  8011; migrations mounted read-only at `/migrations`) for running data-engine tests without touching prod
   `tf-data-engine`. Built from the data-engine Dockerfile's `dev` stage
   (dev deps, no code — the source tree is volume-mounted), provider
   hard-coded to `fixture`, its own database `tradingfirm_dev` and Redis

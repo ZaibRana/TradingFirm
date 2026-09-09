@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     # Data provider (yfinance for dev, fmp for prod)
     data_provider: str = "yfinance"
 
+    # Finnhub (Phase 2 context fetchers). Empty = fetchers raise
+    # FinnhubNotConfigured before any HTTP; the dev twin is always empty.
+    finnhub_api_key: str = ""
+
     # Scanner defaults
     default_price_min: float = 10.0
     default_price_max: float = 40.0
