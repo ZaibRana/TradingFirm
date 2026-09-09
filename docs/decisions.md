@@ -148,3 +148,14 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 **Why:** the plan row names the endpoints and tables but not the free-tier limits, the date mismatch between the two earnings endpoints, or the dedup trap; all three would otherwise surface as silent bugs in 2.3 and 2.4.
 
 **Supersedes:** N/A — the plan's `news_items` column list said `ticker NULL for market news`; the sentinel replaces the NULL for the reason above.
+
+---
+
+## 2026-09-09 — G1 reworded: spec file before approval, approval is a word in chat
+
+**Decision:** G1 in `.agents/AGENTS.md` now says: the spec goes to `docs/specs/<part>.md` (3 sentences, G1.5 tables, the decisions the plan row leaves open) and is the only file written before approval; no other edit until "approved" appears in chat for that part; a complete plan row is not a substitute; "do part X, stop when done" means post the spec and stop; the spec file is committed with the feat commit, corrected to what was approved.
+
+**Why:** Part 2.2 was built without a posted spec on the strength of "Do step 2.2 only", and its completion report listed five choices the plan row never covered. Review then changed four of them and the table shape. A spec file also survives a cleared chat.
+
+**Supersedes:** the G1 wording of 2026-09-04 (first entry); G1.5 unchanged.
+

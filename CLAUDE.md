@@ -25,6 +25,7 @@ TradingFirm — a day-trading system that screens the market, applies technical 
 ## Docs discipline
 
 - **Active plan: `docs/plan-analyst-watcher.md`.** Read it before any part. Its §0 decisions are binding. The user says which part to build.
+- **`docs/specs/<part>.md` is the part's spec** (G1): the only file written before approval, committed with the feat commit, corrected to what was approved. Approval is the word "approved" in chat for that part; a plan row is not it.
 - **Plan files are read-only** once approved. If a part proves the plan wrong, record the change in `docs/decisions.md` ("supersedes D-n") and note it in `docs/progress.md`.
 - **`docs/overview.md` describes what exists now**, never future state. Update it when a part changes architecture, adds a service/endpoint, or adds a third-party API or library.
 - **`docs/decisions.md` is append-only.** One entry per decision: date, decision, why, supersedes.

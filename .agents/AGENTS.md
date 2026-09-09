@@ -7,11 +7,14 @@
 ## PART 1: GLOBAL RULES
 
 ### G1: Ask Before Building
-**When:** Starting any new feature, service, or integration
+**When:** Starting any new feature, service, or integration — every plan part included
 → Use `/grill-me` to interview the user — resolve ALL design decisions first
-→ Write a 3-sentence spec (what it does, what it must NOT do, acceptance criteria)
-→ Get user approval before touching any file
+→ Write the spec to `docs/specs/<part>.md`: 3 sentences (what it does, what it must NOT do, acceptance criteria), then the G1.5 tables and the decisions the plan row leaves open
+→ The spec file is the only file written before approval. No other file edit for the part until the word "approved" appears in chat for that part
+→ A complete plan row is not a substitute for approval. "Do part X, stop when done" means: post the spec, then stop
+→ The spec file is committed with the part's feat commit, corrected to what was approved
 → NEVER assume a library, data source, or architecture — always ask
+→ Why: Part 2.2 was built on "Do step 2.2 only"; its own report then listed five choices the plan row never covered — exactly what the spec review exists to catch
 
 ### G1.5: Spec Tables
 **When:** The part writes state (Postgres, Redis, disk) or calls a dependency
