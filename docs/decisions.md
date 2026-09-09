@@ -207,3 +207,19 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 
 **Supersedes:** N/A. Extends the 2026-09-09 Finnhub entry, which named Part 2.3 as the place the past-report-date gap gets closed.
 
+---
+
+## 2026-09-09 — Earnings reactions: volume decides, never the bigger move (Part 2.3, commit 2)
+
+**Decision:**
+
+- **One rule for both ambiguities.** An unknown report hour and a cross-source date conflict are both resolved by `calc_rvol >= 2` on the candidate session. "Whichever session moved more" was rejected: it selects the bigger move by construction and would bias every statistic built on this history. When volume cannot separate the candidates the report is dropped and counted, never guessed.
+- **Date reconciliation has three cases.** Same source under 20 days apart: one report, keep the earlier (quarters are ≥ 60 days apart), nothing counted. Cross-source ≤ 1 day apart: one report off by a day, collapse to the yfinance row, not a disagreement. Cross-source 1–20 days apart: a real conflict, counted in `dataQuality.disagreements`, resolved by volume or both dropped.
+- **`reactions: null` ≠ `[]`.** Null means no confirmed report exists at all (never refreshed, or both sources down); `[]` means reports exist but no bars explain them. 2.4 shows "no data" for one and "no reaction" for the other, and never 500s on either.
+- **Only past rows count against quality.** A future report is unvalidated by construction, so it is skipped silently; counting it would show a permanent `dropped: 1` on every healthy ticker. The hour also falls back to `meta.calendar.hour` so Part 2.1 rows, which have no `meta.earnings`, still produce reactions.
+- **`db.get_events` is generic** (`event_type` / `since` / `until`, all optional, `meta` decoded with a malformed row kept as `{}`) because 2.4's dossier and 6.4's "earnings within 24 h" read the same table.
+
+**Why:** the plan row says "join stored earnings dates with stored daily bars" and leaves every tie-break open; each one above is a place where a plausible shortcut would have quietly biased the journal that Phase 4 scores verdicts against.
+
+**Supersedes:** N/A.
+

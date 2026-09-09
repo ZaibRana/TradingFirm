@@ -306,6 +306,70 @@ async def upsert_events(pool: asyncpg.Pool, events: list[dict]) -> int:
     return len(records)
 
 
+async def get_events(
+    pool: asyncpg.Pool,
+    ticker: str,
+    event_type: Optional[str] = None,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+) -> list[dict]:
+    """
+    Fetch stored events for a ticker, oldest first (Part 2.3).
+
+    Generic on purpose: Part 2.3 reads ('earnings', date) rows, 2.4's
+    dossier reads every kind, and 6.4 asks "is there an earnings event in
+    the next 24 hours". `event_type`, `since` and `until` are each optional
+    filters; `meta` is decoded from jsonb text, and a row whose meta will
+    not parse is kept with an empty dict rather than failing the read — a
+    malformed meta must not hide the date it belongs to.
+    """
+    conditions = ["ticker = $1"]
+    args: list[Any] = [ticker]
+    if event_type is not None:
+        args.append(event_type)
+        conditions.append(f"event_type = ${len(args)}")
+    if since is not None:
+        args.append(since)
+        conditions.append(f"event_at >= ${len(args)}")
+    if until is not None:
+        args.append(until)
+        conditions.append(f"event_at <= ${len(args)}")
+
+    query = f"""
+        SELECT ticker, event_type, event_at, meta
+        FROM data_engine.events
+        WHERE {' AND '.join(conditions)}
+        ORDER BY event_at ASC
+    """
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(query, *args)
+
+    events = []
+    for row in rows:
+        raw = row["meta"]
+        if isinstance(raw, (str, bytes)):
+            try:
+                meta = json.loads(raw)
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"get_events {ticker}: unparseable meta on "
+                    f"{row['event_type']} {row['event_at']}, read as empty"
+                )
+                meta = {}
+        else:
+            meta = raw or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        events.append({
+            "ticker": row["ticker"],
+            "event_type": row["event_type"],
+            "event_at": row["event_at"],
+            "meta": meta,
+        })
+    return events
+
+
 # ── Context: filings (Part 2.2) ──────────────────────────────────
 
 async def upsert_filings(pool: asyncpg.Pool, filings: list[dict]) -> int:

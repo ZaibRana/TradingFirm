@@ -190,7 +190,8 @@ def test_gap_matches_hand_computed():
 def test_package_exports_all_public_names():
     expected = [
         "IndicatorsResponse", "Zone", "aggregate_4h", "avg_dollar_volume", "calc_atr",
-        "calc_atrp", "calc_rvol", "check_52w_position", "ema", "extension",
+        "calc_atrp", "calc_rvol", "check_52w_position", "earnings_reactions", "ema",
+        "extension",
         "fractal_swings", "gap", "macd", "merge_levels", "relative_strength", "rsi",
         "score_zones", "sector_etf", "support_resistance", "swing_snapshot",
         "volume_nodes", "zone_to_dict",

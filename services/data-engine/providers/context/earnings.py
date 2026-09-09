@@ -40,6 +40,7 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
+from indicators.earnings import earnings_reactions
 from providers.base import ProviderRateLimited
 from providers.context.alphavantage_client import (
     AlphaVantageClient,
@@ -354,3 +355,47 @@ async def sync_earnings_dates(
 
     result["stored"] = await upsert_events(pool, rows)
     return result
+
+
+# ── Read side: reactions from what is stored ─────────────────────────────
+
+REACTION_HISTORY_YEARS = 3
+
+
+async def earnings_reaction_history(
+    pool,
+    ticker: str,
+    limit: int = 8,
+    *,
+    today: Optional[date] = None,
+) -> dict:
+    """
+    Last `limit` earnings reactions for `ticker` from stored events and
+    stored daily bars — two queries, no provider call and no cache (2.4
+    caches the whole dossier).
+
+    Returns {"ticker", "reactions": [...] | None, "dataQuality": {...}}.
+    A missing pool is fail-open (reactions None); a database error
+    propagates — a read that half-worked must not look like "no history".
+    """
+    t = validate_ticker(ticker)
+    today = today or datetime.now(timezone.utc).date()
+    if pool is None:
+        logger.warning(f"earnings_reaction_history {t}: no db pool")
+        return {
+            "ticker": t,
+            "reactions": None,
+            "dataQuality": {"source": None, "dropped": 0, "disagreements": 0},
+        }
+
+    from db import get_bars, get_events  # deferred: db.py imports asyncpg
+
+    since = datetime(
+        today.year - REACTION_HISTORY_YEARS, today.month, today.day, tzinfo=timezone.utc
+    )
+    events = await get_events(pool, t, event_type=EVENT_EARNINGS, since=since)
+    bars = await get_bars(pool, t, "1d", since=since)
+
+    result = earnings_reactions(events, bars, limit=limit, today=today)
+    del bars, events
+    return {"ticker": t, **result}

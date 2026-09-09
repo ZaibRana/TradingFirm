@@ -6,6 +6,7 @@ Import from the package, not the submodules: the module split
 detail. Every public function is re-exported here.
 """
 
+from indicators.earnings import earnings_reactions
 from indicators.levels import (
     Zone,
     fractal_swings,
@@ -30,6 +31,7 @@ __all__ = [
     "calc_atr",
     "calc_atrp",
     "calc_rvol",
+    "earnings_reactions",
     "check_52w_position",
     "ema",
     "extension",

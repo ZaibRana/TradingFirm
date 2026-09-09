@@ -179,6 +179,19 @@ FastAPI app. Key pieces:
   The Alpha Vantage key travels as the `apikey` query parameter (no header
   form exists) under the two conditions in that client module: the `httpx`
   logger pinned to WARNING and typed errors raised `from None`.
+  `indicators/earnings.py` holds the pure reaction calculation (plan §3):
+  `earnings_reactions(events, bars, limit=8)` pairs each confirmed report
+  with the session that absorbed it (`amc` → the next session, `bmo`/`dmh`
+  → the same one, at most 4 calendar days later) and returns gap % and
+  close-to-close % newest first, plus `dataQuality: {source, dropped,
+  disagreements}`. An unknown report hour and a cross-source date conflict
+  are both settled by `calc_rvol >= 2` on the candidate session, never by
+  the size of the move; when volume cannot separate them the report is
+  dropped and counted. `providers/context/earnings.earnings_reaction_history()`
+  is the I/O wrapper over the new generic `db.get_events(ticker,
+  event_type, since, until)` and the existing `get_bars`; `reactions` is
+  `null` when no confirmed report exists at all and `[]` when reports exist
+  but no bars explain them.
 - **Storage fallback chain**: results are always kept in an in-memory store;
   Redis and Postgres are optional — the service degrades gracefully and
   keeps working (from memory only) if either is unavailable at startup.
