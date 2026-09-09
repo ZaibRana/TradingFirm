@@ -117,6 +117,15 @@
 → End every completion report with `git diff --stat <base>..HEAD`, where `<base>` is the last commit before the part
 → Why: two consecutive parts each had an edit pass silently not apply. A passing test is not proof that the intended edit is what got committed
 
+### G14: Never Print Secrets
+**When:** Any command, log line, test, fixture or doc that could carry an API key, password, token or DSN
+→ Never run anything whose output can contain a secret value: no `docker compose config`, no `env`, no `cat .env`, no printing `settings.*` values
+→ Verify a secret by shape only: `grep -c "^NAME=.\+" .env` (set or empty), its length, or `print(bool(settings.name))` inside the container
+→ A masking pattern (`sed`, `grep -v`) is not a safeguard — it assumes an output format. If the check needs the value in the output at all, use a different check
+→ Secrets travel in headers and container env, never in URLs, query strings, fixtures, commit messages or progress rows
+→ The user pastes keys into `.env` themselves; never type, echo or read one. If a value does leak into a transcript, say so at once and tell the user to rotate it
+→ Why: Part 2.1 rendered `docker compose config` through a mask that expected quoted values; compose prints them unquoted, the real Finnhub key landed in the session transcript and had to be rotated
+
 ---
 
 ## PART 2: PROJECT RULES — TradingFirm

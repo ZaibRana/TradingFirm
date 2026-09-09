@@ -10,7 +10,7 @@ TradingFirm — a day-trading system that screens the market, applies technical 
 
 ## Read `.agents/AGENTS.md` first
 
-13 global rules + project rules take priority over generic habits. The ones most likely to bite:
+14 global rules + project rules take priority over generic habits. The ones most likely to bite:
 
 - **G1 — Ask before building.** 3-sentence spec approved before touching files for any new feature/service.
 - **G1.5 — Spec tables.** Stateful parts: writes table + failure-branch table in the spec, each branch naming its test function. Keys go through one shared normalization function.
@@ -19,6 +19,7 @@ TradingFirm — a day-trading system that screens the market, applies technical 
 - **G7 — Tests alongside code.** Every module gets a unit test; tests never call external APIs (mock the provider).
 - **G8 — Clean up memory.** `del` DataFrames + `gc.collect()` after use; never store raw DataFrames in `app.state`.
 - **G13 — Verify edits landed.** Absolute paths for every edit; prove scripted edits applied; end each completion report with `git diff --stat <base>..HEAD`.
+- **G14 — Never print secrets.** No `docker compose config`, `env` or `cat .env`; verify a key by shape only (set/empty, length, boolean). A masking pattern is not a safeguard.
 
 ## Docs discipline
 
