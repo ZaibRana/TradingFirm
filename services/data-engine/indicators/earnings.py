@@ -29,8 +29,15 @@ dropped and counted rather than guessed.
 
 dataQuality travels with the result so 2.4 can show what was thrown away:
     source         'yfinance' | 'alphavantage' | 'mixed' | None
-    dropped        rows that should have produced a reaction and did not
+    dropped        the source gave us something we could not use
     disagreements  cross-source date conflicts seen (resolved or not)
+
+A report older than the first stored bar is NOT counted in `dropped`: that
+is a limit of our bar history, not a problem with the source, and counting
+it would report a large `dropped` on a perfectly healthy ticker (the live
+yfinance feed reaches six years back against a two-year store). It is
+logged and skipped — the same treatment validate_report_dates gives it on
+the write side, where it is out_of_range rather than dropped.
 
 `reactions` is None (not []) when no confirmed report exists at all — the
 ticker was never refreshed, or both sources were down. [] means reports
@@ -221,7 +228,15 @@ def _reaction(event: dict, bar_dates: list[date], bars: list[dict]) -> tuple[Opt
     hour_assumed = False
 
     if d < bar_dates[0]:
-        return None, True                       # older than the stored history
+        # A history limit, not a source-quality problem: the source gave us
+        # a real report, we simply hold no bars that far back. Uncounted, so
+        # `dropped` keeps meaning "the source gave us something we could not
+        # use". Matches validate_report_dates' out_of_range on the write side.
+        logger.info(
+            f"earnings_reactions: {d} is older than the first stored bar "
+            f"({bar_dates[0]}), skipped and not counted"
+        )
+        return None, False
 
     if hour in (HOUR_AMC, HOUR_BMO, HOUR_DMH):
         i = _session_for_hour(bar_dates, d, hour)

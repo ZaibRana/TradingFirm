@@ -223,3 +223,13 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 
 **Supersedes:** N/A.
 
+---
+
+## 2026-09-09 — `dropped` means one thing on both sides (Part 2.3, follow-up)
+
+**Decision:** a report older than the first stored bar is logged, skipped and **not counted** at read time, matching `out_of_range` on the write side. `dropped` means "the source gave us something we could not use"; a short bar history is our limit, not a source-quality problem. No fourth `dataQuality` key — the shape stays `{source, dropped, disagreements}` and `out_of_range` reaches no response.
+
+**Why:** commit 2 shipped the two sides disagreeing — uncounted when storing, counted when reading — so the same report could inflate `dataQuality.dropped` for 2.4 purely because bars were trimmed.
+
+**Supersedes:** the read-side half of the 2026-09-09 commit-1 entry's out-of-range rule, which described the write side only.
+

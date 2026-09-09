@@ -8,6 +8,7 @@ end-to-end pass over the recorded AAPL fixtures through a mocked pool.
 """
 
 import json
+import logging
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -273,11 +274,19 @@ def test_reactions_skips_future_events():
     assert out["dataQuality"]["dropped"] == 0
 
 
-def test_reactions_skips_before_bar_history():
+def test_reactions_skips_before_bar_history(caplog):
+    """Older than the first stored bar: skipped and logged, but NOT counted.
+    `dropped` means "the source gave us something we could not use", and a
+    real report we hold no bars for is a limit of our history instead. Same
+    treatment as out_of_range on the write side."""
+    caplog.set_level(logging.INFO, logger="indicators.earnings")
     days = _weekdays(date(2026, 7, 27), 3)
+
     out = earnings_reactions([_event(date(2025, 1, 15))], _bars(days), today=TODAY)
+
     assert out["reactions"] == []
-    assert out["dataQuality"]["dropped"] == 1
+    assert out["dataQuality"]["dropped"] == 0
+    assert "older than the first stored bar" in caplog.text
 
 
 def test_reactions_skips_first_bar_no_previous_close():
@@ -469,7 +478,8 @@ def test_reactions_source_mixed():
 
 
 def test_reactions_data_quality_counts():
-    """One good report, one unconfirmed, one before the bar history."""
+    """One good report, one unconfirmed (counted), one before the bar
+    history (not counted: our history is short, the source is fine)."""
     days = _weekdays(date(2026, 1, 5), 40)
     unconfirmed = _event(days[30], validated=False)
     unconfirmed["meta"]["earnings"]["validated"] = False
@@ -478,7 +488,7 @@ def test_reactions_data_quality_counts():
     out = earnings_reactions(events, _bars(days), today=TODAY)
 
     assert len(out["reactions"]) == 1
-    assert out["dataQuality"] == {"source": "yfinance", "dropped": 2, "disagreements": 0}
+    assert out["dataQuality"] == {"source": "yfinance", "dropped": 1, "disagreements": 0}
 
 
 # ── the wrapper ──────────────────────────────────────────────────────────
