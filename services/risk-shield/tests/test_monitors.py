@@ -322,6 +322,22 @@ def test_breadth_slope_score_table(monkeypatch, slope, score):
     assert (result["score"], result["raw"]["slopePct"]) == (score, slope)
 
 
+@pytest.mark.parametrize(
+    "rsp_closes, score",
+    [
+        ([100.0 + 0.5 * i for i in range(20)], 90),   # fitted ratio change ≈ +9.5%
+        ([100.0] * 20, 60),                            # flat ratio
+        ([100.0 - 0.5 * i for i in range(20)], 25),   # ≈ −9.5%: a sign flip in slope_pct fails here
+    ],
+    ids=["rising_90", "flat_60", "falling_25"],
+)
+def test_breadth_real_closes_reach_every_band(rsp_closes, score):
+    """Unpatched: proves slope_pct is wired into breadth, in the right sign."""
+    d = bdays(20)
+    view = view_of({"RSP": make_series(d, rsp_closes), "SPY": make_series(d, [100.0] * 20)})
+    assert regime.breadth(view)["score"] == score
+
+
 def test_breadth_ad_unavailable_is_null_not_zero():
     d = bdays(20)
     rsp = make_series(d, [100.0 + 0.5 * i for i in range(20)])   # equal weight pulling ahead

@@ -382,3 +382,37 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 **Why:** Part 3.2's commit 2 (`5a5b307`) carried 980 lines of code + tests, well over the threshold. That surfaced only in the report after the commit was on `origin/main`, where it stays. A split is free locally and impossible after a push. The part came in at 841 code / 1,049 tests against an estimate of 520 / 700, and the estimate is what the split plan is approved against.
 
 **Supersedes:** the 2026-09-04 "Do not edit or delete past entries" line, for entries from the current part only.
+
+---
+
+## 2026-09-10 — Health score + regime (Part 3.3)
+
+**Decision:** approved spec `docs/specs/3.3.md` (v2). What later parts build on:
+
+- **Tickers pair on date, never by position.** `monitors/series.align()` inner-joins on the date string.
+  - A bar is **partial** when it is dated today in New York and its body was downloaded before 16:15 ET. The rule reads the body's `asOf`, not the time of reading.
+  - Only `vix` reads a partial bar (its intraday level). Every other monitor uses complete bars.
+- **Last-known is option (b), in the fetcher.** A full quotes answer is also kept 24 h at `tf:risk:cache:quotes_last`. `get_quotes_view` serves it with `stale: true` on a cooldown, refusal, error or degraded answer. A partial download is patched per ticker. There is no Redis fallback: without Redis, a refusal gives `score: null`.
+- **FRED is not a 3.3 input.** Its last-known key, `FredCoolingDown` → stale and cadence-based freshness move to the first FRED reader (3.6), in the same option (b) shape.
+- **A/D is unavailable.** data-engine stores no advance/decline counts and risk-shield reads no other schema, so breadth is the RSP/SPY 20-day slope alone, with `adRatio: null`. The plan row's "when available" is not met.
+- **Comparison operators:**
+  - Part 5's operators are used verbatim, and its bare ranges are lower-inclusive.
+  - A bare range that meets a `>` row closes at the top, so VIX 40.0 → 20 and a red volume ratio of 2.5 → 30.
+  - Equal to an EMA counts as below.
+- **Health score:**
+  - integer weights and round-half-up integer arithmetic
+  - a monitor with no score is left out and the rest renormalize, never counted as 0
+  - covered weight < 70 → `score` and `regime` null
+  - a monitor that raises is isolated
+- **Provisional numbers.** These are not in Part 5, and Phase 5/6 may retune them without a spec correction:
+  - partial-bar cut-off 16:15 ET
+  - spy_trend 25 for a bounce under the 200 EMA; "lower lows" = min(low[-10:]) < min(low[-20:-10])
+  - breadth slope band ±1.0 %
+  - volume, green 1.8–2.0 → 60
+  - cross-asset flat band 0.5 % and mixed → 65
+  - coverage floor 70
+- **Commit split.** Commit 1 came to 640 lines of code + tests (estimate ~520). It was split before any push into `6077699` / `8d03fa6`. Commit 2 was split from the start (`bcde3ee` / `2e6b51a`), because 3.1, 3.2 and 3.3 all ran over.
+
+**Why:** the plan row names six monitors and four regime bands. Every bullet is a place where a plausible default would quietly mis-score a regime: pairing by index, a stale error, A/D read as 0, a missing monitor averaged in as 0, float rounding at 69.5.
+
+**Supersedes:** N/A.
