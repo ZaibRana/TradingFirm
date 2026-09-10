@@ -101,3 +101,28 @@ def test_dockerfile_pins_single_worker():
     for cmd in uvicorn:
         i = cmd.index("--workers")
         assert cmd[i + 1] == "1"
+
+
+def test_news_poll_settings_defaults(monkeypatch):
+    """Part 3.5: the poller is off unless the environment turns it on, it
+    targets prod's data-engine service name by default, and the Finnhub key
+    masks like FRED's. The env is cleared first: the twin's compose env sets
+    all three (3.4's lesson — a default test must not read its container)."""
+    for var in ("NEWS_POLL_ENABLED", "DATA_ENGINE_URL", "FINNHUB_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    s = config.Settings(_env_file=None)
+    assert s.news_poll_enabled is False
+    assert s.data_engine_url == "http://data-engine:8001"
+    assert s.finnhub_api_key.get_secret_value() == ""
+    assert s.finnhub_configured is False
+
+    secret = "FINNHUB-KEY-3f9a7c21"
+    s = config.Settings(_env_file=None, finnhub_api_key=secret)
+    assert isinstance(s.finnhub_api_key, SecretStr)
+    assert secret not in repr(s)
+    assert secret not in str(s.model_dump())
+    assert s.finnhub_configured is True
+
+    mod = _reload(monkeypatch, NEWS_POLL_ENABLED="true", DATA_ENGINE_URL="http://data-engine-dev:8001")
+    assert mod.settings.news_poll_enabled is True
+    assert mod.settings.data_engine_url == "http://data-engine-dev:8001"

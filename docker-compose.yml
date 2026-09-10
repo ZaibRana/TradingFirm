@@ -142,6 +142,9 @@ services:
       DATA_PROVIDER: ${DATA_PROVIDER:-yfinance}
       FRED_API_KEY: ${FRED_API_KEY:-}
       SCHEDULER_ENABLED: "true"   # Part 3.4: the regime scheduler runs in prod only
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}         # Part 3.5: market news, header only
+      NEWS_POLL_ENABLED: "true"                     # Part 3.5: the news poller runs in prod only
+      DATA_ENGINE_URL: http://data-engine:8001      # Part 3.5: POST /news/ingest
     restart: unless-stopped
 
   # Dev/test twin of risk-shield (Part 3.1), the same shape Part 0.7 gave
@@ -153,6 +156,8 @@ services:
   # image is inert without the source mount below. Hard-coded, not from
   # .env:
   #   FRED_API_KEY=""        → nothing on 8013 can reach FRED (Part 3.2)
+  #   FINNHUB_API_KEY=""     → nor Finnhub (Part 3.5)
+  #   DATA_ENGINE_URL=data-engine-dev → news can only land in tradingfirm_dev (3.5)
   #   database tradingfirm_dev, Redis DB 1 → can never write prod's tables
   #                                          or prod's cache keys
   # Create the dev database once with scripts/dev-db.sh (it applies every
@@ -179,6 +184,9 @@ services:
       DEBUG: "true"
       SCHEDULER_ENABLED: "false"          # hard-coded: no quotes fixture here, a scheduler would download live (3.4)
       HEALTH_CHANNEL: tf:risk:dev:health  # pub/sub ignores the Redis DB index: never prod's channel (3.4)
+      FINNHUB_API_KEY: ""                 # hard-coded empty: nothing on 8013 can reach Finnhub (3.5)
+      NEWS_POLL_ENABLED: "false"          # hard-coded: the twin never polls (3.5)
+      DATA_ENGINE_URL: http://data-engine-dev:8001  # hard-coded: never prod's data-engine or database (3.5)
     command: uvicorn main:app --host 0.0.0.0 --port 8003 --workers 1 --reload
     restart: "no"
 

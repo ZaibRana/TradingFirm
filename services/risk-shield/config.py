@@ -46,6 +46,19 @@ class Settings(BaseSettings):
     # `fredConfigured` boolean on /health.
     fred_api_key: SecretStr = SecretStr("")
 
+    # Finnhub (Part 3.5 market news). SecretStr like FRED's. It goes in the
+    # X-Finnhub-Token header only, never a URL. Empty = the client raises
+    # before any HTTP; the dev twin is always empty.
+    finnhub_api_key: SecretStr = SecretStr("")
+
+    # Market news poller (Part 3.5). Off unless the environment turns it on:
+    # only the prod compose service does. The dev twin hard-codes false.
+    news_poll_enabled: bool = False
+
+    # Where the poller POSTs /news/ingest. The dev twin hard-codes
+    # http://data-engine-dev:8001 so it can never write into prod's database.
+    data_engine_url: str = "http://data-engine:8001"
+
     # Regime scheduler (Part 3.4). Off unless the environment turns it on:
     # only the prod compose service does. The dev twin has no quotes fixture,
     # so a scheduler there would download from yfinance every 5 minutes.
@@ -71,6 +84,11 @@ class Settings(BaseSettings):
         """Whether a FRED key is present. The only thing 3.1 asks of the
         key — the value itself never reaches a response or a log."""
         return bool(self.fred_api_key.get_secret_value())
+
+    @property
+    def finnhub_configured(self) -> bool:
+        """Whether a Finnhub key is present, never the value (G14)."""
+        return bool(self.finnhub_api_key.get_secret_value())
 
 
 settings = Settings()
