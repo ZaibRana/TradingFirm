@@ -14,6 +14,7 @@ FastAPI application with endpoints:
                              recommendations, filings, earnings reactions, profile
   GET  /market/status  — current market session
   POST /news/ingest    — store market news under _MARKET (risk-shield's poller, Part 3.5)
+  GET  /news/market    — stored _MARKET news, newest first (risk-shield's macro inputs, Part 3.6a)
   GET  /health         — health check
   GET  /               — service info
 
@@ -24,7 +25,7 @@ import gc
 import logging
 import time as _time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
@@ -281,6 +282,7 @@ async def root():
             "GET  /dossier/{ticker}",
             "GET  /market/status",
             "POST /news/ingest",
+            "GET  /news/market?hours=24&limit=50",
             "GET  /health",
         ],
     }
@@ -862,3 +864,45 @@ async def ingest_news(body: NewsIngestRequest):
         raise HTTPException(status_code=503, detail=NEWS_DB_UNAVAILABLE_DETAIL) from None
     logger.info(f"/news/ingest: {len(rows)} received, {sent} sent under {MARKET_TICKER}")
     return {"received": len(rows), "sent": sent}
+
+
+# ── Market news read (Part 3.6a, spec decision 2) ────────────────
+# Postgres only: no cache, no provider, no write. risk-shield's macro inputs
+# call it with hours=24&limit=50 and keep a copy of these bounds
+# (test_inputs_news_request_within_route_bounds there,
+# test_news_market_bounds_pinned_for_risk_shield here). A drift would be a
+# 422 on every brief.
+
+NEWS_MARKET_DEFAULT_HOURS = 24
+NEWS_MARKET_MAX_HOURS = 168
+NEWS_MARKET_DEFAULT_LIMIT = 50
+NEWS_MARKET_MAX_LIMIT = 100
+
+
+@app.get("/news/market")
+async def market_news(
+    hours: int = Query(NEWS_MARKET_DEFAULT_HOURS, ge=1, le=NEWS_MARKET_MAX_HOURS),
+    limit: int = Query(NEWS_MARKET_DEFAULT_LIMIT, ge=1, le=NEWS_MARKET_MAX_LIMIT),
+):
+    """
+    Market news published in the last `hours`, newest first, at most `limit`
+    items: [{publishedAt, source, title, summary, url}]. No rows is 200 [],
+    never a 404. No pool, or a database error or timeout, is a 503.
+    """
+    pool = getattr(app.state, "db_pool", None)
+    if pool is None:
+        raise HTTPException(status_code=503, detail=NEWS_DB_UNAVAILABLE_DETAIL)
+
+    from db import DB_ERRORS, get_market_news
+
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    try:
+        rows = await get_market_news(pool, since, limit)
+    except (*DB_ERRORS, TimeoutError) as e:
+        logger.warning(f"/news/market: database unavailable ({type(e).__name__})")
+        raise HTTPException(status_code=503, detail=NEWS_DB_UNAVAILABLE_DETAIL) from None
+    return [
+        {"publishedAt": row["published_at"].isoformat(), "source": row["source"],
+         "title": row["title"], "summary": row["summary"], "url": row["url"]}
+        for row in rows
+    ]

@@ -282,6 +282,26 @@ async def upsert_news(pool: asyncpg.Pool, items: list[dict]) -> int:
     return len(records)
 
 
+GET_MARKET_NEWS_SQL = """
+    SELECT published_at, source, title, summary, url
+    FROM data_engine.news_items
+    WHERE ticker = $1 AND published_at >= $2
+    ORDER BY published_at DESC
+    LIMIT $3
+"""
+
+
+async def get_market_news(pool: asyncpg.Pool, since: datetime, limit: int) -> list[dict]:
+    """
+    Market news (ticker = MARKET_TICKER) published at or after `since`,
+    newest first, at most `limit` rows (Part 3.6a). Read-only; served by
+    news_items_ticker_published_idx.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(GET_MARKET_NEWS_SQL, MARKET_TICKER, since, limit)
+    return [dict(row) for row in rows]
+
+
 async def upsert_events(pool: asyncpg.Pool, events: list[dict]) -> int:
     """
     Upsert rows into data_engine.events keyed on (ticker, event_type,
