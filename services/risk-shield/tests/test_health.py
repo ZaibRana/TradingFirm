@@ -108,3 +108,11 @@ def test_health_reports_news_poll_state(stub_state, monkeypatch):
         "newsPageSpanMinutes": 2466, "newsOldestAt": "2026-09-09T00:06:48+00:00",
         "newsLastError": "ingest: HTTP 503", "finnhubConfigured": True}
     assert secret not in resp.text
+
+
+def test_health_reports_macro_brief_flag(stub_state, monkeypatch):
+    """Part 3.6a: whether this process may generate macro briefs."""
+    monkeypatch.setattr(main.settings, "macro_brief_enabled", False)
+    assert stub_state().get("/health").json()["macroBriefEnabled"] is False
+    monkeypatch.setattr(main.settings, "macro_brief_enabled", True)
+    assert stub_state().get("/health").json()["macroBriefEnabled"] is True

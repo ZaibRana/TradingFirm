@@ -145,6 +145,8 @@ services:
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}         # Part 3.5: market news, header only
       NEWS_POLL_ENABLED: "true"                     # Part 3.5: the news poller runs in prod only
       DATA_ENGINE_URL: http://data-engine:8001      # Part 3.5: POST /news/ingest
+      MACRO_BRIEF_ENABLED: "false"                  # Part 3.6a: stays off until ai-agent's /brief/macro (4.6)
+      AI_AGENT_URL: http://ai-agent:8004            # Part 3.6b: POST /brief/macro
     restart: unless-stopped
 
   # Dev/test twin of risk-shield (Part 3.1), the same shape Part 0.7 gave
@@ -187,6 +189,8 @@ services:
       FINNHUB_API_KEY: ""                 # hard-coded empty: nothing on 8013 can reach Finnhub (3.5)
       NEWS_POLL_ENABLED: "false"          # hard-coded: the twin never polls (3.5)
       DATA_ENGINE_URL: http://data-engine-dev:8001  # hard-coded: never prod's data-engine or database (3.5)
+      MACRO_BRIEF_ENABLED: "false"                  # hard-coded: the twin never generates a brief (3.6a)
+      AI_AGENT_URL: http://ai-agent.invalid:8004    # hard-coded: .invalid never resolves, no LLM from the twin (3.6a)
     command: uvicorn main:app --host 0.0.0.0 --port 8003 --workers 1 --reload
     restart: "no"
 

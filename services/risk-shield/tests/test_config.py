@@ -126,3 +126,35 @@ def test_news_poll_settings_defaults(monkeypatch):
     mod = _reload(monkeypatch, NEWS_POLL_ENABLED="true", DATA_ENGINE_URL="http://data-engine-dev:8001")
     assert mod.settings.news_poll_enabled is True
     assert mod.settings.data_engine_url == "http://data-engine-dev:8001"
+
+
+def test_macro_brief_settings_defaults(monkeypatch):
+    """Part 3.6a: brief generation is off unless the environment turns it on,
+    and ai-agent defaults to prod's service name. The env is cleared first:
+    the twin's compose env sets both (a default test must not read its
+    container)."""
+    for var in ("MACRO_BRIEF_ENABLED", "AI_AGENT_URL"):
+        monkeypatch.delenv(var, raising=False)
+    s = config.Settings(_env_file=None)
+    assert s.macro_brief_enabled is False
+    assert s.ai_agent_url == "http://ai-agent:8004"
+
+    mod = _reload(monkeypatch, MACRO_BRIEF_ENABLED="true", AI_AGENT_URL="http://ai-agent.invalid:8004")
+    assert mod.settings.macro_brief_enabled is True
+    assert mod.settings.ai_agent_url == "http://ai-agent.invalid:8004"
+
+
+def test_twin_never_calls_prod_ai_agent():
+    """The dev twin must never generate a brief or reach any ai-agent (an
+    LLM costs money and the twin has no ai-agent). Guards the compose
+    overrides MACRO_BRIEF_ENABLED / AI_AGENT_URL: fails if one is dropped.
+    Runs only inside the twin (SERVICE_NAME=risk-shield-dev)."""
+    import os
+    from urllib.parse import urlparse
+
+    if os.environ.get("SERVICE_NAME") != "risk-shield-dev":
+        pytest.skip("not the risk-shield dev twin")
+    live = config.Settings()
+    assert live.macro_brief_enabled is False
+    host = urlparse(live.ai_agent_url).hostname or ""
+    assert host.endswith(".invalid"), live.ai_agent_url

@@ -69,6 +69,15 @@ class Settings(BaseSettings):
     # Default = shared/constants.py REDIS_CHANNELS["health_update"].
     health_channel: str = "tf:risk:health"
 
+    # Macro brief (Part 3.6a plumbing; the generator is 3.6b). Off unless the
+    # environment turns it on, and prod keeps it off until ai-agent's
+    # POST /brief/macro (Phase 4.6) exists. The dev twin hard-codes false.
+    macro_brief_enabled: bool = False
+
+    # Where 3.6b calls ai-agent. The dev twin hard-codes an .invalid host
+    # (RFC 6761: it never resolves), so the twin can never reach an LLM.
+    ai_agent_url: str = "http://ai-agent:8004"
+
     # Debug mode
     debug: bool = False
 

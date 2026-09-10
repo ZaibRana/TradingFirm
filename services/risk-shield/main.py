@@ -210,6 +210,8 @@ async def health():
         **_calendar_health(),
         # Part 3.5: the market news poller.
         **_news_health(),
+        # Part 3.6a: whether this process may generate macro briefs (3.6b).
+        "macroBriefEnabled": settings.macro_brief_enabled,
     }
 
 

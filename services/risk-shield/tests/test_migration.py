@@ -77,3 +77,37 @@ def test_migration_005_text_is_rerunnable(sql):
         assert "IF NOT EXISTS" in stmt.upper(), stmt
     assert not re.search(r"^\s*INSERT\b", sql, re.MULTILINE | re.IGNORECASE)
     assert not re.search(r"^\s*(DROP|ALTER|TRUNCATE|DELETE)\b", sql, re.MULTILINE | re.IGNORECASE)
+
+
+# ── 006 (Part 3.6a, spec decision 1) ─────────────────────────────
+
+@pytest.fixture(scope="module")
+def sql_006():
+    path = os.path.join(MIGRATIONS_DIR, "006_macro_brief_output.sql")
+    if not os.path.exists(path):
+        pytest.skip(f"{path} not mounted (run inside tf-risk-shield-dev)")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_migration_006_adds_brief_and_trigger(sql_006):
+    """Two guarded ADD COLUMNs on risk.macro_briefs, brief a JSON object,
+    trigger one of exactly four values, nothing else. Repeat call: every
+    statement is IF NOT EXISTS (the live rerun is the part's round trip)."""
+    body = _statements(sql_006)
+    statements = [s.strip() for s in body.split(";") if s.strip()]
+    assert len(statements) == 2
+    for stmt in statements:
+        assert stmt.startswith("ALTER TABLE risk.macro_briefs ADD COLUMN IF NOT EXISTS"), stmt
+
+    brief, trigger = statements
+    assert re.search(r"IF NOT EXISTS brief JSONB NOT NULL\s+CHECK \(jsonb_typeof\(brief\) = 'object'\)$", brief)
+    assert re.search(r"IF NOT EXISTS trigger TEXT NOT NULL\s+CHECK \(trigger IN \(([^)]*)\)\)$", trigger)
+    values = re.search(r"trigger IN \(([^)]*)\)", trigger).group(1)
+    assert [v.strip().strip("'") for v in values.split(",")] == ["slot", "regime_change", "critical", "manual"]
+
+    # No default (a default would hide a writer that forgot the field), no
+    # seed, nothing destructive.
+    assert "DEFAULT" not in body.upper()
+    assert not re.search(r"^\s*(INSERT|DROP|TRUNCATE|DELETE|UPDATE)\b", body, re.MULTILINE | re.IGNORECASE)
+    assert not re.search(r"\bDROP\b", body, re.IGNORECASE)
