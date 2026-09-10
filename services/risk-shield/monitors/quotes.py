@@ -89,6 +89,17 @@ def _download_lock() -> asyncio.Lock:
     return _lock_state["lock"]
 
 
+def download_in_flight() -> bool:
+    """Whether a core-quotes download holds the single-flight lock in the
+    running loop. A scheduled check skips rather than queues (Part 3.4)."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    lock = _lock_state["lock"]
+    return lock is not None and _lock_state["loop"] is loop and lock.locked()
+
+
 # ── Download ─────────────────────────────────────────────────────
 
 class _LogCapture(logging.Handler):

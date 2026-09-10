@@ -1,0 +1,264 @@
+"""Part 3.4 — one health check (run_check) and the scheduler loop.
+compute_health, the pool and the clock are fakes; FakeRedis records the
+publish; db.py's real helpers run over the fake pool. The XNYS calendar is
+real (offline). No socket."""
+
+import asyncio
+import json
+import logging
+import math
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
+import asyncpg
+import pytest
+
+import scheduler
+from cache import MemoryCooldowns
+from monitors import quotes
+from scoring.regime_classifier import classify
+from tests.fake_redis import FakeRedis
+
+ET = ZoneInfo("America/New_York")
+
+
+def et(y, mo, d, h, mi, s=0):
+    return datetime(y, mo, d, h, mi, s, tzinfo=ET)
+
+
+MARKET_AT = et(2026, 9, 10, 10, 0)
+SETTLE_AT = et(2026, 9, 10, 16, 20)
+YESTERDAY_SETTLE = {"checked_at": et(2026, 9, 9, 16, 20), "score": 70, "kind": "settle"}
+
+
+class Clock:
+    def __init__(self, t):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+class LoggingRedis(FakeRedis):
+    def __init__(self, log, **kw):
+        super().__init__(**kw)
+        self.log = log
+
+    async def publish(self, channel, message):
+        result = await super().publish(channel, message)
+        self.log.append("publish")
+        return result
+
+
+class FakePool:
+    """Rows in memory. settle_base's fetchrow applies the filter the SQL
+    encodes (settle, scored, before the cutoff, latest); the SQL text itself
+    is asserted in test_db.py."""
+
+    def __init__(self, log, rows=(), *, fail_insert=None, fail_read=None):
+        self.log, self.rows = log, [dict(r) for r in rows]
+        self.fail_insert, self.fail_read = fail_insert, fail_read
+        self.inserts, self.reads = [], []
+
+    async def fetchrow(self, sql, *args):
+        self.reads.append((sql, args))
+        if self.fail_read:
+            raise self.fail_read
+        (before,) = args
+        matches = [r for r in self.rows
+                   if r["kind"] == "settle" and r["score"] is not None and r["checked_at"] < before]
+        if not matches:
+            return None
+        best = max(matches, key=lambda r: r["checked_at"])
+        return {"checked_at": best["checked_at"], "score": best["score"]}
+
+    async def execute(self, sql, *args):
+        if self.fail_insert:
+            raise self.fail_insert
+        self.inserts.append(args)
+        self.log.append("insert")
+        checked_at, score, _regime, _trend, indicators = args
+        self.rows.append({"checked_at": checked_at, "score": score, "kind": json.loads(indicators)["kind"]})
+
+
+def snapshot(score, at, *, nan=False):
+    return {
+        "score": score,
+        "regime": classify(score),
+        "coverage": 100 if score is not None else 40,
+        "stale": False,
+        "staleMonitors": [],
+        "checkedAt": at.astimezone(timezone.utc).isoformat(),
+        "monitors": {"vix": {"score": score, "raw": {"level": math.nan if nan else 18.0},
+                             "detail": "", "stale": False, "weight": 25}},
+        "inputs": {"asOf": at.isoformat(), "source": "cached", "reason": None, "staleTickers": []},
+    }
+
+
+def patch_compute(monkeypatch, log, score, *, nan=False):
+    calls = []
+
+    async def fake(r, memory, *, now):
+        calls.append({"r": r, "memory": memory, "now": now()})
+        log.append("compute")
+        return snapshot(score, now(), nan=nan)
+
+    monkeypatch.setattr(scheduler, "compute_health", fake)
+    return calls
+
+
+def make_state(log, *, redis="fake", pool="fake", rows=(), **pool_kw):
+    return SimpleNamespace(
+        redis=LoggingRedis(log) if redis == "fake" else redis,
+        db_pool=FakePool(log, rows, **pool_kw) if pool == "fake" else pool,
+        cooldowns=MemoryCooldowns(),
+        check_status={"lastCheckAt": None, "lastKind": None, "lastScore": None, "lastError": None},
+    )
+
+
+# ── run_check ────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_run_check_order_compute_publish_insert(monkeypatch):
+    log = []
+    state = make_state(log, rows=[YESTERDAY_SETTLE])
+    calls = patch_compute(monkeypatch, log, 72)
+
+    result = await scheduler.run_check(state, "market", clock=Clock(MARKET_AT))
+
+    assert log == ["compute", "publish", "insert"]
+    assert calls[0]["r"] is state.redis and calls[0]["memory"] is state.cooldowns
+    assert state.db_pool.reads[0][1] == (et(2026, 9, 10, 9, 30),)     # today's open
+    checked_at, score, regime, trend, indicators = state.db_pool.inserts[0]
+    assert checked_at == MARKET_AT
+    assert (score, regime, trend) == (72, "HEALTHY", "stable")
+    body = json.loads(indicators)
+    assert body["kind"] == "market"
+    assert (body["settleScore"], body["settleCheckedAt"]) == (70, et(2026, 9, 9, 16, 20).isoformat())
+    assert state.check_status == {"lastCheckAt": MARKET_AT.astimezone(timezone.utc).isoformat(),
+                                  "lastKind": "market", "lastScore": 72, "lastError": None}
+    assert result["published"] == {"published": True, "reason": "initial"}
+
+
+@pytest.mark.asyncio
+async def test_run_check_without_db_still_publishes(monkeypatch, caplog):
+    log = []
+    state = make_state(log, pool=None)
+    patch_compute(monkeypatch, log, 72)
+    with caplog.at_level(logging.WARNING):
+        result = await scheduler.run_check(state, "market", clock=Clock(MARKET_AT))
+    assert log == ["compute", "publish"]
+    assert result["settle"] is None and result["trend"] is None
+    assert any("database unavailable" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", [asyncpg.InterfaceError("connection lost"), TimeoutError("command timeout")])
+async def test_run_check_insert_failure_is_logged_not_raised(monkeypatch, caplog, exc):
+    log = []
+    state = make_state(log, rows=[YESTERDAY_SETTLE], fail_insert=exc)
+    patch_compute(monkeypatch, log, 72)
+    with caplog.at_level(logging.WARNING):
+        result = await scheduler.run_check(state, "market", clock=Clock(MARKET_AT))
+    assert log == ["compute", "publish"]
+    assert result["published"]["published"] is True
+    assert state.db_pool.inserts == []
+    assert [r.levelno for r in caplog.records if "insert failed" in r.getMessage()] == [logging.WARNING]
+    assert state.check_status["lastError"] == f"insert: {type(exc).__name__}"
+
+
+@pytest.mark.asyncio
+async def test_run_check_trend_read_failure_trend_null(monkeypatch, caplog):
+    log = []
+    state = make_state(log, rows=[YESTERDAY_SETTLE], fail_read=asyncpg.InterfaceError("down"))
+    patch_compute(monkeypatch, log, 72)
+    with caplog.at_level(logging.WARNING):
+        result = await scheduler.run_check(state, "market", clock=Clock(MARKET_AT))
+    assert log == ["compute", "publish", "insert"]
+    assert result["trend"] is None
+    _, _, _, trend, indicators = state.db_pool.inserts[0]
+    assert trend is None and json.loads(indicators)["settleScore"] is None
+    assert any("settle base read failed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_trend_against_previous_session_settle(monkeypatch):
+    for score, base, expected in [(75, 70, "improving"), (74, 70, "stable"), (66, 70, "stable"),
+                                  (65, 70, "declining"), (70, None, None), (None, 70, None)]:
+        assert scheduler.trend_from(score, base) == expected
+
+    # The 16:20 settle check compares against yesterday's settle: its cutoff
+    # is today's open, so neither its own row nor today's earlier rows count.
+    log = []
+    state = make_state(log, rows=[
+        {"checked_at": et(2026, 9, 8, 16, 20), "score": 50, "kind": "settle"},
+        {"checked_at": et(2026, 9, 9, 16, 20), "score": 60, "kind": "settle"},
+        {"checked_at": et(2026, 9, 10, 10, 0), "score": 80, "kind": "market"},
+    ])
+    patch_compute(monkeypatch, log, 72)
+    first = await scheduler.run_check(state, "settle", clock=Clock(SETTLE_AT))
+    assert state.db_pool.reads[-1][1] == (et(2026, 9, 10, 9, 30),)
+    assert (first["settle"]["score"], first["trend"]) == (60, "improving")
+    # Today's settle row now exists; a second settle check still reads yesterday's.
+    assert state.db_pool.rows[-1] == {"checked_at": SETTLE_AT, "score": 72, "kind": "settle"}
+    again = await scheduler.run_check(state, "settle", clock=Clock(SETTLE_AT + timedelta(minutes=1)))
+    assert again["settle"] == {"score": 60, "checkedAt": et(2026, 9, 9, 16, 20)}
+
+    # Yesterday's settle had a null score → the latest scored settle before today's open.
+    state = make_state([], rows=[
+        {"checked_at": et(2026, 9, 8, 16, 20), "score": 58, "kind": "settle"},
+        {"checked_at": et(2026, 9, 9, 16, 20), "score": None, "kind": "settle"},
+    ])
+    patch_compute(monkeypatch, [], 60)
+    result = await scheduler.run_check(state, "market", clock=Clock(MARKET_AT))
+    assert result["settle"] == {"score": 58, "checkedAt": et(2026, 9, 8, 16, 20)}
+    assert result["trend"] == "stable"
+    assert json.loads(state.db_pool.inserts[0][4])["settleCheckedAt"] == et(2026, 9, 8, 16, 20).isoformat()
+
+    # No scored settle at all → trend null.
+    state = make_state([], rows=[{"checked_at": et(2026, 9, 9, 10, 0), "score": 65, "kind": "market"}])
+    result = await scheduler.run_check(state, "market", clock=Clock(MARKET_AT))
+    assert result["settle"] is None and result["trend"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_check_null_score_recorded_not_published(monkeypatch):
+    log = []
+    state = make_state(log, rows=[YESTERDAY_SETTLE])
+    patch_compute(monkeypatch, log, None)
+    await scheduler.run_check(state, "market", clock=Clock(MARKET_AT))
+    assert log == ["compute", "insert"]
+    assert state.redis.published == []
+    _, score, regime, trend, _ = state.db_pool.inserts[0]
+    assert (score, regime, trend) == (None, None, None)
+    assert state.check_status["lastScore"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_check_nan_indicators_no_row(monkeypatch, caplog):
+    log = []
+    state = make_state(log)
+    patch_compute(monkeypatch, log, 72, nan=True)
+    with caplog.at_level(logging.ERROR):
+        result = await scheduler.run_check(state, "market", clock=Clock(MARKET_AT))
+    assert log == ["compute", "publish"]              # the payload carries scores only
+    assert result["published"]["published"] is True
+    assert state.db_pool.inserts == []
+    assert any(r.levelno == logging.ERROR and "insert raised ValueError" in r.getMessage()
+               for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_run_check_skips_when_quotes_lock_held(monkeypatch, caplog):
+    log = []
+    state = make_state(log)
+    calls = patch_compute(monkeypatch, log, 72)
+    assert quotes.download_in_flight() is False
+    async with quotes._download_lock():
+        assert quotes.download_in_flight() is True
+        with caplog.at_level(logging.WARNING):
+            assert await scheduler.run_check(state, "market", clock=Clock(MARKET_AT)) is None
+    assert quotes.download_in_flight() is False
+    assert calls == [] and log == []
+    assert any("skipped" in r.getMessage() for r in caplog.records)
