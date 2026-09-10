@@ -526,3 +526,30 @@ The shared ×1.3–1.8 put 3.5's code above its band (1,119 vs ~770–1,060) and
 **Why:** the scheduler has no catch-up. A missed settle breaks the next day's trend, which 3.6 and Phase 6 read.
 
 **Supersedes:** N/A (it adds timing to G15's "only on explicit go").
+
+---
+
+## 2026-09-10 — Part 3.6 splits into 3.6a / 3.6b; ops alerting is Phase 6's first item
+
+**Decision:**
+- **3.6a (inputs):**
+  - migration 006 (`risk.macro_briefs.brief` JSONB, `trigger` with a CHECK)
+  - the FRED items carried from 3.3 (last-known, cooldown as stale, per-series cadence)
+  - data-engine `GET /news/market`
+  - the inputs document with freshness flags, and `GET /macro/brief/inputs`
+  - `MACRO_BRIEF_ENABLED` plumbing
+  - Spec `docs/specs/3.6a.md`.
+- **3.6b (brief):**
+  - the ai-agent client (mocked in tests)
+  - the 07:30 / 12:30 / 16:30 ET weekday slots
+  - the regime-change hook from `run_check`'s publish reason, with its debounce
+  - storage and `GET /macro/brief`
+  - The prod flag stays off until 4.6 exists.
+- **Deferred to Phase 6, first in order (item 6.0): ops alerting.**
+  - Every feed-stopping condition goes into the `tf:risk:health` payload and `/market/health` as `errors: [{source, since, message}]`.
+  - Telegram subscribers forward each new entry once, and the dashboard shows them as a status strip.
+  - Recorded here only; the plan file stays read-only.
+
+**Why:** plan row 3.6 came to ~650 lines of code before overruns. The inputs half is deployable and checkable in prod with no LLM, so 3.6b can be code-only.
+
+**Supersedes:** plan row 3.6 as a single part. For ops alerting, it refines the Part 3.5 entry's deferral (addition 9) by fixing its place in Phase 6.
