@@ -494,3 +494,35 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 **Why:** Part 3.5's addition 8 landed after the bands were set, and 4c's band (208–288) was never re-cut. 4c measured 529 and was split into 4c-1 / 4c-2 at commit time.
 
 **Supersedes:** N/A.
+
+---
+
+## 2026-09-10 — Separate estimate bands for code and tests (from Part 3.6)
+
+**Decision:**
+- A spec estimates code and tests separately on the fresh count: **code ×1.3–1.9, tests ×1.05–1.5.**
+- Live scripts (`*_live.py`) count as code. Data (fixtures, JSON) stays outside both bands and the 600-line split threshold.
+- Per-commit bands are cut the same way, and an addition after approval re-cuts both (entry above).
+
+**Why:** actual ÷ fresh over the last three parts:
+- code: 1.28× (3.3), 1.80× (3.4), 1.90× (3.5, live script included)
+- tests: 1.05×, 1.50×, 1.27×
+
+The shared ×1.3–1.8 put 3.5's code above its band (1,119 vs ~770–1,060) and its tests below (1,509 vs ~1,550–2,140).
+
+**Supersedes:** the single ×1.3–1.8 band used in `docs/specs/3.5.md` decision 12.
+
+---
+
+## 2026-09-10 — G15 timing for prod rebuilds (from Part 3.6)
+
+**Decision:**
+- Prod `risk-shield` rebuilds happen outside XNYS hours: after the 16:20 ET settle check is recorded, or before 09:30 ET. Weekends and XNYS holidays are always fine.
+- A during-hours rebuild is allowed only if the report names the slot(s) skipped and confirms the settle row was not one of them.
+- `data-engine` rebuilds avoid the premarket scan window.
+- **3.5 waived it**, because nothing reads the settle yet. Both rebuilds ran during the session (14:57–14:58 ET). The rebuild window held no slot boundary and no settle. The old image missed 18:45 and 18:55 UTC before the rebuild; the cause is unknown, since its logs went with the recreate.
+- The rule is added to `CLAUDE.md`'s G15 rules in Part 3.6's docs commit.
+
+**Why:** the scheduler has no catch-up. A missed settle breaks the next day's trend, which 3.6 and Phase 6 read.
+
+**Supersedes:** N/A (it adds timing to G15's "only on explicit go").
