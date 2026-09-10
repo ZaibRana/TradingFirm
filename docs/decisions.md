@@ -416,3 +416,39 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 **Why:** the plan row names six monitors and four regime bands. Every bullet is a place where a plausible default would quietly mis-score a regime: pairing by index, a stale error, A/D read as 0, a missing monitor averaged in as 0, float rounding at 69.5.
 
 **Supersedes:** N/A.
+
+---
+
+## 2026-09-10 — Regime scheduler + endpoints (Part 3.4)
+
+**Decision:** approved spec `docs/specs/3.4.md` (v2). What later parts build on:
+
+- **Night mode moves to a new Part 3.4b.**
+  - 3.4 schedules only XNYS slots: every 5 min from open to close inclusive, plus a 16:20 ET settle check (`exchange_calendars` 4.13.2).
+  - No 3.3 monitor reads futures, so a night check would repeat the last score.
+  - How yfinance dates an evening `ES=F` bar is unverified. 3.4b opens with that live check.
+- **The scheduler runs in prod only.**
+  - `SCHEDULER_ENABLED` defaults to false, and the dev twin hard-codes false.
+  - `--workers 1` is pinned in both Dockerfile stages, because uvicorn's default reads `$WEB_CONCURRENCY` and two workers would be two schedulers.
+- **Redis pub/sub ignores the DB index.** Redis DB 1 does not isolate the twin's channel, so it publishes on `tf:risk:dev:health`. `test_twin_never_publishes_on_prod_channel` guards the compose override.
+- **Throttle:**
+  - A publish needs a regime change or a ≥ 10-point move since the last publish, at most one per 15 min.
+  - CRITICAL bypasses the interval when entering it or on a ≥ 10 move inside it. Leaving CRITICAL is held like any other change.
+  - A held change is delayed, never lost.
+  - Delivery is at-least-once. Subscribers read `GET /market/health` on start, because pub/sub drops messages while they are down.
+- **A check runs compute → trend base → publish → insert, each step isolated.** A Postgres failure never delays a publish. Null-score checks become rows and are never published.
+- **Endpoints read Postgres only.**
+  - No rows → 404 `no health checks yet`.
+  - `settleScore` (the trend base) and the payload's `previousScore` (the last publish) are distinct on purpose.
+  - `POST /market/check` is deferred.
+- **Provisional numbers:**
+  - trend ±5 against the latest scored settle before the check's session open
+  - 60 s grace for a late slot, never caught up
+  - settle at 16:20 ET, early closes included, so 3.3's 16:15 partial rule stands
+- **Accepted:** 17 extra yfinance requests per prod recreate. There is no volume for the tz cache.
+- **Test correction during commit 2:** the channel tests had read the twin's env, and now pin it. A test that proves a default must not depend on its container.
+- **Commit split:** commit 3a came to 610 lines and was split before push (`5647ca2` / `b5324a7`).
+
+**Why:** the plan row names a cadence, a channel and three endpoints. Each bullet is a place where a plausible default would quietly misbehave: a night check that repeats itself, Redis DB 1 assumed to isolate pub/sub, a symmetric CRITICAL bypass, one `previousScore` meaning two things, an unpinned worker count.
+
+**Supersedes:** plan row 3.4's "every 30 min otherwise using futures (`ES=F NQ=F`) + VIX", which moves to Part 3.4b.

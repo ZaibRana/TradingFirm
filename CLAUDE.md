@@ -6,7 +6,7 @@ Guidance for Claude Code working in this repository.
 
 TradingFirm — a day-trading system that screens the market, applies technical filters, and surfaces trade candidates. FastAPI microservices + a Next.js dashboard, with Postgres and Redis as shared infrastructure.
 
-**Service status** (don't assume otherwise): `data-engine` and the web dashboard are functional. `risk-shield` is a skeleton (Part 3.1: config, pool, cache, bounded lifespan, `risk.macro_briefs`; Part 3.2: core-quotes and FRED fetchers in `monitors/`; Part 3.3: six regime monitors, `scoring/` health score + regime, not called by any endpoint or scheduler yet) — only `/health` and `/` exist. `signal-engine` and `ai-agent` are empty FastAPI scaffolds.
+**Service status** (don't assume otherwise): `data-engine` and the web dashboard are functional. `risk-shield` has its regime path (Part 3.1: config, pool, cache, bounded lifespan, `risk.macro_briefs`; Part 3.2: core-quotes and FRED fetchers in `monitors/`; Part 3.3: six regime monitors, `scoring/` health score + regime; Part 3.4: an XNYS-gated scheduler writing `risk.health_checks` and publishing `tf:risk:health`, plus `GET /market/health`, `/market/indicators`, `/market/history`). Night mode (3.4b), market news, the econ calendar and the macro brief do not exist yet. `signal-engine` and `ai-agent` are empty FastAPI scaffolds.
 
 ## Read `.agents/AGENTS.md` first
 
@@ -45,7 +45,7 @@ uvicorn main:app --reload --port 8001
 **risk-shield: 8003 is prod** (`tf-risk-shield`, real `FRED_API_KEY`); **8013 is its dev twin** (`tf-risk-shield-dev`, empty FRED key, `tradingfirm_dev`, Redis DB 1). Tests run there:
 ```bash
 docker compose --profile dev up -d --build risk-shield-dev
-docker exec tf-risk-shield-dev pytest tests/test_config.py tests/test_cache.py tests/test_db.py tests/test_lifespan.py tests/test_health.py tests/test_migration.py tests/test_ratelimit.py tests/test_fred_client.py tests/test_monitors_data.py tests/test_live_guard.py tests/test_monitors.py tests/test_scoring.py -v
+docker exec tf-risk-shield-dev pytest tests/test_config.py tests/test_cache.py tests/test_db.py tests/test_lifespan.py tests/test_health.py tests/test_migration.py tests/test_ratelimit.py tests/test_fred_client.py tests/test_monitors_data.py tests/test_live_guard.py tests/test_monitors.py tests/test_scoring.py tests/test_scheduler_gating.py tests/test_alert_throttle.py tests/test_scheduler.py tests/test_market_endpoints.py -v
 ```
 
 Tests run inside `tf-data-engine-dev` (host pandas ≠ pinned version). It is a separate container from prod `tf-data-engine`, so prod keeps running: fixture provider, its own database `tradingfirm_dev`, Redis DB 1, pytest baked in via the Dockerfile `dev` stage. Rebuild with `--build` after changing `requirements*.txt`:
@@ -94,5 +94,9 @@ Requires `.env` with `DB_PASSWORD` set — compose fails fast without it.
 - **Alpha Vantage takes its key as a query parameter** (`apikey=`; no header form exists), one of two approved exceptions to "secrets never in URLs" (spec 2.3 decision 13; FRED is the other, below). Two conditions hold it in place, both in `providers/context/alphavantage_client.py`: the `httpx` logger is pinned to WARNING there (at INFO it logs the full URL), and typed errors never chain or format the httpx exception (`raise ... from None`; `HTTPStatusError.__str__` carries the URL). Never log `resp.url`. Free tier: 5 req/min, 25/day, and the daily cap arrives as HTTP 200 with an `Information` body, not a 429.
 - **FRED takes its key as a query parameter too** (`api_key=`; no header form exists), the second approved exception (spec 3.2 decision 7), on the same two conditions, both in `services/risk-shield/monitors/fred_client.py`: `httpx` logger pinned to WARNING, typed errors raised `from None` with a series id + status message only (the body's `error_message` is inspected for `api_key`, never echoed). Limit 120 req/min, then 429; a 423 or ignored 429s mean blocked. Both stop the snapshot walk and start the cooldown.
 - **yfinance 1.5.1 `download` never raises on a rate limit**: it catches `YFRateLimitError` per ticker and only logs it, so risk-shield's `monitors/quotes.py` watches the `yfinance` logger behind an exact version guard. A cold container also makes 2 requests per ticker (a timezone fetch first). Bumping the yfinance pin means re-checking both.
+- **risk-shield's scheduler downloads live on a cadence** (Part 3.4). It runs only where `SCHEDULER_ENABLED=true` (the prod compose service).
+  - The dev twin hard-codes `SCHEDULER_ENABLED=false`, because it has no quotes fixture.
+  - The twin also hard-codes `HEALTH_CHANNEL=tf:risk:dev:health`, because Redis pub/sub ignores the DB index. `test_twin_never_publishes_on_prod_channel` guards it.
+  - Never drop either override. Keep `--workers 1` pinned in the Dockerfile: two workers are two schedulers.
 - **SEC EDGAR needs a declared `User-Agent`** (`EDGAR_USER_AGENT="<app> <email>"`, header only, never a URL or a fixture); one process-wide limiter of 10 req/s (the SEC cap), and a 403 means blocked: stop, never retry.
 - **Never write into another service's Postgres schema** (`data_engine`, `signals`, `risk`, `users`, `ai`). Cross-service communication is HTTP + Redis pub/sub only.

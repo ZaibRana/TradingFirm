@@ -43,7 +43,7 @@ pub/sub, never by writing into another service's tables.
 |---|---|---|---|
 | `data-engine` | 8001 | **Functional** | Finviz screening → yfinance OHLCV → technical filters → enrichment. The only backend service with real logic. |
 | `signal-engine` | 8002 | Empty scaffold | Intended for entry/exit signal detection (zones, patterns). Only `/health` and `/` exist. |
-| `risk-shield` | 8003 | **Skeleton** | Market health scoring and regime detection (Phase 3). Part 3.1 gave it `config.py` / `db.py` / `cache.py`, a bounded fail-open lifespan and the `risk.macro_briefs` table; Part 3.2 added the two data fetchers (`monitors/quotes.py`, `monitors/fred.py`); Part 3.3 added the six regime monitors, the health score and the regime classifier (`scoring/`). Nothing calls them yet. The endpoints are still `/health` (reporting `db_connected` / `redis_connected` / `fredConfigured`) and `/`. The scheduler and `/market/*` land in 3.4. |
+| `risk-shield` | 8003 | **Partial** | Market health scoring and regime detection (Phase 3). Part 3.1 gave it `config.py` / `db.py` / `cache.py`, a bounded fail-open lifespan and the `risk.macro_briefs` table; Part 3.2 added the two data fetchers (`monitors/quotes.py`, `monitors/fred.py`); Part 3.3 added the six regime monitors, the health score and the regime classifier (`scoring/`). Part 3.4 added the scheduler that runs them in market hours (prod only, `SCHEDULER_ENABLED`), writes `risk.health_checks` and publishes `tf:risk:health`, and `GET /market/health`, `/market/indicators`, `/market/history` beside `/health` and `/`. Night mode (3.4b), market news, the econ calendar and the macro brief are not built. |
 | `ai-agent` | 8004 | Empty scaffold | Intended for trade grading via an LLM (`LLM_PROVIDER` env var supports Gemini/Anthropic). Only `/health` and `/` exist. |
 | `web` (dashboard) | 3000 | **Functional** | Next.js UI showing scan results, stock cards, market status. |
 
@@ -262,9 +262,9 @@ FastAPI app. Key pieces:
 ## Risk Shield service
 
 [`services/risk-shield`](../services/risk-shield) holds the Phase 3 regime
-inputs (Part 3.2, spec `docs/specs/3.2.md`) and the health score built on
-them (Part 3.3, spec `docs/specs/3.3.md`). All of it is library modules
-with no endpoint or scheduler yet (3.4 adds both):
+inputs (Part 3.2, spec `docs/specs/3.2.md`), the health score built on
+them (Part 3.3, spec `docs/specs/3.3.md`), and the scheduler and read
+endpoints that run and serve it (Part 3.4, spec `docs/specs/3.4.md`):
 
 - **`monitors/quotes.py`** — `get_core_quotes(r, memory)`: one yfinance
   1.5.1 `download` of the 17 core tickers (`SPY QQQ RSP ^VIX TLT GLD UUP
@@ -325,6 +325,39 @@ with no endpoint or scheduler yet (3.4 adds both):
   - `regime_classifier.classify()` maps the score to HEALTHY ≥ 70 /
     CAUTIOUS ≥ 40 / DANGER ≥ 20 / CRITICAL.
   - The thresholds Part 5 doesn't give are provisional (`docs/decisions.md`).
+- **`scheduler.py`** (3.4) is one asyncio task, started by the lifespan only
+  when `SCHEDULER_ENABLED=true` (the prod compose service). The Dockerfile
+  pins `uvicorn --workers 1`, so there is exactly one.
+  - **When:** XNYS sessions from `exchange_calendars` 4.13.2, holidays and
+    early closes included. Every 5 min from open to close inclusive (79
+    slots, 43 on an early close), plus a 16:20 ET settle check. A slot more
+    than 60 s late is skipped with a "missed N" WARNING, never caught up.
+    There are no night checks (Part 3.4b).
+  - **A check:** `compute_health` → trend base → publish → insert, each step
+    isolated, so a Postgres failure never delays a publish. Trend is ±5
+    against the latest scored settle before the check's session open. A
+    check skips while the quotes download lock is held.
+- **`scoring/alert_manager.py`** (3.4) publishes on `settings.health_channel`.
+  - **Channel:** `tf:risk:health`; the dev twin uses `tf:risk:dev:health`,
+    because Redis pub/sub ignores the DB index.
+  - **When:** the regime changed, or the score moved ≥ 10 since the last
+    publish, at most once per 15 min. Entering CRITICAL skips the interval.
+  - **State:** `tf:risk:state:health_published` (7 d), written after the
+    publish, so delivery is at-least-once.
+- **`risk.health_checks`** (table from 001) gets one row per check, null
+  scores included. `kind`, the monitors, the inputs and the settle base live
+  in the `indicators` JSONB.
+- **Endpoints** (3.4) read Postgres only and never download:
+  - `GET /market/health` returns the latest check with `trend`,
+    `settleScore`, Part 5's message and `ageSeconds`, plus `lastScored` when
+    that check has no score. Before the first check it answers 404
+    `no health checks yet`.
+  - `GET /market/indicators` returns the latest check's six monitors with
+    weights.
+  - `GET /market/history?days=1..90` (default 30) returns rows ascending,
+    null scores kept.
+  - A missing pool or a database failure is a 503. `/health` also reports
+    `schedulerEnabled` and `lastCheckAt`.
 
 ## Web dashboard
 
@@ -364,7 +397,9 @@ Google-sign-in scaffolding under `web/lib/firebase/` has been removed.
 - **`tf-risk-shield-dev` (port 8013)** is the same arrangement for
   risk-shield (Part 3.1): profile `dev`, the Dockerfile's `dev` stage,
   source volume-mounted, `tradingfirm_dev` + Redis DB 1, `FRED_API_KEY`
-  hard-coded empty, and `infra/supabase/migrations` mounted read-only at
+  hard-coded empty, `SCHEDULER_ENABLED=false` and
+  `HEALTH_CHANNEL=tf:risk:dev:health` hard-coded (Part 3.4), and
+  `infra/supabase/migrations` mounted read-only at
   `/migrations` for the tests that assert migration text. Phase 3 tests run
   there:
   `docker exec tf-risk-shield-dev pytest tests/test_config.py ... -v`.
@@ -383,8 +418,10 @@ downstream of that — actually generating trade signals (`signal-engine`)
 and grading trades with AI (`ai-agent`) — is still an empty FastAPI
 scaffold with no business logic. `risk-shield` has its infrastructure
 (config, pool, cache, migration, dev twin) as of Part 3.1 and its two
-data fetchers (core quotes, FRED) as of Part 3.2, and its health score
-and regime as of Part 3.3, but no endpoint or scheduler yet. The `scanner/`
+data fetchers (core quotes, FRED) as of Part 3.2, its health score and
+regime as of Part 3.3, and a market-hours scheduler plus the `/market/*`
+read endpoints as of Part 3.4. The scheduler is enabled in prod compose,
+and the prod rebuild that starts it waits for a go (`docs/progress.md`). The `scanner/`
 standalone scripts predate the data-engine port and stay only as a frozen
 reference — see [`.agents/AGENTS.md`](../.agents/AGENTS.md) for the full
 rationale.
