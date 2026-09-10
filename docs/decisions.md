@@ -368,3 +368,17 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 - **G15:** `docker compose up -d --build risk-shield` puts the 3.2 pins in the prod image. Nothing in prod calls the new modules until then.
 
 **Supersedes:** N/A.
+
+---
+
+## 2026-09-10 — Commit sizes are checked before the first push; estimate overruns are reported
+
+**Decision:**
+
+- **Before a part's first push**, run `git show --numstat` on every unpushed commit. A commit over the 600-line split threshold (code + tests, spec 3.1 decision 12) is split locally before anything is pushed: `git reset --soft <part base>` and re-commit in smaller staged sets, because interactive rebase isn't available in the tool. If a split isn't sensible, stop and ask before pushing.
+- **When code or tests come in more than ~50% over the spec's estimate**, the completion report says so as its own line item, with both numbers.
+- **The append-only scope of this file:** an entry written during the current part may be edited in place until that part closes. Entries from earlier parts stay append-only.
+
+**Why:** Part 3.2's commit 2 (`5a5b307`) carried 980 lines of code + tests, well over the threshold. That surfaced only in the report after the commit was on `origin/main`, where it stays. A split is free locally and impossible after a push. The part came in at 841 code / 1,049 tests against an estimate of 520 / 700, and the estimate is what the split plan is approved against.
+
+**Supersedes:** the 2026-09-04 "Do not edit or delete past entries" line, for entries from the current part only.
