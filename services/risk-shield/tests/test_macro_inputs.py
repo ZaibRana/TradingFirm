@@ -540,3 +540,202 @@ async def test_inputs_repeat_call_is_read_only(monkeypatch):
     assert {sql for sql, _ in pool.calls} <= {db.LATEST_HEALTH_CHECK_SQL, db.SETTLE_BASE_SQL,
                                               db.LATEST_SCORED_HEALTH_CHECK_SQL}
     json.dumps(first, allow_nan=False)
+
+
+# ── GET /macro/brief/inputs and the lifespan (commit 4d) ─────────
+
+from fastapi.testclient import TestClient
+
+import cache
+import main
+from monitors.errors import FredNotConfigured
+from monitors.fred_client import FredClient
+
+ENDPOINT_NOW = et(2026, 9, 10, 14, 7)
+
+
+class SlowFred(FakeFred):
+    async def observations(self, sid):
+        await asyncio.sleep(0.01)          # lets a second request reach the lock mid-walk
+        return await super().observations(sid)
+
+
+@pytest.fixture
+def app_inputs(monkeypatch):
+    """app.state stubbed without the lifespan, as test_health.py does."""
+    clock = [1000.0]
+    monkeypatch.setattr(main, "_now", lambda: ENDPOINT_NOW)
+    monkeypatch.setattr(main, "_monotonic", lambda: clock[0])
+    monkeypatch.setattr(news_poller.settings, "news_poll_enabled", False)
+    http_calls = []
+
+    def _set(*, pool=None, redis=None, fred_client=None, handler=None):
+        st = main.app.state
+        st.db_pool, st.redis = pool, redis
+        st.cooldowns = MemoryCooldowns()
+        st.news_status = news_poller.initial_news_status()
+        st.fred_client = fred_client or FakeFred()
+        st.inputs_http = _http(_answer(json_body=[_item(30)], seen=http_calls) if handler is None else handler)
+        st.inputs_lock, st.inputs_last = None, None
+        return st
+
+    yield SimpleNamespace(set=_set, clock=clock, http_calls=http_calls)
+    st = main.app.state
+    st.db_pool = st.redis = st.inputs_last = st.inputs_lock = None
+
+
+def _healthy_pool():
+    return HealthPool(latest=_row(et(2026, 9, 10, 14, 5, 2)),
+                      settle={"checked_at": et(2026, 9, 9, 16, 20, 2), "score": 63})
+
+
+def test_macro_inputs_endpoint_returns_document(app_inputs):
+    app_inputs.set(pool=_healthy_pool(), redis=FakeRedis())
+    client = TestClient(main.app)
+    resp = client.get("/macro/brief/inputs")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert list(body) == ["schemaVersion", "assembledAt", "ready", "health", "settle", "news",
+                          "calendar", "fred", "freshness", "cached"]
+    assert body["cached"] is False
+    assert body["assembledAt"] == ENDPOINT_NOW.isoformat()
+    assert (body["ready"], body["health"]["status"], body["settle"]["present"], body["news"]["status"],
+            body["calendar"]["status"]) == (True, "ok", True, "ok", "ok")
+    assert "cached" not in main.app.state.inputs_last[1]
+    assert "GET  /macro/brief/inputs" in client.get("/").json()["endpoints"]
+
+
+def test_macro_inputs_endpoint_all_dependencies_down(app_inputs):
+    """The twin's shape with nothing reachable: still 200, every section says why."""
+    app_inputs.set(pool=None, redis=None,
+                   fred_client=FakeFred(raises={"VIXCLS": FredNotConfigured("VIXCLS: FRED_API_KEY is not set")}),
+                   handler=_raise(httpx.ConnectError("refused")))
+    resp = TestClient(main.app).get("/macro/brief/inputs")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ready"] is False
+    assert body["health"]["status"] == "unavailable" and body["settle"]["present"] is False
+    assert (body["news"]["status"], body["news"]["cause"]) == ("unavailable", "ConnectError")
+    assert body["calendar"]["status"] == "ok"
+    assert {e["staleReason"] for e in body["fred"].values()} == {"no_data"}
+    assert body["freshness"]["fredStaleSeries"] == list(fred.FRED_SERIES)
+    assert body["freshness"]["anyStale"] is True and body["freshness"]["newsPollStale"] is None
+
+
+@pytest.mark.asyncio
+async def test_macro_inputs_concurrent_calls_share_one_fred_walk(app_inputs):
+    client = SlowFred()
+    app_inputs.set(pool=_healthy_pool(), redis=FakeRedis(), fred_client=client)
+    first, second = await asyncio.gather(main.macro_brief_inputs(), main.macro_brief_inputs())
+    assert len(client.calls) == 8                  # one walk, not two
+    assert sorted([first["cached"], second["cached"]]) == [False, True]
+    strip = lambda d: {k: v for k, v in d.items() if k != "cached"}
+    assert strip(first) == strip(second)
+
+
+@pytest.mark.asyncio
+async def test_macro_inputs_endpoint_reuses_document_within_60s(app_inputs, monkeypatch):
+    pool = _healthy_pool()
+    client = FakeFred()
+    app_inputs.set(pool=pool, redis=FakeRedis(), fred_client=client)
+    assembled = []
+    real = macro_inputs.assemble_inputs
+
+    async def spy(*a, **k):
+        doc = await real(*a, **k)
+        assembled.append(doc)
+        return doc
+    monkeypatch.setattr(macro_inputs, "assemble_inputs", spy)
+
+    first = await main.macro_brief_inputs()
+    reads, requests = len(pool.calls), len(app_inputs.http_calls)
+    app_inputs.clock[0] += 59
+    again = await main.macro_brief_inputs()
+    assert (first["cached"], again["cached"]) == (False, True)
+    assert {k: v for k, v in again.items() if k != "cached"} == {k: v for k, v in first.items() if k != "cached"}
+    assert (len(pool.calls), len(app_inputs.http_calls), len(assembled)) == (reads, requests, 1)
+
+    app_inputs.clock[0] += 2                        # 61 s after the assembly
+    fresh = await main.macro_brief_inputs()
+    assert fresh["cached"] is False
+    assert len(assembled) == 2 and len(pool.calls) > reads
+    assert all("cached" not in doc for doc in assembled)
+
+
+def test_macro_inputs_failed_assembly_is_not_reused(app_inputs, monkeypatch):
+    app_inputs.set(pool=_healthy_pool(), redis=FakeRedis())
+    real = macro_inputs.assemble_inputs
+    calls = []
+
+    async def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("bug in assembly")
+        return await real(*a, **k)
+    monkeypatch.setattr(macro_inputs, "assemble_inputs", flaky)
+
+    client = TestClient(main.app, raise_server_exceptions=False)
+    assert client.get("/macro/brief/inputs").status_code == 500
+    assert main.app.state.inputs_last is None
+    app_inputs.clock[0] += 5
+    resp = client.get("/macro/brief/inputs")
+    assert resp.status_code == 200 and resp.json()["cached"] is False
+    assert len(calls) == 2
+
+
+def test_macro_inputs_endpoint_ignores_brief_flag(app_inputs, monkeypatch):
+    bodies = []
+    for flag in (False, True):
+        monkeypatch.setattr(main.settings, "macro_brief_enabled", flag)
+        app_inputs.set(pool=_healthy_pool(), redis=FakeRedis())
+        resp = TestClient(main.app).get("/macro/brief/inputs")
+        assert resp.status_code == 200
+        bodies.append(resp.json())
+    assert bodies[0] == bodies[1]
+
+
+def test_lifespan_closes_inputs_clients(monkeypatch):
+    events = []
+
+    class Pool:
+        async def close(self):
+            events.append("db closed")
+
+    class Redis:
+        async def close(self):
+            events.append("redis closed")
+
+    async def ok_redis(*a, **k):
+        return Redis()
+
+    async def ok_pool(*a, **k):
+        return Pool()
+
+    monkeypatch.setattr(cache, "create_redis", ok_redis)
+    monkeypatch.setattr(db, "create_db_pool", ok_pool)
+    monkeypatch.setattr(main.settings, "scheduler_enabled", False)
+    monkeypatch.setattr(main.settings, "news_poll_enabled", False)
+    real_fred_close = FredClient.aclose
+    real_http_close = httpx.AsyncClient.aclose
+
+    async def fred_close(self):
+        events.append("fred closed")
+        await real_fred_close(self)
+
+    async def http_close(self):
+        events.append("http closed")
+        await real_http_close(self)
+    monkeypatch.setattr(FredClient, "aclose", fred_close)
+    monkeypatch.setattr(httpx.AsyncClient, "aclose", http_close)
+
+    with TestClient(main.app) as client:
+        client.get("/health")
+        state = main.app.state
+        assert isinstance(state.fred_client, FredClient) and state.fred_client.calls_made == 0
+        assert isinstance(state.inputs_http, httpx.AsyncClient) and not state.inputs_http.is_closed
+        assert state.inputs_last is None and state.inputs_lock is not None
+        http = state.inputs_http
+    assert http.is_closed
+    assert "fred closed" in events and "http closed" in events
+    assert max(events.index("fred closed"), events.index("http closed")) < events.index("db closed")
+    assert events.index("db closed") < events.index("redis closed")

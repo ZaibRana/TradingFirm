@@ -15,6 +15,8 @@ Endpoints:
   GET /market/history     — checks over the last ?days=1..90 (default 30)
   GET /market/calendar    — FOMC / CPI / jobs dates for ?days=1..31 (default 7),
                             from data/econ_calendar.json only (Part 3.5)
+  GET /macro/brief/inputs — the macro brief's inputs document with freshness
+                            flags, reused for 60 s (Part 3.6a)
 
 Port: 8003
 """
@@ -22,6 +24,7 @@ Port: 8003
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -32,6 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import config
 import db
 import econ_calendar
+import macro_inputs
 import news_poller
 from config import settings
 
@@ -123,6 +127,17 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Market news poller disabled (NEWS_POLL_ENABLED is not true)")
 
+    # Macro brief inputs (Part 3.6a decision 7). Built whatever the flags say:
+    # neither client makes a request at construction, and GET
+    # /macro/brief/inputs serves with the brief off. The lock is created here,
+    # on the serving loop (a lock is per event loop, Part 3.2).
+    import httpx
+    from monitors.fred_client import FredClient
+    app.state.fred_client = FredClient(settings.fred_api_key.get_secret_value())
+    app.state.inputs_http = httpx.AsyncClient(timeout=macro_inputs.NEWS_TIMEOUT, follow_redirects=False)
+    app.state.inputs_lock = asyncio.Lock()
+    app.state.inputs_last = None
+
     logger.info(f"Risk Shield ready on port {settings.service_port}")
     yield
 
@@ -157,6 +172,14 @@ async def lifespan(app: FastAPI):
             await client.aclose()
         except Exception as e:
             logger.warning(f"News poller client close failed: {e!r}")
+    for name in ("fred_client", "inputs_http"):
+        client = getattr(app.state, name, None)
+        if client is None:
+            continue
+        try:
+            await client.aclose()
+        except Exception as e:
+            logger.warning(f"Macro inputs client close failed ({name}): {e!r}")
     if getattr(app.state, "db_pool", None) is not None:
         await app.state.db_pool.close()
         logger.info("Database pool closed")
@@ -228,6 +251,7 @@ async def root():
             "GET  /market/indicators",
             "GET  /market/history?days=30",
             "GET  /market/calendar?days=7",
+            "GET  /macro/brief/inputs",
         ],
     }
 
@@ -404,3 +428,35 @@ async def market_calendar(days: int = Query(CALENDAR_DAYS_DEFAULT, ge=1, le=CALE
     except econ_calendar.CalendarUnavailable:
         raise HTTPException(status_code=503, detail=CALENDAR_UNAVAILABLE_DETAIL) from None
     return econ_calendar.window(calendar, _now(), days)
+
+
+# ── /macro/brief/inputs (Part 3.6a, spec decision 7) ─────────────
+# The document 3.6b will store, served so the inputs can be checked without an
+# LLM. Unauthenticated, and a cold call can start FRED requests, so one
+# assembly at a time (the lock) and the last document reused for 60 s (the
+# lock alone does not stop a slow loop of calls). `cached` is added on the
+# way out only: assemble_inputs() never returns it, so 3.6b stores none.
+
+INPUTS_REUSE_SECONDS = 60
+
+
+def _monotonic() -> float:
+    """The reuse clock (tests patch it)."""
+    return time.monotonic()
+
+
+@app.get("/macro/brief/inputs")
+async def macro_brief_inputs():
+    """200 with the inputs document plus `cached`; sections say why they are
+    degraded. Works whatever MACRO_BRIEF_ENABLED says. A raise during
+    assembly is a 500 and stores nothing for reuse."""
+    state = app.state
+    if getattr(state, "inputs_lock", None) is None:
+        state.inputs_lock = asyncio.Lock()
+    async with state.inputs_lock:
+        last = getattr(state, "inputs_last", None)
+        if last is not None and _monotonic() - last[0] < INPUTS_REUSE_SECONDS:
+            return {**last[1], "cached": True}
+        doc = await macro_inputs.assemble_inputs(state, state.fred_client, state.inputs_http, now=_now())
+        state.inputs_last = (_monotonic(), doc)
+    return {**doc, "cached": False}

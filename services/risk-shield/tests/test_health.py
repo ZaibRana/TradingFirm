@@ -116,3 +116,4 @@ def test_health_reports_macro_brief_flag(stub_state, monkeypatch):
     assert stub_state().get("/health").json()["macroBriefEnabled"] is False
     monkeypatch.setattr(main.settings, "macro_brief_enabled", True)
     assert stub_state().get("/health").json()["macroBriefEnabled"] is True
+    assert "GET  /macro/brief/inputs" in stub_state().get("/").json()["endpoints"]
