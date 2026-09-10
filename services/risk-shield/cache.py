@@ -12,6 +12,7 @@ Both services share Redis DB 0 in prod.
 
 import json
 import logging
+import time as _time
 from typing import Any, Awaitable, Callable, Optional
 
 import redis.asyncio as aioredis
@@ -39,6 +40,21 @@ KIND_HEALTH = "health"   # 3.4: the latest health snapshot
 TTL_QUOTES = 300     # 5 min (plan 3.2)
 TTL_FRED = 21600     # 6 hours (plan 3.2)
 TTL_HEALTH = 300     # 5 min, the scheduler's market-hours cadence (3.4)
+# A body that came back degraded (envelope `reason` not null: "empty",
+# "partial") is cached briefly, never for the source's full window: one
+# transient empty FRED answer must not blank a series for six hours (Part
+# 3.2 decision 3). Same number as data-engine's TTL_DOSSIER_ERROR.
+TTL_DEGRADED = 120
+
+# Source cooldowns (Part 3.2 decision 4, copied from data-engine 2.4): set
+# after a source refuses us, checked before any request. Source-wide — one
+# name per source, never per ticker or per series.
+COOLDOWN_PREFIX = f"{RISK_PREFIX}cooldown:"
+SOURCE_YFINANCE = "yfinance"
+SOURCE_FRED = "fred"
+TTL_COOLDOWN_YFINANCE = 900      # rate limit, or a whole download empty
+TTL_COOLDOWN_FRED = 900          # 429 / 423
+TTL_COOLDOWN_FRED_AUTH = 3600    # 400 naming api_key
 
 
 # ── Keys ─────────────────────────────────────────────────────────
@@ -96,6 +112,84 @@ async def create_redis(url: str = None, timeout: float = None) -> aioredis.Redis
     return client
 
 
+# ── Cooldowns (sources per name) ─────────────────────────────────
+
+class MemoryCooldowns:
+    """In-memory cooldown clock used when Redis is absent or raising.
+
+    Copied from data-engine's cache.py (Part 2.4), same semantics. Names
+    are source names ("yfinance", "fred"). Lost on restart.
+    """
+
+    def __init__(self):
+        self._started: dict[str, float] = {}
+
+    def remaining(self, name: str, ttl: int) -> Optional[int]:
+        started = self._started.get(name)
+        if started is None:
+            return None
+        elapsed = _time.time() - started
+        if elapsed < ttl:
+            return int(ttl - elapsed)
+        return None
+
+    def start(self, name: str) -> None:
+        self._started[name] = _time.time()
+
+
+def cooldown_key(name: str) -> str:
+    """Redis key for one source cooldown: `tf:risk:cooldown:{NAME}`. The
+    name goes through canonical(), the one normalizer (G1.5)."""
+    return f"{COOLDOWN_PREFIX}{canonical(name)}"
+
+
+async def cooldown_remaining(
+    r: Optional[aioredis.Redis],
+    memory: Optional[MemoryCooldowns],
+    name: str,
+    ttl: int,
+) -> Optional[int]:
+    """
+    Seconds left on `name`'s cooldown, or None if it is clear now.
+
+    Redis is the source of truth; if it is absent or the read raises, the
+    in-memory clock answers (fail-open to a shorter memory of refusals,
+    never to a hard failure).
+    """
+    if r is not None:
+        try:
+            left = await r.ttl(cooldown_key(name))
+        except Exception as e:
+            logger.warning(f"Cooldown check failed for {name}: {e}")
+        else:
+            if left is None or left < 0:
+                return None
+            return left
+    if memory is None:
+        return None
+    return memory.remaining(canonical(name), ttl)
+
+
+async def start_cooldown(
+    r: Optional[aioredis.Redis],
+    memory: Optional[MemoryCooldowns],
+    name: str,
+    ttl: int,
+) -> None:
+    """
+    Start `name`'s cooldown window. Call only after the source actually
+    refused us. A Redis write that raises falls back to the in-memory clock.
+    """
+    if r is not None:
+        try:
+            await r.set(cooldown_key(name), "1", ex=ttl)
+            return
+        except Exception as e:
+            logger.warning(f"Cooldown write failed for {name}: {e}")
+    if memory is not None:
+        memory.start(canonical(name))
+
+
 # ── Generic JSON cache ───────────────────────────────────────────
 
 async def get_cached_json(r: aioredis.Redis, key: str) -> Optional[Any]:
@@ -120,10 +214,11 @@ async def set_cached_json(r: aioredis.Redis, key: str, body: Any, ttl: int) -> N
 async def cached_json(
     r: Optional[aioredis.Redis],
     key: str,
-    ttl: int,
+    ttl: Optional[int],
     fetch: Callable[[], Awaitable[Any]],
     *,
     valid: Optional[Callable[[Any], bool]] = None,
+    ttl_for: Optional[Callable[[Any], int]] = None,
 ) -> tuple[Any, bool]:
     """
     Read-through cache: return (body, from_cache). On a miss, `fetch()`
@@ -134,7 +229,14 @@ async def cached_json(
     inside `fetch()` propagates and nothing is cached.
 
     An empty body ([] or {}) is an answer, not a miss: it is cached and
-    returned as-is. Only a literal absence is a miss.
+    returned as-is. Only a literal absence is a miss — which is why a
+    stored JSON `null` reads as a miss (refetched once, overwritten) and
+    why `fetch()` returning None raises TypeError instead of being cached
+    (Part 3.2 decision 2): a None written here would be refetched on every
+    call and the cache would silently stop protecting the source.
+
+    `ttl_for` (restored from data-engine, Part 3.2 decision 3) decides the
+    TTL from the computed body and wins over `ttl`; `ttl` may then be None.
     """
     if r is not None:
         try:
@@ -149,10 +251,13 @@ async def cached_json(
             return body, True
 
     body = await fetch()
+    if body is None:
+        raise TypeError(f"fetch for {key} returned None; fetchers return an envelope")
 
     if r is not None:
+        write_ttl = ttl_for(body) if ttl_for is not None else ttl
         try:
-            await set_cached_json(r, key, body, ttl)
+            await set_cached_json(r, key, body, write_ttl)
         except Exception as e:
             logger.warning(f"Cache write failed for {key}: {e}")
     return body, False

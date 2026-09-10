@@ -175,6 +175,106 @@ async def test_cached_json_fetch_raise_propagates_and_caches_nothing():
     assert r.set_calls == []
 
 
+# ── Part 3.2: None guard, ttl_for ────────────────────────────────
+
+def test_degraded_and_cooldown_constants():
+    assert cache.TTL_DEGRADED == 120
+    assert cache.TTL_COOLDOWN_YFINANCE == 900
+    assert cache.TTL_COOLDOWN_FRED == 900
+    assert cache.TTL_COOLDOWN_FRED_AUTH == 3600
+
+
+@pytest.mark.asyncio
+async def test_cached_json_stored_null_is_miss_and_overwritten():
+    """A JSON null at the key reads as a miss: fetched once, overwritten
+    with the envelope, and the next call is a hit — never one fetch per
+    call (decision 2)."""
+    r = FakeRedis()
+    r.store["k"] = "null"
+    fetch, calls = _counter({"reason": None, "data": 1})
+    body, from_cache = await cache.cached_json(r, "k", 300, fetch)
+    assert from_cache is False and body == {"reason": None, "data": 1}
+    assert json.loads(r.store["k"]) == {"reason": None, "data": 1}
+    body, from_cache = await cache.cached_json(r, "k", 300, fetch)
+    assert from_cache is True
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cached_json_fetch_returning_none_raises_and_caches_nothing():
+    r = FakeRedis()
+    fetch, _ = _counter(None)
+    with pytest.raises(TypeError, match="returned None"):
+        await cache.cached_json(r, "k", 300, fetch)
+    assert r.store == {}
+    assert r.set_calls == []
+
+
+@pytest.mark.asyncio
+async def test_cached_json_ttl_for_wins_over_ttl():
+    r = FakeRedis()
+
+    def ttl_for(body):
+        return cache.TTL_DEGRADED if body["reason"] is not None else 21600
+
+    fetch, _ = _counter({"reason": "empty"})
+    await cache.cached_json(r, "a", 21600, fetch, ttl_for=ttl_for)
+    assert r.ttls["a"] == 120
+    fetch, _ = _counter({"reason": None})
+    await cache.cached_json(r, "b", None, fetch, ttl_for=ttl_for)
+    assert r.ttls["b"] == 21600
+
+
+# ── Part 3.2: cooldowns ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_cooldown_remaining_clear():
+    r = FakeRedis()
+    assert await cache.cooldown_remaining(r, cache.MemoryCooldowns(), "fred", 900) is None
+
+
+@pytest.mark.asyncio
+async def test_cooldown_started_in_redis_reports_remaining():
+    r = FakeRedis()
+    await cache.start_cooldown(r, cache.MemoryCooldowns(), "fred", 900)
+    assert r.store["tf:risk:cooldown:FRED"] == "1"
+    assert r.ttls["tf:risk:cooldown:FRED"] == 900
+    assert await cache.cooldown_remaining(r, None, "fred", 900) == 900
+
+
+@pytest.mark.asyncio
+async def test_cooldown_ttl_raise_falls_back_to_memory(caplog):
+    memory = cache.MemoryCooldowns()
+    memory.start("YFINANCE")
+    r = FakeRedis(fail_ttl=True)
+    with caplog.at_level("WARNING"):
+        left = await cache.cooldown_remaining(r, memory, "yfinance", 900)
+    assert left is not None and 0 < left <= 900
+    assert any("Cooldown check failed" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_start_cooldown_set_raise_falls_back_to_memory(caplog):
+    memory = cache.MemoryCooldowns()
+    r = FakeRedis(fail_set=True)
+    with caplog.at_level("WARNING"):
+        await cache.start_cooldown(r, memory, "fred", 900)
+    assert await cache.cooldown_remaining(None, memory, "fred", 900) is not None
+    assert any("Cooldown write failed" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_cooldown_without_redis_or_memory_is_clear():
+    await cache.start_cooldown(None, None, "fred", 900)   # nowhere to record
+    assert await cache.cooldown_remaining(None, None, "fred", 900) is None
+
+
+def test_cooldown_key_namespace_and_normalized():
+    assert cache.cooldown_key("fred") == "tf:risk:cooldown:FRED"
+    assert cache.cooldown_key(" yfinance ") == cache.cooldown_key("YFINANCE")
+    assert not cache.cooldown_key("fred").startswith("tf:cache:")
+
+
 @pytest.mark.asyncio
 async def test_create_redis_passes_socket_timeouts(monkeypatch):
     """Both socket bounds are set; redis-py defaults them to None."""

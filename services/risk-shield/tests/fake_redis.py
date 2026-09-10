@@ -9,11 +9,12 @@ without patching cache.py itself.
 
 
 class FakeRedis:
-    def __init__(self, *, fail_get=False, fail_set=False):
+    def __init__(self, *, fail_get=False, fail_set=False, fail_ttl=False):
         self.store: dict[str, str] = {}
         self.ttls: dict[str, int] = {}
         self.fail_get = fail_get
         self.fail_set = fail_set
+        self.fail_ttl = fail_ttl
         self.get_calls: list[str] = []
         self.set_calls: list[tuple[str, str, int]] = []
 
@@ -30,6 +31,16 @@ class FakeRedis:
         self.store[key] = value
         self.ttls[key] = ex
         return True
+
+    async def ttl(self, key):
+        """Redis semantics: -2 absent, -1 no expiry, else the stored TTL
+        (the fake clock never advances; tests set `ttls` directly)."""
+        if self.fail_ttl:
+            raise RuntimeError("boom: redis ttl")
+        if key not in self.store:
+            return -2
+        ex = self.ttls.get(key)
+        return -1 if ex is None else ex
 
     async def ping(self):
         return True

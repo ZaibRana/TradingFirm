@@ -1,8 +1,7 @@
 # Dev/test-only dependencies. Not installed in the prod image (Dockerfile
 # stage `dev` installs these; stage `prod` does not).
 # Pins match services/data-engine/requirements-dev.txt exactly so the two
-# dev twins cannot drift. No respx here: Part 3.1 makes no HTTP call —
-# 3.2 adds it at data-engine's pin when the FRED fetcher lands.
+# dev twins cannot drift. respx (Part 3.2) mocks the FRED client's httpx.
 #
 # Run tests inside tf-risk-shield-dev, not on the host:
 #   docker compose --profile dev up -d risk-shield-dev
@@ -10,3 +9,4 @@
 -r requirements.txt
 pytest==9.1.1
 pytest-asyncio==1.4.0
+respx==0.22.0
