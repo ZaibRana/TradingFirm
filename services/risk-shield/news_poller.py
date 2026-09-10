@@ -10,6 +10,8 @@ minId, no news state in Redis).
                      route's validation (decision 5)
   poll_once          one poll: skips → one Finnhub call → convert → overlap
                      check → POST in chunks → news_status (decision 7)
+  stale_view         newsPollStale / lastNewsPollAt / newsLastError for
+                     /market/health and the tf:risk:health payload (addition 8)
 
 A poll is a success only when Finnhub answered a non-empty page, at least
 one item survived conversion and every chunk answered 200 (addition 8).
@@ -127,7 +129,7 @@ def _utc_now() -> datetime:
 def initial_news_status() -> dict:
     """app.state.news_status before the first poll: a small dict (G8)."""
     return {
-        "lastPollAt": None, "lastSuccessAt": None,
+        "startedAt": None, "lastPollAt": None, "lastSuccessAt": None,
         "fetched": None, "sent": None, "dropped": None, "truncated": None,
         "pageSpanMinutes": None, "oldestAt": None,
         "lastError": None, "consecutive422": 0,
@@ -255,3 +257,25 @@ async def poll_once(state, client, http, *, clock: Callable[[], datetime] = _utc
         f"{counts['truncated']} truncated, page span {status['pageSpanMinutes']} min"
     )
     return {"outcome": "success", "cause": None}
+
+# ── Staleness (addition 8) ───────────────────────────────────────
+
+STALE_AFTER_SECONDS = 3600
+
+
+def stale_view(state, now: datetime) -> dict:
+    """
+    {newsPollStale, lastNewsPollAt, newsLastError} for /market/health and the
+    tf:risk:health payload. Stale when the poller is enabled and the last
+    success — or, before any, the poller's start — is more than an hour old,
+    whatever the cause (only a success moves the clock). null when the poller
+    is off, or has not started. Process memory: a restart restarts the hour.
+    """
+    status = getattr(state, "news_status", None) or {}
+    view = {"newsPollStale": None, "lastNewsPollAt": status.get("lastSuccessAt"),
+            "newsLastError": status.get("lastError")}
+    base = status.get("lastSuccessAt") or status.get("startedAt")
+    if settings.news_poll_enabled and base is not None:
+        view["newsPollStale"] = (now - datetime.fromisoformat(base)).total_seconds() > STALE_AFTER_SECONDS
+    return view
+

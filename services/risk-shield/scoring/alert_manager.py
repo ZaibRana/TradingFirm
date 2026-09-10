@@ -43,7 +43,10 @@ REASON_REGIME_CHANGE = "regime_change"
 REASON_SCORE_MOVE = "score_move"
 
 PAYLOAD_KEYS = ("score", "regime", "reason", "recovery", "previousScore", "previousRegime",
-                "trend", "stale", "coverage", "checkedAt", "monitors")
+                "trend", "stale", "coverage", "checkedAt", "monitors",
+                # Part 3.5 addition 8: the news feed's state (news_poller.stale_view)
+                "newsPollStale", "lastNewsPollAt", "newsLastError")
+NEWS_KEYS = PAYLOAD_KEYS[-3:]
 
 
 def _aware(value: Any) -> Optional[datetime]:
@@ -84,9 +87,12 @@ def decide(last: Optional[dict], health: dict, now: datetime) -> tuple[bool, Opt
     return False, None
 
 
-def build_payload(health: dict, last: Optional[dict], reason: str, trend: Optional[str]) -> dict:
+def build_payload(health: dict, last: Optional[dict], reason: str, trend: Optional[str],
+                  news: Optional[dict] = None) -> dict:
     """previousScore / previousRegime are the last *published* values (Part
-    5: "from last alert"); the trend base is a different thing (settle*)."""
+    5: "from last alert"); the trend base is a different thing (settle*).
+    The news keys ride along on a publish; staleness never causes one."""
+    news = news or {}
     return {
         "score": health["score"],
         "regime": health["regime"],
@@ -99,6 +105,7 @@ def build_payload(health: dict, last: Optional[dict], reason: str, trend: Option
         "coverage": health.get("coverage"),
         "checkedAt": health.get("checkedAt"),
         "monitors": {name: m.get("score") for name, m in (health.get("monitors") or {}).items()},
+        **{key: news.get(key) for key in NEWS_KEYS},
     }
 
 
@@ -117,10 +124,12 @@ async def read_state(r) -> Optional[dict]:
     return state
 
 
-async def publish_health(r, health: dict, trend: Optional[str], *, now: datetime) -> dict:
+async def publish_health(r, health: dict, trend: Optional[str], *, now: datetime,
+                         news: Optional[dict] = None) -> dict:
     """Publish on settings.health_channel if decide() says so. Returns
     {published, reason}. Never raises for a Redis state; a payload that is
-    not strict JSON (a NaN from a monitor bug) raises ValueError."""
+    not strict JSON (a NaN from a monitor bug) raises ValueError. `news` is
+    news_poller.stale_view(); absent, the news keys are null."""
     if r is None:
         logger.warning("Health publish skipped: Redis unavailable")
         return {"published": False, "reason": None}
@@ -130,7 +139,7 @@ async def publish_health(r, health: dict, trend: Optional[str], *, now: datetime
     if not publish:
         return {"published": False, "reason": None}
 
-    message = json.dumps(build_payload(health, last, reason, trend), allow_nan=False)
+    message = json.dumps(build_payload(health, last, reason, trend, news), allow_nan=False)
     channel = settings.health_channel
     try:
         await r.publish(channel, message)

@@ -485,3 +485,55 @@ async def test_poll_once_repeat_page_is_resent_whole():
     assert len(ingest.posts) == 2 and ingest.posts[0] == ingest.posts[1]
     assert len(ingest.posts[0][1]["items"]) == 20
     assert redis.get_calls == [] and redis.set_calls == []          # no state consulted or kept
+
+
+# ── Staleness (commit 4c-1) ──────────────────────────────────────
+
+def test_news_poll_stale_after_60_minutes(monkeypatch):
+    monkeypatch.setattr(news_poller.settings, "news_poll_enabled", True)
+    status = news_poller.initial_news_status()
+    state = SimpleNamespace(news_status=status)
+    view = lambda at: news_poller.stale_view(state, at)
+
+    assert view(T0)["newsPollStale"] is None                               # enabled, not started yet
+    status["startedAt"] = T0.isoformat()
+    assert view(T0 + timedelta(seconds=3600)) == {"newsPollStale": False, "lastNewsPollAt": None,
+                                                  "newsLastError": None}
+    assert view(T0 + timedelta(seconds=3601))["newsPollStale"] is True    # no success since start
+
+    success = T0 + timedelta(hours=2)
+    status["lastSuccessAt"] = success.isoformat()
+    assert view(success + timedelta(seconds=3600))["newsPollStale"] is False
+    assert view(success + timedelta(seconds=3601)) == {"newsPollStale": True,
+                                                       "lastNewsPollAt": success.isoformat(),
+                                                       "newsLastError": None}
+
+    monkeypatch.setattr(news_poller.settings, "news_poll_enabled", False)
+    assert view(success + timedelta(hours=5))["newsPollStale"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause, make_finnhub, make_ingest, cooldown", [
+    ("ingest: HTTP 422", FakeFinnhub, lambda: FakeIngest(422), False),
+    ("finnhub: FinnhubError", lambda: FakeFinnhub(error=FinnhubError("general news: HTTP 500")), FakeIngest, False),
+    ("skipped: cooldown", FakeFinnhub, FakeIngest, True),
+    ("ingest: ConnectError", FakeFinnhub, lambda: FakeIngest(httpx.ConnectError("refused")), False),
+    ("finnhub: empty page", lambda: FakeFinnhub([]), FakeIngest, False),
+], ids=["422", "finnhub-500", "cooldown", "data-engine-down", "empty-page"])
+async def test_news_poll_stale_for_any_cause(cause, make_finnhub, make_ingest, cooldown, monkeypatch):
+    monkeypatch.setattr(news_poller.settings, "news_poll_enabled", True)
+    redis = FakeRedis()
+    state = _state(redis)
+    state.news_status["startedAt"] = T0.isoformat()
+    first, _, _ = await _poll(state, at=T0)
+    assert first["outcome"] == "success"
+    if cooldown:
+        redis.store[OWN_COOLDOWN] = "1"
+        redis.ttls[OWN_COOLDOWN] = 900
+
+    for minutes in (15, 30, 45, 61):
+        await _poll(state, make_finnhub(), make_ingest(), at=T0 + timedelta(minutes=minutes))
+
+    assert news_poller.stale_view(state, T0 + timedelta(minutes=60))["newsPollStale"] is False
+    assert news_poller.stale_view(state, T0 + timedelta(minutes=61)) == {
+        "newsPollStale": True, "lastNewsPollAt": T0.isoformat(), "newsLastError": cause}

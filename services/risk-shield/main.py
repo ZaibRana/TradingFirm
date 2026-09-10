@@ -32,6 +32,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import config
 import db
 import econ_calendar
+import news_poller
 from config import settings
 
 # ── Logging ──────────────────────────────────────────────────────
@@ -270,6 +271,9 @@ async def market_health():
         "kind": ind.get("kind"),
         "coverage": ind.get("coverage"),
         "stale": ind.get("stale"),
+        # Part 3.5 addition 8: the news feed's state, from process memory at
+        # request time — the only values on this route not from Postgres.
+        **news_poller.stale_view(app.state, _now()),
     }
     if row["score"] is None:
         scored = await _read(db.latest_scored_health_check)

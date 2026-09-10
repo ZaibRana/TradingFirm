@@ -59,6 +59,42 @@ class ReadPool:
         raise AssertionError("the /market endpoints never write")
 
 
+@pytest.fixture(autouse=True)
+def _news_poller_off(monkeypatch):
+    """The news keys on /market/health read the poller flag and news_status;
+    pin both so a row test never depends on another test's app.state."""
+    import news_poller
+    monkeypatch.setattr(news_poller.settings, "news_poll_enabled", False)
+    monkeypatch.setattr(main.app.state, "news_status", news_poller.initial_news_status(), raising=False)
+
+
+def test_market_health_carries_news_poll_stale(client_with, monkeypatch):
+    """Part 3.5 addition 8: newsPollStale / lastNewsPollAt / newsLastError come
+    from process memory at request time, never from Postgres."""
+    import news_poller
+    now = datetime.now(timezone.utc)
+    status = news_poller.initial_news_status()
+    status.update(startedAt=(now - timedelta(hours=5)).isoformat(),
+                  lastSuccessAt=(now - timedelta(hours=2)).isoformat(), lastError="ingest: HTTP 503")
+    monkeypatch.setattr(main.app.state, "news_status", status, raising=False)
+    monkeypatch.setattr(news_poller.settings, "news_poll_enabled", True)
+    pool = ReadPool(latest=row())
+    client = client_with(pool)
+
+    body = client.get("/market/health").json()
+    assert (body["newsPollStale"], body["lastNewsPollAt"], body["newsLastError"]) == (
+        True, status["lastSuccessAt"], "ingest: HTTP 503")
+
+    status.update(lastSuccessAt=(now - timedelta(minutes=5)).isoformat(), lastError=None)
+    body = client.get("/market/health").json()
+    assert (body["newsPollStale"], body["lastNewsPollAt"], body["newsLastError"]) == (
+        False, status["lastSuccessAt"], None)
+
+    monkeypatch.setattr(news_poller.settings, "news_poll_enabled", False)
+    assert client.get("/market/health").json()["newsPollStale"] is None
+    assert len(pool.calls) == 3                       # one row read per request, nothing more
+
+
 @pytest.fixture
 def client_with():
     def _make(pool):
@@ -83,6 +119,7 @@ def test_market_health_returns_latest_row(client_with):
         "settleScore": 60, "settleCheckedAt": SETTLE_AT,
         "message": "Elevated risk — trade with caution",
         "checkedAt": at.isoformat(), "kind": "market", "coverage": 100, "stale": False,
+        "newsPollStale": None, "lastNewsPollAt": None, "newsLastError": None,   # Part 3.5, poller off
     }
     assert "previousScore" not in body               # the last publish lives in pub/sub only
     assert len(pool.calls) == 1                       # no lastScored query for a scored row

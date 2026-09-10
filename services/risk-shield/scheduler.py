@@ -27,6 +27,7 @@ import exchange_calendars as xcals
 import pandas as pd
 
 import db
+import news_poller
 from monitors import quotes
 from scoring.alert_manager import publish_health
 from scoring.health_calculator import compute_health
@@ -221,7 +222,8 @@ async def run_check(state, kind: str, *, clock: Callable[[], datetime] = _utc_no
 
     published = None
     try:
-        published = await publish_health(r, health, trend, now=checked_at)
+        published = await publish_health(r, health, trend, now=checked_at,
+                                         news=news_poller.stale_view(state, checked_at))
     except Exception as e:
         _failure("publish", e, errors)
 

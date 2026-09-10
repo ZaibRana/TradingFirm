@@ -5,11 +5,14 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
 import cache
 import config
+import news_poller
+import scheduler
 from scoring import alert_manager
 from scoring.alert_manager import decide, publish_health
 from scoring.regime_classifier import classify
@@ -222,6 +225,7 @@ async def test_publish_payload_shape_and_channel(monkeypatch):
         "score": 30, "regime": "DANGER", "reason": "regime_change", "recovery": False,
         "previousScore": 45, "previousRegime": "CAUTIOUS", "trend": "declining", "stale": True,
         "coverage": 100, "checkedAt": NOW.isoformat(), "monitors": {"vix": 30, "breadth": None},
+        "newsPollStale": None, "lastNewsPollAt": None, "newsLastError": None,     # Part 3.5, no view passed
     }
     bad = health(30)
     bad["coverage"] = float("nan")
@@ -238,6 +242,43 @@ async def test_health_channel_default_and_override(monkeypatch):
     r = FakeRedis()
     await publish_health(r, health(72), None, now=NOW)
     assert [ch for ch, _ in r.published] == ["tf:risk:dev:health"]
+
+
+@pytest.mark.asyncio
+async def test_publish_payload_carries_news_poll_stale(monkeypatch):
+    """Part 3.5 addition 8: a scheduled check publishes the news feed's state,
+    read from app.state.news_status through news_poller.stale_view."""
+    monkeypatch.setattr(news_poller.settings, "news_poll_enabled", True)
+    status = news_poller.initial_news_status()
+    status.update(startedAt=(NOW - timedelta(hours=3)).isoformat(),
+                  lastSuccessAt=(NOW - timedelta(minutes=61)).isoformat(),
+                  lastError="ingest: HTTP 422")
+    state = SimpleNamespace(redis=FakeRedis(), db_pool=None, cooldowns=cache.MemoryCooldowns(),
+                            check_status={}, news_status=status)
+
+    async def fake_compute(r, cooldowns, now=None):
+        return health(72)
+
+    monkeypatch.setattr(scheduler, "compute_health", fake_compute)
+    monkeypatch.setattr(scheduler.quotes, "download_in_flight", lambda: False)
+    await scheduler.run_check(state, "market", clock=lambda: NOW)
+    [(_, payload)] = messages(state.redis)
+    assert tuple(payload) == alert_manager.PAYLOAD_KEYS
+    assert (payload["newsPollStale"], payload["lastNewsPollAt"], payload["newsLastError"]) == (
+        True, status["lastSuccessAt"], "ingest: HTTP 422")
+
+    fresh = {**status, "lastSuccessAt": (NOW - timedelta(minutes=5)).isoformat(), "lastError": None}
+    r = FakeRedis()
+    await publish_health(r, health(72), None, now=NOW,
+                         news=news_poller.stale_view(SimpleNamespace(news_status=fresh), NOW))
+    assert {k: messages(r)[0][1][k] for k in alert_manager.NEWS_KEYS} == {
+        "newsPollStale": False, "lastNewsPollAt": fresh["lastSuccessAt"], "newsLastError": None}
+
+    monkeypatch.setattr(news_poller.settings, "news_poll_enabled", False)
+    r = FakeRedis()
+    await publish_health(r, health(72), None, now=NOW,
+                         news=news_poller.stale_view(SimpleNamespace(news_status=fresh), NOW))
+    assert messages(r)[0][1]["newsPollStale"] is None
 
 
 def test_twin_never_publishes_on_prod_channel():
