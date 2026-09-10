@@ -41,6 +41,16 @@ class Settings(BaseSettings):
     # `fredConfigured` boolean on /health.
     fred_api_key: SecretStr = SecretStr("")
 
+    # Regime scheduler (Part 3.4). Off unless the environment turns it on:
+    # only the prod compose service does. The dev twin has no quotes fixture,
+    # so a scheduler there would download from yfinance every 5 minutes.
+    scheduler_enabled: bool = False
+
+    # Pub/sub channel for health changes. Redis pub/sub ignores the DB index,
+    # so the dev twin (Redis DB 1) overrides this to stay off prod's channel.
+    # Default = shared/constants.py REDIS_CHANNELS["health_update"].
+    health_channel: str = "tf:risk:health"
+
     # Debug mode
     debug: bool = False
 

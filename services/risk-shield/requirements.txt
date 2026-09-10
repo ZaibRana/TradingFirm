@@ -10,3 +10,6 @@ pydantic-settings==2.9.1
 yfinance==1.5.1
 numpy==2.3.0
 pandas==2.3.0
+# Part 3.4: NYSE sessions, holidays and early closes for the scheduler.
+# Probed on these pins: adds korean_lunar_calendar, pyluach, toolz only.
+exchange_calendars==4.13.2

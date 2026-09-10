@@ -21,7 +21,7 @@ services:
       - ./services/risk-shield:/app
     environment:
       DEBUG: "true"
-    command: uvicorn main:app --host 0.0.0.0 --port 8003 --reload
+    command: uvicorn main:app --host 0.0.0.0 --port 8003 --workers 1 --reload   # one process = one scheduler (3.4)
 
   ai-agent:
     volumes:

@@ -1,6 +1,8 @@
 """Part 3.1 — config.py: defaults, env overrides, and the SecretStr guard."""
 
 import importlib
+import json
+from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
@@ -24,7 +26,7 @@ def _restore_config():
 
 def test_config_defaults(monkeypatch):
     for var in ("SERVICE_NAME", "SERVICE_PORT", "DATABASE_URL", "REDIS_URL",
-                "FRED_API_KEY", "DEBUG"):
+                "FRED_API_KEY", "DEBUG", "SCHEDULER_ENABLED", "HEALTH_CHANNEL"):
         monkeypatch.delenv(var, raising=False)
     mod = importlib.reload(config)
     s = mod.Settings(_env_file=None)
@@ -34,6 +36,7 @@ def test_config_defaults(monkeypatch):
     assert s.debug is False
     assert s.fred_api_key.get_secret_value() == ""
     assert s.fred_configured is False
+    assert s.health_channel == "tf:risk:health"
 
 
 def test_config_env_override(monkeypatch):
@@ -75,3 +78,25 @@ def test_config_secretstr_masks_key():
 
 def test_startup_timeout_constant():
     assert config.STARTUP_TIMEOUT == 5.0
+
+
+def test_scheduler_disabled_by_default(monkeypatch):
+    """Part 3.4: only an explicit SCHEDULER_ENABLED turns the scheduler on."""
+    monkeypatch.delenv("SCHEDULER_ENABLED", raising=False)
+    assert config.Settings(_env_file=None).scheduler_enabled is False
+    assert _reload(monkeypatch, SCHEDULER_ENABLED="true").settings.scheduler_enabled is True
+    assert _reload(monkeypatch, SCHEDULER_ENABLED="false").settings.scheduler_enabled is False
+
+
+def test_dockerfile_pins_single_worker():
+    """Part 3.4 decision 8: two workers would be two schedulers. uvicorn's
+    --workers default reads $WEB_CONCURRENCY, so every CMD pins 1."""
+    dockerfile = Path(__file__).resolve().parent.parent / "Dockerfile"
+    cmds = [json.loads(line[len("CMD"):].strip())
+            for line in dockerfile.read_text().splitlines()
+            if line.startswith("CMD [")]
+    uvicorn = [c for c in cmds if c and c[0] == "uvicorn"]
+    assert len(uvicorn) == 2                    # dev and prod stages
+    for cmd in uvicorn:
+        i = cmd.index("--workers")
+        assert cmd[i + 1] == "1"

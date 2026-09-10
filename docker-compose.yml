@@ -141,6 +141,7 @@ services:
       REDIS_URL: redis://redis:6379
       DATA_PROVIDER: ${DATA_PROVIDER:-yfinance}
       FRED_API_KEY: ${FRED_API_KEY:-}
+      SCHEDULER_ENABLED: "true"   # Part 3.4: the regime scheduler runs in prod only
     restart: unless-stopped
 
   # Dev/test twin of risk-shield (Part 3.1), the same shape Part 0.7 gave
@@ -176,7 +177,9 @@ services:
       REDIS_URL: redis://redis:6379/1
       FRED_API_KEY: ""        # hard-coded empty: nothing on 8013 can reach FRED
       DEBUG: "true"
-    command: uvicorn main:app --host 0.0.0.0 --port 8003 --reload
+      SCHEDULER_ENABLED: "false"          # hard-coded: no quotes fixture here, a scheduler would download live (3.4)
+      HEALTH_CHANNEL: tf:risk:dev:health  # pub/sub ignores the Redis DB index: never prod's channel (3.4)
+    command: uvicorn main:app --host 0.0.0.0 --port 8003 --workers 1 --reload
     restart: "no"
 
   ai-agent:

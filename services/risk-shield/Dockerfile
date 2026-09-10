@@ -28,7 +28,9 @@ EXPOSE 8003
 HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=3)" || exit 1
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003"]
+# --workers 1 explicitly (uvicorn's default reads $WEB_CONCURRENCY): one
+# process is one scheduler; two would double every download (spec 3.4 d. 8).
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003", "--workers", "1"]
 
 
 FROM base AS prod
@@ -40,4 +42,6 @@ EXPOSE 8003
 HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=3)" || exit 1
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003"]
+# --workers 1 explicitly (uvicorn's default reads $WEB_CONCURRENCY): one
+# process is one scheduler; two would double every download (spec 3.4 d. 8).
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003", "--workers", "1"]
