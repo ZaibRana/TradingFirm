@@ -44,3 +44,11 @@ One row per part from `docs/plan-analyst-watcher.md`. Updated at the end of ever
   - 19:00:00 UTC `100 fetched, 100 sent, 0 dropped, 0 truncated, page span 2444 min`; prod `_MARKET` 0 → 100
   - 19:15:00 `100 fetched, 100 sent, page span 2409 min`; 100 → 103 (97 duplicates absorbed); no overlap warning; `newsPollStale: false`
 - **Slots:** the rebuild window held no slot boundary, and 19:00 ran on the new image. 18:45 and 18:55 UTC have no `health_checks` row. Both fell before the rebuild, on the old image, whose logs went with the recreate, so the cause is unknown. |
+| 3.6a | done, G15 waiting | b3c1cce, cfcb681, 88cd366, 4106dae, 1740c5d, 1768eb8, 85fb611, 25f8079 | 2026-09-10 | Spec `docs/specs/3.6a.md` (v2 + amendments A–C). Plan row 3.6 split into 3.6a / 3.6b (`452062d`, decisions). **Built:**
+- migration 006 (`macro_briefs.brief`, `trigger`)
+- data-engine `GET /news/market`
+- FRED last-known (7 d), refusals as stale, freshness by series cadence
+- `macro_inputs.assemble_inputs` + `GET /macro/brief/inputs` (60 s reuse)
+- `MACRO_BRIEF_ENABLED` / `AI_AGENT_URL`, off in prod, twin hard-coded off / `.invalid`
+
+**Step 0:** 8 FRED requests (one per series), all 200; the cadence table stood. **Verified:** risk-shield 448 → 546, data-engine 435 → 452 in the twins. Twin round trip: health `ok`, settle present, 20 news items via `:8011`, calendar `ok`, FRED `no_data`, `anyStale: true`, second call `cached: true`; dev rows deleted. Pre-part slot check: no gaps on `72b8099801a1` 19:00–20:20 UTC. **Estimate:** code 678 vs 663–969, tests 1,263 vs 1,244–1,778; 4a re-cut to its measured 369. **Outside 3.6a:** `2325d49` froze the clock in `test_dossier_camelcase_shape` (a hard-coded 09-09 broke at the 09-10 close). **G15 waiting:** migrate 006, rebuild data-engine, rebuild risk-shield. |

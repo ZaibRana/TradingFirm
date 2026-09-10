@@ -43,7 +43,7 @@ pub/sub, never by writing into another service's tables.
 |---|---|---|---|
 | `data-engine` | 8001 | **Functional** | Finviz screening → yfinance OHLCV → technical filters → enrichment. The only backend service with real logic. |
 | `signal-engine` | 8002 | Empty scaffold | Intended for entry/exit signal detection (zones, patterns). Only `/health` and `/` exist. |
-| `risk-shield` | 8003 | **Partial** | Market health scoring and regime detection (Phase 3). Part 3.1 gave it `config.py` / `db.py` / `cache.py`, a bounded fail-open lifespan and the `risk.macro_briefs` table; Part 3.2 added the two data fetchers (`monitors/quotes.py`, `monitors/fred.py`); Part 3.3 added the six regime monitors, the health score and the regime classifier (`scoring/`). Part 3.4 added the scheduler that runs them in market hours (prod only, `SCHEDULER_ENABLED`), writes `risk.health_checks` and publishes `tf:risk:health`, and `GET /market/health`, `/market/indicators`, `/market/history` beside `/health` and `/`. Part 3.5 added `GET /market/calendar` (a hand-maintained econ calendar file) and the market news poller (Finnhub general news every 15 min into data-engine's `POST /news/ingest`, prod only, `NEWS_POLL_ENABLED`). Night mode (3.4b) and the macro brief are not built. |
+| `risk-shield` | 8003 | **Partial** | Market health scoring and regime detection (Phase 3). Part 3.1 gave it `config.py` / `db.py` / `cache.py`, a bounded fail-open lifespan and the `risk.macro_briefs` table; Part 3.2 added the two data fetchers (`monitors/quotes.py`, `monitors/fred.py`); Part 3.3 added the six regime monitors, the health score and the regime classifier (`scoring/`). Part 3.4 added the scheduler that runs them in market hours (prod only, `SCHEDULER_ENABLED`), writes `risk.health_checks` and publishes `tf:risk:health`, and `GET /market/health`, `/market/indicators`, `/market/history` beside `/health` and `/`. Part 3.5 added `GET /market/calendar` (a hand-maintained econ calendar file) and the market news poller (Finnhub general news every 15 min into data-engine's `POST /news/ingest`, prod only, `NEWS_POLL_ENABLED`). Part 3.6a added the macro brief's inputs: `GET /macro/brief/inputs` (health rows, data-engine's `GET /news/market`, the calendar, a FRED view with last-known and cadence freshness), the `MACRO_BRIEF_ENABLED` flag (off) and migration 006. Night mode (3.4b) and brief generation (3.6b) are not built. |
 | `ai-agent` | 8004 | Empty scaffold | Intended for trade grading via an LLM (`LLM_PROVIDER` env var supports Gemini/Anthropic). Only `/health` and `/` exist. |
 | `web` (dashboard) | 3000 | **Functional** | Next.js UI showing scan results, stock cards, market status. |
 
@@ -106,7 +106,11 @@ FastAPI app. Key pieces:
   Accepted), `GET /scan/status`, `GET /scan/results`, `GET /scan/history`,
   `GET /stocks/{ticker}`, `POST /stock/{ticker}/refresh`, `GET /stock/{ticker}/bars`,
   `GET /indicators/{ticker}`, `GET /dossier/{ticker}`, `GET /market/status`,
-  `POST /news/ingest`, `GET /health`.
+  `POST /news/ingest`, `GET /news/market`, `GET /health`.
+- **`GET /news/market?hours=1..168&limit=1..100`** (3.6a, default 24 / 50) —
+  stored `_MARKET` news, newest first, `[{publishedAt, source, title,
+  summary, url}]`, Postgres only. `[]` when empty, 503 when the database is
+  down. risk-shield's macro inputs call it; the bounds are a pinned copy there.
 - **`POST /news/ingest`** (3.5) — market news from risk-shield's poller,
   stored under `_MARKET` by the existing `db.upsert_news` (dedup on
   `(ticker, url)`).
@@ -275,7 +279,8 @@ FastAPI app. Key pieces:
 inputs (Part 3.2, spec `docs/specs/3.2.md`), the health score built on
 them (Part 3.3, spec `docs/specs/3.3.md`), the scheduler and read
 endpoints that run and serve it (Part 3.4, spec `docs/specs/3.4.md`), and
-the econ calendar and market news poller (Part 3.5, spec `docs/specs/3.5.md`):
+the econ calendar and market news poller (Part 3.5, spec `docs/specs/3.5.md`),
+and the macro brief's inputs (Part 3.6a, spec `docs/specs/3.6a.md`):
 
 - **`monitors/quotes.py`** — `get_core_quotes(r, memory)`: one yfinance
   1.5.1 `download` of the 17 core tickers (`SPY QQQ RSP ^VIX TLT GLD UUP
@@ -300,6 +305,10 @@ the econ calendar and market news poller (Part 3.5, spec `docs/specs/3.5.md`):
     `ratelimit.fred_limiter` at 60/min with a 1 s gap.
   - **Snapshot:** `fred_snapshot()` walks the 8 series. It stops on a
     source-wide state and continues past a per-series error.
+  - **View (3.6a):** `get_fred_view()` is what the macro inputs read.
+    - Every full envelope is also kept 7 days under `tf:risk:cache:fred_last:{SERIES}`. A refusal, cooldown, error or empty answer serves that copy as stale; with none it is `no_data`, never a raise.
+    - Each series is judged by cadence on the ET date: daily 6 d, DCOILWTICO 14, CPIAUCSL 80, UNRATE 70.
+    - It carries `latest` / `monthAgo` / `yearAgo`, never the arrays.
 - **Refusals and cooldowns** — `cache.py` carries data-engine's cooldown
   helpers under `tf:risk:cooldown:{SOURCE}`:
   - yfinance: a rate limit, or an all-empty download, parks the source 15 min.
@@ -412,6 +421,23 @@ the econ calendar and market news poller (Part 3.5, spec `docs/specs/3.5.md`):
     `/market/health` and every `tf:risk:health` publish. **`newsPollStale:
     null` means the poller is off or its loop has not started yet (for
     example a boot before its first quarter hour), not "unknown".**
+- **`macro_inputs.py`** (3.6a) — `assemble_inputs()` builds the document the
+  macro brief will read and 3.6b will store as `risk.macro_briefs.inputs`:
+  `{schemaVersion, assembledAt, ready, health, settle, news, calendar, fred,
+  freshness}`.
+  - **Sections fail on their own** and say why:
+    - health: the latest `risk.health_checks` row, stale when older than the last slot that should have produced one
+    - settle: the latest scored settle
+    - news: one `GET /news/market?hours=24&limit=50`, no url, text cut to 300
+    - calendar: the next 7 ET days
+    - fred: the view above
+  - **`freshness`** flattens each section's flags plus the news poller's three keys into `anyStale`. `ready` means a scored row exists.
+  - **Bounded** at 64 KB of compact JSON by dropping the oldest news; `allow_nan=False`.
+  - **`GET /macro/brief/inputs`** serves it with `cached`: one assembly at a time, the last document reused for 60 s. It works with the brief flag off.
+- **`risk.macro_briefs`** (005, 006) has `brief` (JSONB object) and `trigger`
+  (`slot` / `regime_change` / `critical` / `manual`), both `NOT NULL`.
+  Nothing writes it yet. `MACRO_BRIEF_ENABLED` (false in prod) and
+  `AI_AGENT_URL` are wired for 3.6b.
 
 ## Web dashboard
 
@@ -454,7 +480,9 @@ Google-sign-in scaffolding under `web/lib/firebase/` has been removed.
   hard-coded empty, `SCHEDULER_ENABLED=false` and
   `HEALTH_CHANNEL=tf:risk:dev:health` hard-coded (Part 3.4),
   `FINNHUB_API_KEY=""`, `NEWS_POLL_ENABLED=false` and
-  `DATA_ENGINE_URL=http://data-engine-dev:8001` hard-coded (Part 3.5), and
+  `DATA_ENGINE_URL=http://data-engine-dev:8001` hard-coded (Part 3.5),
+  `MACRO_BRIEF_ENABLED=false` and `AI_AGENT_URL=http://ai-agent.invalid:8004`
+  hard-coded (Part 3.6a), and
   `infra/supabase/migrations` mounted read-only at
   `/migrations` for the tests that assert migration text. Phase 3 tests run
   there:
@@ -478,7 +506,10 @@ data fetchers (core quotes, FRED) as of Part 3.2, its health score and
 regime as of Part 3.3, and a market-hours scheduler plus the `/market/*`
 read endpoints as of Part 3.4, running in prod since 2026-09-10. Part 3.5
 added the econ calendar and the market news poller (with data-engine's
-`POST /news/ingest`); in the repo, not yet deployed to prod. The `scanner/`
+`POST /news/ingest`), deployed to prod on 2026-09-10. Part 3.6a added the
+macro brief's inputs and `GET /macro/brief/inputs` (with data-engine's
+`GET /news/market` and migration 006); in the repo, not yet deployed to
+prod. The `scanner/`
 standalone scripts predate the data-engine port and stay only as a frozen
 reference — see [`.agents/AGENTS.md`](../.agents/AGENTS.md) for the full
 rationale.

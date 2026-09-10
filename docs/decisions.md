@@ -553,3 +553,26 @@ The shared ×1.3–1.8 put 3.5's code above its band (1,119 vs ~770–1,060) and
 **Why:** plan row 3.6 came to ~650 lines of code before overruns. The inputs half is deployable and checkable in prod with no LLM, so 3.6b can be code-only.
 
 **Supersedes:** plan row 3.6 as a single part. For ops alerting, it refines the Part 3.5 entry's deferral (addition 9) by fixing its place in Phase 6.
+
+---
+
+## 2026-09-10 — Macro brief inputs (Part 3.6a)
+
+**Decision:** approved spec `docs/specs/3.6a.md` (v2, amendments A–C). What 3.6b builds on:
+
+- **The inputs document** (schema v1): `ready`, `health`, `settle`, `news`, `calendar`, `fred`, `freshness`.
+  - 3.6b stores it unchanged. It is bounded at 64 KB by dropping the oldest news items, and uses `allow_nan=False`.
+  - `GET /macro/brief/inputs` serves it and reuses it for 60 s per process. `cached` is added on the way out only.
+- **Health comes from rows only.** It is stale when older than the last slot that should have produced a row (`now − 300 s`), and the age is always carried. 07:30 reads yesterday's settle as fresh, at ~900 min.
+- **FRED:**
+  - The last full envelope per series is kept 7 days in the fetcher. A refusal, cooldown, error or empty answer is stale data, never an error.
+  - Staleness is judged by cadence on the ET date: daily 6 d, DCOILWTICO 14, CPIAUCSL 80, UNRATE 70. Provisional, set from the 2026-09-10 live check.
+- **News:**
+  - It comes through data-engine `GET /news/market`. The bounds are 168 h / 100, a pinned copy on both sides.
+  - Items carry no url. An empty 24 h counts as stale.
+- **`anyStale`** ignores `calendarRenewalDue` and a null `newsPollStale`.
+- **006:** `brief` and `trigger` are `NOT NULL` with no default. The table must be empty when it is applied.
+
+**Why:** each bullet is a place where a plausible default would have hidden stale inputs from the brief: a fresh-looking 07:30 health row, a cooldown read as an error, a monthly series judged by a daily threshold, an empty news window read as a quiet day.
+
+**Supersedes:** 3.3's deferral of FRED last-known, cooldown-as-stale and cadence freshness (now built).
