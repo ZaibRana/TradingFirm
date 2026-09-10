@@ -64,3 +64,12 @@ async def test_cooldown_helpers_redis_and_memory():
     # ── No Redis and no memory: fail open, never raise ──
     assert await cooldown_remaining(None, None, "edgar", 900) is None
     await start_cooldown(None, None, "edgar", 900)
+
+
+def test_finnhub_cooldown_key_is_pinned_for_risk_shield():
+    from cache import SOURCE_FINNHUB
+    assert cooldown_key(SOURCE_FINNHUB) == "tf:cache:finnhub", (
+        "risk-shield's news poller reads this key before calling Finnhub "
+        "(services/risk-shield/cache.py DATA_ENGINE_FINNHUB_COOLDOWN_KEY, spec 3.5 "
+        "decision 4). Rename both together."
+    )

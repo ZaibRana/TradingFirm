@@ -47,6 +47,10 @@ SOURCE_FINNHUB = "finnhub"
 SOURCE_EDGAR = "edgar"
 SOURCE_ALPHAVANTAGE = "alphavantage"
 TTL_COOLDOWN_FINNHUB = 60         # the width of Finnhub's per-minute window
+# risk-shield's news poller reads this source's key, tf:cache:finnhub, before
+# it calls Finnhub (spec 3.5 decision 4). Renaming it means changing
+# risk-shield's DATA_ENGINE_FINNHUB_COOLDOWN_KEY too; tests/test_cooldowns.py
+# pins it.
 TTL_COOLDOWN_EDGAR = 900          # 403 = blocked: stop, do not poke it
 TTL_COOLDOWN_ALPHAVANTAGE = 3600  # the free tier's daily cap, seen as HTTP 200
 

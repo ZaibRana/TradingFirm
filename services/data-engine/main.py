@@ -13,6 +13,7 @@ FastAPI application with endpoints:
   GET  /dossier/{ticker}   — one document per ticker: indicators, news, events,
                              recommendations, filings, earnings reactions, profile
   GET  /market/status  — current market session
+  POST /news/ingest    — store market news under _MARKET (risk-shield's poller, Part 3.5)
   GET  /health         — health check
   GET  /               — service info
 
@@ -27,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
@@ -278,6 +280,7 @@ async def root():
             "GET  /indicators/{ticker}",
             "GET  /dossier/{ticker}",
             "GET  /market/status",
+            "POST /news/ingest",
             "GET  /health",
         ],
     }
@@ -775,3 +778,87 @@ async def market_status():
         "timestamp": et.isoformat(),
         "display": et.strftime("%A %I:%M %p ET"),
     }
+
+
+# ── News ingest (Part 3.5, spec decision 5) ──────────────────────
+# Market news only, sent by risk-shield's poller; stored under _MARKET by the
+# existing upsert_news (dedup on (ticker, url)). The limits are spec 3.5
+# decision 5's table. risk-shield's converter keeps a copy of the same
+# numbers and makes a violation impossible before it sends; each copy is
+# pinned by a test (test_ingest_limits_pinned_to_spec here,
+# test_converter_limits_pinned_to_spec there). After that, a 422 here means
+# the two copies drifted. NUL is refused because Postgres TEXT rejects it:
+# it would otherwise surface as a 503 that the poller resends forever.
+
+NEWS_INGEST_MAX_ITEMS = 200
+NEWS_URL_MAX = 2048
+NEWS_TITLE_MAX = 1000
+NEWS_SUMMARY_MAX = 10000
+NEWS_SOURCE_MAX = 100
+NEWS_DB_UNAVAILABLE_DETAIL = "database unavailable"
+
+
+class NewsIngestItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")   # a `ticker` field is a 422: market news only
+
+    publishedAt: AwareDatetime
+    title: str = Field(max_length=NEWS_TITLE_MAX)
+    url: str = Field(max_length=NEWS_URL_MAX)
+    source: str = Field("", max_length=NEWS_SOURCE_MAX)
+    summary: str = Field("", max_length=NEWS_SUMMARY_MAX)
+
+    @field_validator("title", "url", "source", "summary")
+    @classmethod
+    def _no_nul(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("NUL character not allowed")
+        return value
+
+    @field_validator("title")
+    @classmethod
+    def _title_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("title is blank")
+        return value
+
+    @field_validator("url")
+    @classmethod
+    def _http_url(cls, value: str) -> str:
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("url must start with http:// or https://")
+        return value
+
+
+class NewsIngestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[NewsIngestItem] = Field(min_length=1, max_length=NEWS_INGEST_MAX_ITEMS)
+
+
+@app.post("/news/ingest")
+async def ingest_news(body: NewsIngestRequest):
+    """
+    Store a batch of market news. One bad item fails the whole request with
+    a 422 (the sender is our own code). 200 {received, sent}: `sent` counts
+    rows sent after in-batch dedup, not rows inserted (executemany reports no
+    count). No pool, or a database error or timeout, is a 503; a raise
+    mid-batch can leave earlier rows stored (Part 2.1), and a resend dedups.
+    """
+    pool = getattr(app.state, "db_pool", None)
+    if pool is None:
+        raise HTTPException(status_code=503, detail=NEWS_DB_UNAVAILABLE_DETAIL)
+
+    from db import DB_ERRORS, MARKET_TICKER, upsert_news
+
+    rows = [
+        {"ticker": None, "published_at": item.publishedAt, "source": item.source,
+         "title": item.title, "url": item.url, "summary": item.summary}
+        for item in body.items
+    ]
+    try:
+        sent = await upsert_news(pool, rows)
+    except (*DB_ERRORS, TimeoutError) as e:
+        logger.warning(f"/news/ingest: database unavailable ({type(e).__name__})")
+        raise HTTPException(status_code=503, detail=NEWS_DB_UNAVAILABLE_DETAIL) from None
+    logger.info(f"/news/ingest: {len(rows)} received, {sent} sent under {MARKET_TICKER}")
+    return {"received": len(rows), "sent": sent}
