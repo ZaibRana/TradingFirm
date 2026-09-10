@@ -63,3 +63,23 @@ class QuotesCoolingDown(QuotesError):
     def __init__(self, remaining: int):
         self.remaining = remaining
         super().__init__(f"yfinance cooling down, {remaining}s left")
+
+
+# ── Finnhub market news (Part 3.5) ───────────────────────────────
+# The key rides in a header, but messages still carry a status only.
+
+class FinnhubError(SourceError):
+    """Non-2xx that is not a refusal, timeout, transport, bad JSON, or a
+    body that is not a list."""
+
+
+class FinnhubNotConfigured(FinnhubError):
+    """FINNHUB_API_KEY is empty; no request was attempted."""
+
+
+class FinnhubRateLimited(FinnhubError):
+    """429: account-level. Start the cooldown, never retry."""
+
+
+class FinnhubNotAuthorized(FinnhubError):
+    """401 or 403: rejected key, or an endpoint outside the free tier."""

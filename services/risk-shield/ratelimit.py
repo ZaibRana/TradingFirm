@@ -64,3 +64,14 @@ FRED_MIN_GAP = 1.0
 fred_limiter = RateLimiter(
     max_calls=FRED_MAX_CALLS_PER_MINUTE, window=60.0, min_gap=FRED_MIN_GAP
 )
+
+
+# ── The Finnhub limiter (Part 3.5 decision 4) ────────────────────────────
+# Finnhub's free tier allows 60 calls per minute. The same numbers as
+# data-engine's Finnhub limiter: 60 per 60 s and a 1.2 s gap. The poller
+# makes one call per 15 minutes, so this is a guard, not a pace.
+FINNHUB_MAX_CALLS_PER_MINUTE = 60
+FINNHUB_MIN_GAP = 1.2
+finnhub_limiter = RateLimiter(
+    max_calls=FINNHUB_MAX_CALLS_PER_MINUTE, window=60.0, min_gap=FINNHUB_MIN_GAP
+)

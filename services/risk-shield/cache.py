@@ -63,6 +63,16 @@ SOURCE_FRED = "fred"
 TTL_COOLDOWN_YFINANCE = 900      # rate limit, or a whole download empty
 TTL_COOLDOWN_FRED = 900          # 429 / 423
 TTL_COOLDOWN_FRED_AUTH = 3600    # 400 naming api_key
+SOURCE_FINNHUB = "finnhub"       # 3.5: market news
+TTL_COOLDOWN_FINNHUB = 900       # 429
+TTL_COOLDOWN_FINNHUB_AUTH = 3600 # 401 / 403
+
+# data-engine's own Finnhub cooldown (its cache.cooldown_key(SOURCE_FINNHUB),
+# set for 60 s after a dossier 429). A 429 is account-level, so the news
+# poller reads this key before calling Finnhub: read-only, never written,
+# absent or unreadable = clear (spec 3.5 decision 4). data-engine's
+# test_finnhub_cooldown_key_is_pinned_for_risk_shield pins the other end.
+DATA_ENGINE_FINNHUB_COOLDOWN_KEY = "tf:cache:finnhub"
 
 
 # ── Keys ─────────────────────────────────────────────────────────
