@@ -43,7 +43,7 @@ pub/sub, never by writing into another service's tables.
 |---|---|---|---|
 | `data-engine` | 8001 | **Functional** | Finviz screening → yfinance OHLCV → technical filters → enrichment. The only backend service with real logic. |
 | `signal-engine` | 8002 | Empty scaffold | Intended for entry/exit signal detection (zones, patterns). Only `/health` and `/` exist. |
-| `risk-shield` | 8003 | **Partial** | Market health scoring and regime detection (Phase 3). Part 3.1 gave it `config.py` / `db.py` / `cache.py`, a bounded fail-open lifespan and the `risk.macro_briefs` table; Part 3.2 added the two data fetchers (`monitors/quotes.py`, `monitors/fred.py`); Part 3.3 added the six regime monitors, the health score and the regime classifier (`scoring/`). Part 3.4 added the scheduler that runs them in market hours (prod only, `SCHEDULER_ENABLED`), writes `risk.health_checks` and publishes `tf:risk:health`, and `GET /market/health`, `/market/indicators`, `/market/history` beside `/health` and `/`. Night mode (3.4b), market news, the econ calendar and the macro brief are not built. |
+| `risk-shield` | 8003 | **Partial** | Market health scoring and regime detection (Phase 3). Part 3.1 gave it `config.py` / `db.py` / `cache.py`, a bounded fail-open lifespan and the `risk.macro_briefs` table; Part 3.2 added the two data fetchers (`monitors/quotes.py`, `monitors/fred.py`); Part 3.3 added the six regime monitors, the health score and the regime classifier (`scoring/`). Part 3.4 added the scheduler that runs them in market hours (prod only, `SCHEDULER_ENABLED`), writes `risk.health_checks` and publishes `tf:risk:health`, and `GET /market/health`, `/market/indicators`, `/market/history` beside `/health` and `/`. Part 3.5 added `GET /market/calendar` (a hand-maintained econ calendar file) and the market news poller (Finnhub general news every 15 min into data-engine's `POST /news/ingest`, prod only, `NEWS_POLL_ENABLED`). Night mode (3.4b) and the macro brief are not built. |
 | `ai-agent` | 8004 | Empty scaffold | Intended for trade grading via an LLM (`LLM_PROVIDER` env var supports Gemini/Anthropic). Only `/health` and `/` exist. |
 | `web` (dashboard) | 3000 | **Functional** | Next.js UI showing scan results, stock cards, market status. |
 
@@ -106,7 +106,17 @@ FastAPI app. Key pieces:
   Accepted), `GET /scan/status`, `GET /scan/results`, `GET /scan/history`,
   `GET /stocks/{ticker}`, `POST /stock/{ticker}/refresh`, `GET /stock/{ticker}/bars`,
   `GET /indicators/{ticker}`, `GET /dossier/{ticker}`, `GET /market/status`,
-  `GET /health`.
+  `POST /news/ingest`, `GET /health`.
+- **`POST /news/ingest`** (3.5) — market news from risk-shield's poller,
+  stored under `_MARKET` by the existing `db.upsert_news` (dedup on
+  `(ticker, url)`).
+  - **Validation:** a Pydantic body with `extra="forbid"` (a `ticker` field
+    is a 422) and 1–200 items: aware `publishedAt`, http(s) url ≤ 2,048,
+    non-blank title ≤ 1,000, summary ≤ 10,000, source ≤ 100, no NUL.
+  - **Errors:** one bad item fails the whole batch. No pool, or a database
+    error or timeout, is a 503.
+  - **The limits are a pinned copy** of risk-shield's converter's. There is
+    no auth, like `/scan/run`.
 - **`data_engine.ohlcv_bars`** (Postgres) — daily/hourly OHLCV per ticker,
   written by `db.upsert_bars()` / read by `db.get_bars()`, with bar-shaping
   logic (`db.bar_records_from_df()`) shared by every write path.
@@ -263,8 +273,9 @@ FastAPI app. Key pieces:
 
 [`services/risk-shield`](../services/risk-shield) holds the Phase 3 regime
 inputs (Part 3.2, spec `docs/specs/3.2.md`), the health score built on
-them (Part 3.3, spec `docs/specs/3.3.md`), and the scheduler and read
-endpoints that run and serve it (Part 3.4, spec `docs/specs/3.4.md`):
+them (Part 3.3, spec `docs/specs/3.3.md`), the scheduler and read
+endpoints that run and serve it (Part 3.4, spec `docs/specs/3.4.md`), and
+the econ calendar and market news poller (Part 3.5, spec `docs/specs/3.5.md`):
 
 - **`monitors/quotes.py`** — `get_core_quotes(r, memory)`: one yfinance
   1.5.1 `download` of the 17 core tickers (`SPY QQQ RSP ^VIX TLT GLD UUP
@@ -295,11 +306,13 @@ endpoints that run and serve it (Part 3.4, spec `docs/specs/3.4.md`):
   - FRED: a 429/423 parks it 15 min, a rejected key 1 h.
   - A refusal raises (`…RateLimited`, `…CoolingDown`) and caches nothing.
   - `cached_json` refuses a `None` from a fetcher and takes a body-derived TTL (`ttl_for`).
-- **Live canaries** — `tests/fred_live.py` and `tests/quotes_live.py` run
-  only through the isolated `docker run` line in `docs/specs/3.2.md`:
-  default bridge network, unroutable `DATABASE_URL` / `REDIS_URL`, and
-  only `FRED_API_KEY` taken from `.env`. `tests/live_guard.py` refuses a
-  prod-looking environment.
+- **Live canaries** — `tests/fred_live.py`, `tests/quotes_live.py` and
+  `tests/finnhub_news_live.py` (3.5: one request; reads out page size, span
+  and limits, and records the 20-item fixture) run only through the isolated
+  `docker run` line in `docs/specs/3.2.md`: default bridge network,
+  unroutable `DATABASE_URL` / `REDIS_URL`, and only the one key they need
+  taken from `.env`. `tests/live_guard.py` refuses a prod-looking
+  environment.
 - **`quotes.get_quotes_view(r, memory)`** is what the monitors read.
   - Every full quotes answer is also kept 24 h under
     `tf:risk:cache:quotes_last`.
@@ -358,6 +371,47 @@ endpoints that run and serve it (Part 3.4, spec `docs/specs/3.4.md`):
     null scores kept.
   - A missing pool or a database failure is a 503. `/health` also reports
     `schedulerEnabled` and `lastCheckAt`.
+  - **Exception (3.5):** `GET /market/health` also carries `newsPollStale`,
+    `lastNewsPollAt` and `newsLastError`, read from process memory at
+    request time.
+- **`econ_calendar.py` + `data/econ_calendar.json`** (3.5) — the only econ
+  calendar source: FOMC decisions (14:00 ET), CPI releases and jobs reports
+  (08:30 ET) for 2026-07-01 … 2026-12-31, copied by hand from the Fed and BLS
+  schedule pages. The file ships in the prod image.
+  - **Loading:** validated once per process, and never cached when invalid.
+  - **`GET /market/calendar?days=1..31`** (default 7): events on ET dates
+    today … today + days − 1, with `datetimeUtc` and `released`.
+    - A window past the file's end is 200 with `coverageShort: true`.
+    - A missing or invalid file is a 503.
+  - **Renewal:** `/health` reports `calendarCoversThrough` and
+    `calendarCoverageShort`, which turns true 14 days before the end; the
+    news poller also logs a daily WARNING then. The renewal step is in
+    `CLAUDE.md`.
+- **`monitors/finnhub_client.py` + `news_poller.py`** (3.5) — the market news
+  poller, one asyncio task started only when `NEWS_POLL_ENABLED=true` (prod).
+  - **When:** every wall-clock quarter hour (UTC), around the clock. A late
+    wake polls once, and missed slots are never caught up.
+  - **A poll:** one Finnhub `GET /news?category=general` call (key in the
+    `X-Finnhub-Token` header, 60/min limiter, 8 s bound, no retries), then
+    the whole page (100 items spanning ~41 h on 2026-09-10) POSTed to
+    `DATA_ENGINE_URL/news/ingest`, oldest first, in chunks of 200.
+    - No `minId` and no news state in Redis: ingest dedups.
+    - The converter strips NUL and truncates or drops against the route's
+      limits, so a 422 means the two copies drifted: ERROR once, then WARNING.
+  - **Skips:** a poll makes no request while risk-shield's Finnhub cooldown
+    (429 15 min, 401/403 1 h) or data-engine's `tf:cache:finnhub` (read-only)
+    is running.
+  - **Success** is a non-empty page, at least one item kept and every chunk
+    answering 200. An overlap WARNING fires when the page's oldest item is
+    newer than the previous success.
+  - **`/health`** adds `newsPollEnabled`, `lastNewsPollAt` (the last
+    success), `newsPageSpanMinutes`, `newsOldestAt`, `newsLastError` and
+    `finnhubConfigured`.
+  - **`newsPollStale`** is true when the poller is on and there has been no
+    success for more than 60 min, whatever the cause. It is on
+    `/market/health` and every `tf:risk:health` publish. **`newsPollStale:
+    null` means the poller is off or its loop has not started yet (for
+    example a boot before its first quarter hour), not "unknown".**
 
 ## Web dashboard
 
@@ -398,7 +452,9 @@ Google-sign-in scaffolding under `web/lib/firebase/` has been removed.
   risk-shield (Part 3.1): profile `dev`, the Dockerfile's `dev` stage,
   source volume-mounted, `tradingfirm_dev` + Redis DB 1, `FRED_API_KEY`
   hard-coded empty, `SCHEDULER_ENABLED=false` and
-  `HEALTH_CHANNEL=tf:risk:dev:health` hard-coded (Part 3.4), and
+  `HEALTH_CHANNEL=tf:risk:dev:health` hard-coded (Part 3.4),
+  `FINNHUB_API_KEY=""`, `NEWS_POLL_ENABLED=false` and
+  `DATA_ENGINE_URL=http://data-engine-dev:8001` hard-coded (Part 3.5), and
   `infra/supabase/migrations` mounted read-only at
   `/migrations` for the tests that assert migration text. Phase 3 tests run
   there:
@@ -420,7 +476,9 @@ scaffold with no business logic. `risk-shield` has its infrastructure
 (config, pool, cache, migration, dev twin) as of Part 3.1 and its two
 data fetchers (core quotes, FRED) as of Part 3.2, its health score and
 regime as of Part 3.3, and a market-hours scheduler plus the `/market/*`
-read endpoints as of Part 3.4, running in prod since 2026-09-10. The `scanner/`
+read endpoints as of Part 3.4, running in prod since 2026-09-10. Part 3.5
+added the econ calendar and the market news poller (with data-engine's
+`POST /news/ingest`); in the repo, not yet deployed to prod. The `scanner/`
 standalone scripts predate the data-engine port and stay only as a frozen
 reference — see [`.agents/AGENTS.md`](../.agents/AGENTS.md) for the full
 rationale.

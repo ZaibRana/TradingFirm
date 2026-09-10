@@ -452,3 +452,45 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 **Why:** the plan row names a cadence, a channel and three endpoints. Each bullet is a place where a plausible default would quietly misbehave: a night check that repeats itself, Redis DB 1 assumed to isolate pub/sub, a symmetric CRITICAL bypass, one `previousScore` meaning two things, an unpinned worker count.
 
 **Supersedes:** plan row 3.4's "every 30 min otherwise using futures (`ES=F NQ=F`) + VIX", which moves to Part 3.4b.
+
+---
+
+## 2026-09-10 — Part 3.4b (night mode) goes after 3.6
+
+**Decision:** Phase 3 order is 3.5 → 3.6 → 3.4b. 3.4b's scope is unchanged (entry above).
+
+- Until 3.4b lands, the 3.6 briefs see session checks only. The 07:30 ET brief reads the previous 16:20 settle row, with no overnight futures and no 08:00 pre-market check.
+- The brief's "on regime change" trigger can only fire between 09:30 and 16:20 ET.
+
+**Why:** 3.6 is the first consumer of night data. 3.4b's spec can't be written until the live `ES=F` / `NQ=F` evening-bar dating check has run. Sequencing 3.4b after 3.6 lets that check run against a working brief.
+
+**Supersedes:** the plan §17 order 3.4 → 3.5 → 3.6, for 3.4b only.
+
+---
+
+## 2026-09-10 — Market news + econ calendar (Part 3.5)
+
+**Decision:** approved spec `docs/specs/3.5.md` (v2, plus additions 8–9 and the correction after the live check). What later parts build on:
+
+- **risk-shield polls, data-engine stores.** Finnhub `/news?category=general` every 15 min, around the clock → `POST /news/ingest` → `_MARKET` rows. Prod only (`NEWS_POLL_ENABLED`); the twin targets `data-engine-dev`.
+- **No `minId`.** Live 2026-09-10: a 100-item page spanning ~41 h, ids in pickup order, not publish order. Every poll sends the whole page, and `ON CONFLICT (ticker, url)` absorbs the repeats. An overlap WARNING and `/health`'s page span show a shrinking page. If it ever spans under 15 min, revisit `minId` with a pickup-order check (spec, carried forward).
+- **One limits table, two pinned copies:** url 2,048, title 1,000, summary 10,000, source 100, 200 items, no NUL. The converter truncates or drops before sending, so a 422 means the copies drifted: ERROR once, then WARNING per slot.
+- **Finnhub 429s are account-level.** Before calling, the poller also reads data-engine's `tf:cache:finnhub` (read-only, fail-open).
+- **Success** is a non-empty page, at least one item kept, and every chunk answering 200.
+- **`newsPollStale`** means no success (or, before any, no start) for more than 60 min. It is on `/market/health` and every publish, and `null` when the poller is off or hasn't started.
+- **The econ calendar is a file:** FOMC, CPI and jobs dates for Q3–Q4 2026 from the Fed and BLS pages. Renew by 2026-12-17; `/health` and a daily WARNING say when.
+- **Deferred to Phase 6's first row (ops alerting):** every feed-stopping condition as `errors: [{source, since, message}]` in the health payload. 3.5 ships only `newsPollStale` + `newsLastError`.
+
+**Why:** each bullet is a place where a plausible default would have quietly lost or blocked news: `minId` over pickup-order ids, a route stricter than its sender, per-service cooldowns on one account, a `null` read as "unknown".
+
+**Supersedes:** N/A.
+
+---
+
+## 2026-09-10 — An addition after approval re-cuts its commit's band
+
+**Decision:** an addition folded into an approved spec re-cuts the estimate band of the commit it lands in, in the same spec edit.
+
+**Why:** Part 3.5's addition 8 landed after the bands were set, and 4c's band (208–288) was never re-cut. 4c measured 529 and was split into 4c-1 / 4c-2 at commit time.
+
+**Supersedes:** N/A.

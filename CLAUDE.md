@@ -6,7 +6,7 @@ Guidance for Claude Code working in this repository.
 
 TradingFirm — a day-trading system that screens the market, applies technical filters, and surfaces trade candidates. FastAPI microservices + a Next.js dashboard, with Postgres and Redis as shared infrastructure.
 
-**Service status** (don't assume otherwise): `data-engine` and the web dashboard are functional. `risk-shield` has its regime path (Part 3.1: config, pool, cache, bounded lifespan, `risk.macro_briefs`; Part 3.2: core-quotes and FRED fetchers in `monitors/`; Part 3.3: six regime monitors, `scoring/` health score + regime; Part 3.4: an XNYS-gated scheduler writing `risk.health_checks` and publishing `tf:risk:health`, plus `GET /market/health`, `/market/indicators`, `/market/history`). Night mode (3.4b), market news, the econ calendar and the macro brief do not exist yet. `signal-engine` and `ai-agent` are empty FastAPI scaffolds.
+**Service status** (don't assume otherwise): `data-engine` and the web dashboard are functional. `risk-shield` has its regime path (Part 3.1: config, pool, cache, bounded lifespan, `risk.macro_briefs`; Part 3.2: core-quotes and FRED fetchers in `monitors/`; Part 3.3: six regime monitors, `scoring/` health score + regime; Part 3.4: an XNYS-gated scheduler writing `risk.health_checks` and publishing `tf:risk:health`, plus `GET /market/health`, `/market/indicators`, `/market/history`; Part 3.5: `GET /market/calendar` from a hand-maintained file, and a news poller sending Finnhub general news to data-engine's `POST /news/ingest`). Night mode (3.4b) and the macro brief do not exist yet. `signal-engine` and `ai-agent` are empty FastAPI scaffolds.
 
 ## Read `.agents/AGENTS.md` first
 
@@ -42,16 +42,16 @@ uvicorn main:app --reload --port 8001
 ```
 **8001 is prod** (`tf-data-engine`, live yfinance, real keys); **8011 is the dev twin** (`tf-data-engine-dev`, fixture provider, empty Finnhub key, own database `tradingfirm_dev`, Redis DB 1). Verify parts on 8011; use 8001 for real scans.
 
-**risk-shield: 8003 is prod** (`tf-risk-shield`, real `FRED_API_KEY`); **8013 is its dev twin** (`tf-risk-shield-dev`, empty FRED key, `tradingfirm_dev`, Redis DB 1). Tests run there:
+**risk-shield: 8003 is prod** (`tf-risk-shield`, real `FRED_API_KEY` and `FINNHUB_API_KEY`); **8013 is its dev twin** (`tf-risk-shield-dev`, empty FRED and Finnhub keys, `tradingfirm_dev`, Redis DB 1, data-engine = `data-engine-dev`). Tests run there:
 ```bash
 docker compose --profile dev up -d --build risk-shield-dev
-docker exec tf-risk-shield-dev pytest tests/test_config.py tests/test_cache.py tests/test_db.py tests/test_lifespan.py tests/test_health.py tests/test_migration.py tests/test_ratelimit.py tests/test_fred_client.py tests/test_monitors_data.py tests/test_live_guard.py tests/test_monitors.py tests/test_scoring.py tests/test_scheduler_gating.py tests/test_alert_throttle.py tests/test_scheduler.py tests/test_market_endpoints.py -v
+docker exec tf-risk-shield-dev pytest tests/test_config.py tests/test_cache.py tests/test_db.py tests/test_lifespan.py tests/test_health.py tests/test_migration.py tests/test_ratelimit.py tests/test_fred_client.py tests/test_monitors_data.py tests/test_live_guard.py tests/test_monitors.py tests/test_scoring.py tests/test_scheduler_gating.py tests/test_alert_throttle.py tests/test_scheduler.py tests/test_market_endpoints.py tests/test_finnhub_client.py tests/test_calendar.py tests/test_market_news.py -v
 ```
 
 Tests run inside `tf-data-engine-dev` (host pandas ≠ pinned version). It is a separate container from prod `tf-data-engine`, so prod keeps running: fixture provider, its own database `tradingfirm_dev`, Redis DB 1, pytest baked in via the Dockerfile `dev` stage. Rebuild with `--build` after changing `requirements*.txt`:
 ```bash
 docker compose --profile dev up -d data-engine-dev
-docker exec tf-data-engine-dev pytest tests/test_fixture_provider.py tests/test_provider_factory.py tests/test_scanner_pipeline.py -v
+docker exec tf-data-engine-dev pytest tests/test_fixture_provider.py tests/test_provider_factory.py tests/test_scanner_pipeline.py tests/test_news_ingest.py -v
 ./scripts/dev-db.sh                  # once: create tradingfirm_dev + apply migrations (only needed to poke the dev API on :8011)
 ```
 
@@ -87,7 +87,7 @@ Requires `.env` with `DB_PASSWORD` set — compose fails fast without it.
 ## Never touch / handle with care
 
 - **Name the `test_*.py` files when running pytest** in `services/data-engine`. `pytest.ini` (`testpaths = tests`, `python_files = test_*.py`) now keeps a bare `pytest` from collecting `tests/full_scan_test.py`, which fires a real Finviz + yfinance scan on import — naming files is habit and belt-and-braces, no longer the only guard.
-- **`tests/smoke_test_pipeline.py`, `tests/full_scan_test.py`, `tests/record_fixture_live.py`, `tests/record_finnhub_live.py`, `tests/record_edgar_live.py`, `tests/record_earnings_live.py`, `tests/dossier_live.py`** are live-API scripts. Run manually and deliberately, never in CI. Same for risk-shield's **`tests/fred_live.py`, `tests/quotes_live.py`**, which run only through the isolated `docker run` lines in `docs/specs/3.2.md` decision 11 (no compose network, unroutable `DATABASE_URL`/`REDIS_URL`, only `FRED_API_KEY` from `.env`); `tests/live_guard.py` exits 2 otherwise.
+- **`tests/smoke_test_pipeline.py`, `tests/full_scan_test.py`, `tests/record_fixture_live.py`, `tests/record_finnhub_live.py`, `tests/record_edgar_live.py`, `tests/record_earnings_live.py`, `tests/dossier_live.py`** are live-API scripts. Run manually and deliberately, never in CI. Same for risk-shield's **`tests/fred_live.py`, `tests/quotes_live.py`, `tests/finnhub_news_live.py`**, which run only through the isolated `docker run` lines in `docs/specs/3.2.md` decision 11 (no compose network, unroutable `DATABASE_URL`/`REDIS_URL`, only the one key they need from `.env`; the Finnhub one writes the 20-item fixture, spec 3.5 decision 10); `tests/live_guard.py` exits 2 otherwise.
 - **One live scan pipeline: `services/data-engine`** (proxied by `web/app/api/scanner/pro/route.js`). `scanner/` is a frozen reference — don't build on it (`scanner/README.md`). Its `results.json`/`status.json` are generated output.
 - **G15 here means**: prod `./scripts/migrate.sh` and `docker compose up -d data-engine` (any prod service) wait for a go. So does `docker compose build <service>`: it moves the tag compose deploys — verify a prod stage with `docker build --target prod -t tradingfirm-<service>:verify` instead. `scripts/dev-db.sh` and the dev twin need no ask. Parts that applied prod migrations before the rule: 0.2, 1.1, 2.1.
 - **Migrations must be re-runnable**: `IF NOT EXISTS` everywhere, no plain `INSERT` seeds. Why: `scripts/migrate.sh` header, `docs/decisions.md` 2026-09-05.
@@ -98,5 +98,14 @@ Requires `.env` with `DB_PASSWORD` set — compose fails fast without it.
   - The dev twin hard-codes `SCHEDULER_ENABLED=false`, because it has no quotes fixture.
   - The twin also hard-codes `HEALTH_CHANNEL=tf:risk:dev:health`, because Redis pub/sub ignores the DB index. `test_twin_never_publishes_on_prod_channel` guards it.
   - Never drop either override. Keep `--workers 1` pinned in the Dockerfile: two workers are two schedulers.
+- **risk-shield's news poller calls Finnhub every 15 min, around the clock** (Part 3.5). It runs only where `NEWS_POLL_ENABLED=true` (the prod compose service).
+  - The dev twin hard-codes `NEWS_POLL_ENABLED=false`, `FINNHUB_API_KEY=""` and `DATA_ENGINE_URL=http://data-engine-dev:8001`, so it can never poll or write into prod's database. `test_twin_never_ingests_into_prod_data_engine` guards all three. Never drop them.
+  - **The news limits exist twice**, as `NEWS_*` in data-engine's `main.py` (the route's 422) and in risk-shield's `news_poller.py` (the converter). `test_ingest_limits_pinned_to_spec` and `test_converter_limits_pinned_to_spec` pin both. Change both or neither: a drift means a 422 on every poll.
+  - **risk-shield reads data-engine's Redis key `tf:cache:finnhub`** (read-only, fail-open), because a Finnhub 429 is account-level. Renaming data-engine's Finnhub cooldown means changing `DATA_ENGINE_FINNHUB_COOLDOWN_KEY` too; tests on both sides pin the name.
+- **The econ calendar is a hand-maintained file, `services/risk-shield/data/econ_calendar.json`, covering through 2026-12-31.** Renew it by 14 days before `coversThrough` (2026-12-17). From then on `/health`'s `calendarCoverageShort` turns true, and the news poller logs a daily WARNING. The renewal step:
+  1. Fetch the Fed and BLS schedules: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm, https://www.bls.gov/schedule/news_release/cpi.htm, https://www.bls.gov/schedule/news_release/empsit.htm
+  2. Append the next quarter's FOMC decisions (14:00 ET, second meeting day), CPI releases and jobs reports (08:30 ET). Move `coversThrough` and `retrieved`.
+  3. Update `SPEC_TABLE` and the coverage asserts in `tests/test_calendar.py` to match, and run it in the twin.
+  4. The file ships in the prod image, so the prod rebuild waits for a go (G15).
 - **SEC EDGAR needs a declared `User-Agent`** (`EDGAR_USER_AGENT="<app> <email>"`, header only, never a URL or a fixture); one process-wide limiter of 10 req/s (the SEC cap), and a 403 means blocked: stop, never retry.
 - **Never write into another service's Postgres schema** (`data_engine`, `signals`, `risk`, `users`, `ai`). Cross-service communication is HTTP + Redis pub/sub only.
