@@ -43,7 +43,7 @@ pub/sub, never by writing into another service's tables.
 |---|---|---|---|
 | `data-engine` | 8001 | **Functional** | Finviz screening → yfinance OHLCV → technical filters → enrichment. The only backend service with real logic. |
 | `signal-engine` | 8002 | Empty scaffold | Intended for entry/exit signal detection (zones, patterns). Only `/health` and `/` exist. |
-| `risk-shield` | 8003 | **Skeleton** | Market health scoring and regime detection (Phase 3). Part 3.1 gave it `config.py` / `db.py` / `cache.py`, a bounded fail-open lifespan and the `risk.macro_briefs` table; Part 3.2 added the two data fetchers (`monitors/quotes.py`, `monitors/fred.py`), which no endpoint calls yet. The endpoints are still `/health` (reporting `db_connected` / `redis_connected` / `fredConfigured`) and `/`. Monitors, scoring and `/market/*` land in 3.3–3.4. |
+| `risk-shield` | 8003 | **Skeleton** | Market health scoring and regime detection (Phase 3). Part 3.1 gave it `config.py` / `db.py` / `cache.py`, a bounded fail-open lifespan and the `risk.macro_briefs` table; Part 3.2 added the two data fetchers (`monitors/quotes.py`, `monitors/fred.py`); Part 3.3 added the six regime monitors, the health score and the regime classifier (`scoring/`). Nothing calls them yet. The endpoints are still `/health` (reporting `db_connected` / `redis_connected` / `fredConfigured`) and `/`. The scheduler and `/market/*` land in 3.4. |
 | `ai-agent` | 8004 | Empty scaffold | Intended for trade grading via an LLM (`LLM_PROVIDER` env var supports Gemini/Anthropic). Only `/health` and `/` exist. |
 | `web` (dashboard) | 3000 | **Functional** | Next.js UI showing scan results, stock cards, market status. |
 
@@ -262,8 +262,9 @@ FastAPI app. Key pieces:
 ## Risk Shield service
 
 [`services/risk-shield`](../services/risk-shield) holds the Phase 3 regime
-inputs. As of Part 3.2 (spec `docs/specs/3.2.md`) these are library
-modules with no endpoint or scheduler yet (3.4 adds both):
+inputs (Part 3.2, spec `docs/specs/3.2.md`) and the health score built on
+them (Part 3.3, spec `docs/specs/3.3.md`). All of it is library modules
+with no endpoint or scheduler yet (3.4 adds both):
 
 - **`monitors/quotes.py`** — `get_core_quotes(r, memory)`: one yfinance
   1.5.1 `download` of the 17 core tickers (`SPY QQQ RSP ^VIX TLT GLD UUP
@@ -299,6 +300,31 @@ modules with no endpoint or scheduler yet (3.4 adds both):
   default bridge network, unroutable `DATABASE_URL` / `REDIS_URL`, and
   only `FRED_API_KEY` taken from `.env`. `tests/live_guard.py` refuses a
   prod-looking environment.
+- **`quotes.get_quotes_view(r, memory)`** is what the monitors read.
+  - Every full quotes answer is also kept 24 h under
+    `tf:risk:cache:quotes_last`.
+  - On a cooldown, refusal, error or empty download, the view serves that
+    copy with every ticker stale.
+  - A partial download is filled per ticker.
+  - With nothing to serve it is empty (`source: "none"`); it never raises.
+- **`monitors/series.py`** pairs tickers only through `align()`, an inner
+  join on date. A same-day bar downloaded before 16:15 ET is partial and
+  dropped (`zoneinfo` America/New_York).
+- **`monitors/regime.py`** holds six pure monitors, each returning `{score,
+  raw, detail, stale}`, registered in `MONITORS` with Part 5's weights:
+  - `vix` (25) reads `^VIX` directly, intraday level included
+  - `breadth` (20) is the RSP/SPY 20-day slope; `adRatio` is null
+  - `spy_trend` (20) uses EMA 20/50/200 and lower lows
+  - `sector_rotation` (15) is the offensive vs defensive 5-day spread
+  - `volume` (10) is SPY+QQQ against the 20-day average
+  - `cross_asset` (10) is the 1-day TLT/GLD/UUP/SPY moves
+- **`scoring/`**:
+  - `health_calculator.compute_health(r, memory)` runs the view, then the
+    monitors, then the integer-weighted, half-up score. Monitors without a
+    score are left out, and a covered weight below 70 gives no score.
+  - `regime_classifier.classify()` maps the score to HEALTHY ≥ 70 /
+    CAUTIOUS ≥ 40 / DANGER ≥ 20 / CRITICAL.
+  - The thresholds Part 5 doesn't give are provisional (`docs/decisions.md`).
 
 ## Web dashboard
 
@@ -357,8 +383,8 @@ downstream of that — actually generating trade signals (`signal-engine`)
 and grading trades with AI (`ai-agent`) — is still an empty FastAPI
 scaffold with no business logic. `risk-shield` has its infrastructure
 (config, pool, cache, migration, dev twin) as of Part 3.1 and its two
-data fetchers (core quotes, FRED) as of Part 3.2, but no scoring,
-endpoint or scheduler yet. The `scanner/`
+data fetchers (core quotes, FRED) as of Part 3.2, and its health score
+and regime as of Part 3.3, but no endpoint or scheduler yet. The `scanner/`
 standalone scripts predate the data-engine port and stay only as a frozen
 reference — see [`.agents/AGENTS.md`](../.agents/AGENTS.md) for the full
 rationale.

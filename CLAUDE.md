@@ -6,7 +6,7 @@ Guidance for Claude Code working in this repository.
 
 TradingFirm — a day-trading system that screens the market, applies technical filters, and surfaces trade candidates. FastAPI microservices + a Next.js dashboard, with Postgres and Redis as shared infrastructure.
 
-**Service status** (don't assume otherwise): `data-engine` and the web dashboard are functional. `risk-shield` is a skeleton (Part 3.1: config, pool, cache, bounded lifespan, `risk.macro_briefs`; Part 3.2: core-quotes and FRED fetchers in `monitors/`, not called by any endpoint yet) with no scoring — only `/health` and `/` exist. `signal-engine` and `ai-agent` are empty FastAPI scaffolds.
+**Service status** (don't assume otherwise): `data-engine` and the web dashboard are functional. `risk-shield` is a skeleton (Part 3.1: config, pool, cache, bounded lifespan, `risk.macro_briefs`; Part 3.2: core-quotes and FRED fetchers in `monitors/`; Part 3.3: six regime monitors, `scoring/` health score + regime, not called by any endpoint or scheduler yet) — only `/health` and `/` exist. `signal-engine` and `ai-agent` are empty FastAPI scaffolds.
 
 ## Read `.agents/AGENTS.md` first
 
@@ -45,7 +45,7 @@ uvicorn main:app --reload --port 8001
 **risk-shield: 8003 is prod** (`tf-risk-shield`, real `FRED_API_KEY`); **8013 is its dev twin** (`tf-risk-shield-dev`, empty FRED key, `tradingfirm_dev`, Redis DB 1). Tests run there:
 ```bash
 docker compose --profile dev up -d --build risk-shield-dev
-docker exec tf-risk-shield-dev pytest tests/test_config.py tests/test_cache.py tests/test_db.py tests/test_lifespan.py tests/test_health.py tests/test_migration.py tests/test_ratelimit.py tests/test_fred_client.py tests/test_monitors_data.py tests/test_live_guard.py -v
+docker exec tf-risk-shield-dev pytest tests/test_config.py tests/test_cache.py tests/test_db.py tests/test_lifespan.py tests/test_health.py tests/test_migration.py tests/test_ratelimit.py tests/test_fred_client.py tests/test_monitors_data.py tests/test_live_guard.py tests/test_monitors.py tests/test_scoring.py -v
 ```
 
 Tests run inside `tf-data-engine-dev` (host pandas ≠ pinned version). It is a separate container from prod `tf-data-engine`, so prod keeps running: fixture provider, its own database `tradingfirm_dev`, Redis DB 1, pytest baked in via the Dockerfile `dev` stage. Rebuild with `--build` after changing `requirements*.txt`:
