@@ -207,3 +207,168 @@ async def test_inputs_settle_present_or_absent():
 
     _, settle = await macro_inputs.health_section(HealthPool(latest=_row(et(2026, 9, 10, 16, 0))), now)
     assert settle == {"present": False, "checkedAt": None, "score": None}
+
+
+# ── News section (commit 4b) ─────────────────────────────────────
+
+import asyncio
+from types import SimpleNamespace
+
+import httpx
+
+import news_poller
+
+DE_URL = "http://data-engine-dev:8001"
+
+
+@pytest.fixture(autouse=True)
+def _news_env(monkeypatch):
+    monkeypatch.setattr(macro_inputs.settings, "data_engine_url", DE_URL)
+    macro_inputs._bad_body_logged.clear()
+
+
+def _item(i, **over):
+    body = {"publishedAt": f"2026-09-10T17:{i:02d}:00+00:00", "source": "CNBC", "title": f"Headline {i}",
+            "summary": f"Summary {i}", "url": f"https://example.com/{i}"}
+    body.update(over)
+    return body
+
+
+def _http(handler):
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False)
+
+
+def _answer(status=200, json_body=None, content=None, seen=None):
+    def handler(request):
+        if seen is not None:
+            seen.append(request)
+        if content is not None:
+            return httpx.Response(status, content=content)
+        return httpx.Response(status, json=json_body)
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_inputs_news_from_data_engine():
+    body = [_item(30), _item(20, title="T" * 400, source=None, summary=None), _item(10, summary="S" * 500)]
+    async with _http(_answer(json_body=body)) as http:
+        news = await macro_inputs.news_section(http)
+    assert news == {
+        "status": "ok", "cause": None, "hours": 24, "limit": 50, "count": 3, "truncated": 2,
+        "trimmedForSize": 0,
+        "items": [
+            {"publishedAt": "2026-09-10T17:30:00+00:00", "source": "CNBC", "title": "Headline 30",
+             "summary": "Summary 30"},
+            {"publishedAt": "2026-09-10T17:20:00+00:00", "source": None, "title": "T" * 300, "summary": ""},
+            {"publishedAt": "2026-09-10T17:10:00+00:00", "source": "CNBC", "title": "Headline 10",
+             "summary": "S" * 300},
+        ],
+    }
+    assert all("url" not in item for item in news["items"])
+
+
+@pytest.mark.asyncio
+async def test_inputs_news_request_within_route_bounds():
+    seen = []
+    async with _http(_answer(json_body=[_item(1)], seen=seen)) as http:
+        await macro_inputs.news_section(http)
+    (request,) = seen
+    assert request.method == "GET"
+    assert str(request.url).split("?")[0] == f"{DE_URL}/news/market"
+    assert dict(request.url.params) == {"hours": "24", "limit": "50"}
+    # The pinned copy of data-engine's bounds (spec 3.6a decision 2).
+    assert (macro_inputs.DATA_ENGINE_NEWS_MAX_HOURS, macro_inputs.DATA_ENGINE_NEWS_MAX_LIMIT) == (168, 100), (
+        "data-engine's GET /news/market bounds are pinned there by "
+        "test_news_market_bounds_pinned_for_risk_shield. Change both.")
+    assert 1 <= macro_inputs.NEWS_HOURS <= macro_inputs.DATA_ENGINE_NEWS_MAX_HOURS
+    assert 1 <= macro_inputs.NEWS_LIMIT <= macro_inputs.DATA_ENGINE_NEWS_MAX_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_inputs_news_empty_is_flagged():
+    """An empty 24 h is a failure of the feed, not a quiet day: the section
+    says so, and the anyStale truth table (commit 4c) counts it."""
+    async with _http(_answer(json_body=[])) as http:
+        news = await macro_inputs.news_section(http)
+    assert (news["status"], news["count"], news["items"], news["cause"]) == ("empty", 0, [], None)
+    state = SimpleNamespace(news_status=news_poller.initial_news_status())
+    assert macro_inputs.news_freshness(news, state, et(2026, 9, 10, 14, 7))["newsStatus"] == "empty"
+
+
+def _raise(exc):
+    def handler(request):
+        raise exc
+    return handler
+
+
+async def _slow(request):
+    await asyncio.sleep(1)
+    return httpx.Response(200, json=[])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler, cause", [
+    (_raise(httpx.ConnectError("refused")), "ConnectError"),
+    (_raise(httpx.ReadTimeout("slow")), "timeout"),
+    (_slow, "timeout"),
+    (_answer(307), "HTTP 307"),
+    (_answer(404, json_body={"detail": "Not Found"}), "HTTP 404"),
+    (_answer(422, json_body={"detail": []}), "HTTP 422"),
+    (_answer(500, content=b"boom"), "HTTP 500"),
+    (_answer(503, json_body={"detail": "database unavailable"}), "HTTP 503"),
+], ids=["transport", "httpx-timeout", "hard-timeout", "307", "404", "422", "500", "503"])
+async def test_inputs_news_unavailable(handler, cause, monkeypatch, caplog):
+    monkeypatch.setattr(macro_inputs, "NEWS_TIMEOUT", 0.05)
+    calls = []
+
+    async def counting(request):
+        calls.append(request)
+        result = handler(request)
+        return await result if asyncio.iscoroutine(result) else result
+
+    with caplog.at_level(logging.WARNING, logger="macro_inputs"):
+        async with _http(counting) as http:
+            news = await macro_inputs.news_section(http)
+    assert (news["status"], news["cause"], news["items"]) == ("unavailable", cause, [])
+    assert len(calls) == 1                     # no retry, no redirect followed
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
+
+
+@pytest.mark.asyncio
+async def test_inputs_news_bad_body(caplog):
+    bodies = [
+        ({"items": []}, "not a list"),
+        ([_item(1), {k: v for k, v in _item(2).items() if k != "title"}], "item missing title"),
+    ]
+    with caplog.at_level(logging.DEBUG, logger="macro_inputs"):
+        for body, _ in bodies + bodies:          # each problem twice
+            async with _http(_answer(json_body=body)) as http:
+                news = await macro_inputs.news_section(http)
+            assert (news["status"], news["cause"], news["items"]) == ("unavailable", "bad body", [])
+        async with _http(_answer(content=b"<html>")) as http:
+            assert (await macro_inputs.news_section(http))["cause"] == "bad body"
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 3                      # one per distinct problem, never repeated
+    assert any("not a list" in m for m in errors) and any("item missing title" in m for m in errors)
+    assert any("not JSON" in m for m in errors)
+
+
+def test_inputs_freshness_carries_news_poll_state(monkeypatch):
+    now = et(2026, 9, 10, 14, 7)
+    news = {"status": "ok"}
+    status = news_poller.initial_news_status()
+    status.update(startedAt=(now - timedelta(hours=5)).isoformat(),
+                  lastSuccessAt=(now - timedelta(minutes=61)).isoformat(), lastError="ingest: HTTP 503")
+    state = SimpleNamespace(news_status=status)
+
+    monkeypatch.setattr(news_poller.settings, "news_poll_enabled", True)
+    fresh = macro_inputs.news_freshness(news, state, now)
+    assert fresh == {"newsStatus": "ok", "newsPollStale": True, "lastNewsPollAt": status["lastSuccessAt"],
+                     "newsLastError": "ingest: HTTP 503"}
+    assert {k: fresh[k] for k in news_poller.stale_view(state, now)} == news_poller.stale_view(state, now)
+
+    status["lastSuccessAt"] = (now - timedelta(minutes=60)).isoformat()
+    assert macro_inputs.news_freshness(news, state, now)["newsPollStale"] is False
+
+    monkeypatch.setattr(news_poller.settings, "news_poll_enabled", False)
+    assert macro_inputs.news_freshness(news, state, now)["newsPollStale"] is None
