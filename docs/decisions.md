@@ -296,3 +296,29 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 **Why:** two trackers means neither is trusted. §12 asks for an edit to a read-only file, so it loses to the docs-discipline rule every time; `progress.md` carries the commit, the date and the caveats anyway.
 
 **Supersedes:** the plan's §1 instruction "tick the box in §12".
+
+---
+
+## 2026-09-10 — Verify a prod Dockerfile stage under a separate tag
+
+**Decision:** To check that a prod stage still builds, use `docker build --target prod -t tradingfirm-<service>:verify services/<service>` — never `docker compose build <service>` outside a G15 go. The image tag compose tracks only moves on the approved `docker compose up -d --build <service>`.
+
+**Why:** in Part 3.1 a verification `docker compose build risk-shield` retagged `tradingfirm-risk-shield:latest`, so any later plain `up -d` would deploy it. Building the compose-tracked tag is half a deploy. (The 3.1 recreate itself was the operator's own `up`, not this — the rule is hygiene regardless.)
+
+**Supersedes:** N/A.
+
+---
+
+## 2026-09-10 — Part 3.1 → 3.2 carry-forward
+
+**Decision:** facts from 3.1 that 3.2 (core quotes + FRED) must build on, recorded here because none are in the spec or the plan row:
+
+- **A fetcher must never return `None` into `cached_json`.** A cached JSON `null` reads back as `None`, which `cached_json` treats as a miss — so a quotes fetch that returns `None` (empty yfinance download) is re-fetched on *every* call, and the 5-minute cache silently stops protecting yfinance (G6). Raise a typed error, or return an empty `{}` / `[]` (empty is cached).
+- **No cooldown helpers exist in risk-shield.** data-engine's `MemoryCooldowns` / `cooldown_remaining` / `start_cooldown` were not copied into `cache.py`; a yfinance or FRED refusal has nowhere to record a cooldown until 3.2 copies them (under `tf:risk:`) or specs its own.
+- **No yfinance, pandas, numpy or provider layer.** risk-shield cannot import data-engine's `providers` (no shared package). Add them at data-engine's pins — `yfinance==1.5.1`, `pandas==2.3.0`, `numpy==2.3.0` — so `YFRateLimitError` and `read_json` behave identically, copy the `ProviderRateLimited` pattern, and add `respx==0.22.0` to `requirements-dev.txt`. Rebuild the twin with `docker compose --profile dev up -d --build risk-shield-dev` after the change.
+- **The FRED live canary cannot run in the dev twin** — it hard-codes `FRED_API_KEY=""` by design. Run it as data-engine's 2.3 canary ran: a throwaway prod-image container with the source mounted, `docker compose run --rm --no-deps -v ./services/risk-shield:/app risk-shield python tests/<name>_live.py`. That container carries prod's `DATABASE_URL` / `REDIS_URL`, so a canary script must write neither.
+- **`tests/` is a package** (`tests/__init__.py`): shared helpers import as `from tests.fake_redis import FakeRedis`, not `from fake_redis import`.
+
+**Why:** 3.2 opens in a fresh chat that reads these docs, not the 3.1 conversation. The first two are G6 traps that pass every mocked test.
+
+**Supersedes:** N/A.

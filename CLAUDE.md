@@ -6,7 +6,7 @@ Guidance for Claude Code working in this repository.
 
 TradingFirm — a day-trading system that screens the market, applies technical filters, and surfaces trade candidates. FastAPI microservices + a Next.js dashboard, with Postgres and Redis as shared infrastructure.
 
-**Service status** (don't assume otherwise): `data-engine` and the web dashboard are functional. `signal-engine`, `risk-shield`, and `ai-agent` are empty FastAPI scaffolds — only `/health` and `/` exist.
+**Service status** (don't assume otherwise): `data-engine` and the web dashboard are functional. `risk-shield` is a skeleton (Part 3.1: config, pool, cache, bounded lifespan, `risk.macro_briefs`) with no market logic — only `/health` and `/` exist. `signal-engine` and `ai-agent` are empty FastAPI scaffolds.
 
 ## Read `.agents/AGENTS.md` first
 
@@ -41,6 +41,12 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8001
 ```
 **8001 is prod** (`tf-data-engine`, live yfinance, real keys); **8011 is the dev twin** (`tf-data-engine-dev`, fixture provider, empty Finnhub key, own database `tradingfirm_dev`, Redis DB 1). Verify parts on 8011; use 8001 for real scans.
+
+**risk-shield: 8003 is prod** (`tf-risk-shield`, real `FRED_API_KEY`); **8013 is its dev twin** (`tf-risk-shield-dev`, empty FRED key, `tradingfirm_dev`, Redis DB 1). Tests run there:
+```bash
+docker compose --profile dev up -d --build risk-shield-dev
+docker exec tf-risk-shield-dev pytest tests/test_config.py tests/test_cache.py tests/test_db.py tests/test_lifespan.py tests/test_health.py tests/test_migration.py -v
+```
 
 Tests run inside `tf-data-engine-dev` (host pandas ≠ pinned version). It is a separate container from prod `tf-data-engine`, so prod keeps running: fixture provider, its own database `tradingfirm_dev`, Redis DB 1, pytest baked in via the Dockerfile `dev` stage. Rebuild with `--build` after changing `requirements*.txt`:
 ```bash
@@ -83,7 +89,7 @@ Requires `.env` with `DB_PASSWORD` set — compose fails fast without it.
 - **Name the `test_*.py` files when running pytest** in `services/data-engine`. `pytest.ini` (`testpaths = tests`, `python_files = test_*.py`) now keeps a bare `pytest` from collecting `tests/full_scan_test.py`, which fires a real Finviz + yfinance scan on import — naming files is habit and belt-and-braces, no longer the only guard.
 - **`tests/smoke_test_pipeline.py`, `tests/full_scan_test.py`, `tests/record_fixture_live.py`, `tests/record_finnhub_live.py`, `tests/record_edgar_live.py`, `tests/record_earnings_live.py`, `tests/dossier_live.py`** are live-API scripts. Run manually and deliberately, never in CI.
 - **One live scan pipeline: `services/data-engine`** (proxied by `web/app/api/scanner/pro/route.js`). `scanner/` is a frozen reference — don't build on it (`scanner/README.md`). Its `results.json`/`status.json` are generated output.
-- **G15 here means**: prod `./scripts/migrate.sh` and `docker compose up -d data-engine` (any prod service) wait for a go. `scripts/dev-db.sh` and the dev twin need no ask. Parts that applied prod migrations before the rule: 0.2, 1.1, 2.1.
+- **G15 here means**: prod `./scripts/migrate.sh` and `docker compose up -d data-engine` (any prod service) wait for a go. So does `docker compose build <service>`: it moves the tag compose deploys — verify a prod stage with `docker build --target prod -t tradingfirm-<service>:verify` instead. `scripts/dev-db.sh` and the dev twin need no ask. Parts that applied prod migrations before the rule: 0.2, 1.1, 2.1.
 - **Migrations must be re-runnable**: `IF NOT EXISTS` everywhere, no plain `INSERT` seeds. Why: `scripts/migrate.sh` header, `docs/decisions.md` 2026-09-05.
 - **Alpha Vantage takes its key as a query parameter** (`apikey=`; no header form exists), the one approved exception to "secrets never in URLs" (spec 2.3 decision 13). Two conditions hold it in place, both in `providers/context/alphavantage_client.py`: the `httpx` logger is pinned to WARNING there (at INFO it logs the full URL), and typed errors never chain or format the httpx exception (`raise ... from None`; `HTTPStatusError.__str__` carries the URL). Never log `resp.url`. Free tier: 5 req/min, 25/day, and the daily cap arrives as HTTP 200 with an `Information` body, not a 429.
 - **SEC EDGAR needs a declared `User-Agent`** (`EDGAR_USER_AGENT="<app> <email>"`, header only, never a URL or a fixture); one process-wide limiter of 10 req/s (the SEC cap), and a 403 means blocked: stop, never retry.
