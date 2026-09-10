@@ -487,7 +487,121 @@ async def test_poll_once_repeat_page_is_resent_whole():
     assert redis.get_calls == [] and redis.set_calls == []          # no state consulted or kept
 
 
+# ── run_news_poller (commit 4c-2) ────────────────────────────────
+
+class LoopClock:
+    def __init__(self, start):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+
+def EXACT(delay):
+    return delay
+
+
+def EARLY(delay):
+    return delay - 60
+
+
+def LATE(delay):
+    return delay + 7210            # past eight slots
+
+
+async def _run_loop(monkeypatch, start, steps, poll=None):
+    """Run the real loop on a fake clock. Each sleep applies the next step to
+    the requested delay; "stop" cancels. Returns (state, polls, delays)."""
+    clock = LoopClock(start)
+    polls, delays = [], []
+
+    async def recording(state, client, http, *, clock):
+        polls.append(clock())
+
+    async def sleep(delay):
+        delays.append(delay)
+        step = steps.pop(0)
+        if step == "stop":
+            raise asyncio.CancelledError
+        clock.now += timedelta(seconds=step(delay))
+
+    monkeypatch.setattr(news_poller, "poll_once", poll or recording)
+    state = _state()
+    with pytest.raises(asyncio.CancelledError):
+        await news_poller.run_news_poller(state, object(), object(), clock=clock, sleep=sleep)
+    return state, polls, delays
+
+
+@pytest.mark.asyncio
+async def test_news_loop_one_poll_per_slot_no_catch_up(monkeypatch, caplog):
+    start = datetime(2026, 9, 10, 10, 7, 30, tzinfo=timezone.utc)
+    assert news_poller.next_poll_after(datetime(2026, 9, 10, 10, 15, tzinfo=timezone.utc)) == \
+        datetime(2026, 9, 10, 10, 30, tzinfo=timezone.utc)                  # strictly after
+    assert news_poller.next_poll_after(datetime(2026, 9, 10, 23, 59, 59, tzinfo=timezone.utc)) == \
+        datetime(2026, 9, 11, 0, 0, tzinfo=timezone.utc)
+    with pytest.raises(ValueError):
+        news_poller.next_poll_after(datetime(2026, 9, 10, 10, 0))
+
+    state, polls, delays = await _run_loop(monkeypatch, start, [EXACT, EARLY, EXACT, LATE, EXACT, "stop"])
+    at = lambda h, m, s=0: datetime(2026, 9, 10, h, m, s, tzinfo=timezone.utc)
+    assert polls == [at(10, 15), at(10, 30), at(12, 45, 10), at(13, 0)]     # early wake polls nothing
+    assert delays == [450, 900, 60, 900, 890, 900]                         # no catch-up after the late wake
+    assert _logged(caplog, "missed slots not caught up") == ["WARNING"]
+    assert state.news_status["startedAt"] == start.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_news_loop_calendar_warning_once_per_day(monkeypatch, caplog):
+    renewals = lambda: sum(1 for r in caplog.records if r.name == "news_poller" and "renew by" in r.getMessage())
+    seen = []
+
+    async def poll(state, client, http, *, clock):
+        seen.append(renewals())
+
+    # 2026-12-18: 13 days of coverage left, so short. Two polls that ET day, one the next.
+    next_day = lambda delay: delay + 86400
+    await _run_loop(monkeypatch, datetime(2026, 12, 18, 13, 7, tzinfo=timezone.utc),
+                    [EXACT, EXACT, next_day, "stop"], poll=poll)
+    assert seen == [1, 1, 2]
+
+    caplog.clear()
+    seen.clear()
+    await _run_loop(monkeypatch, datetime(2026, 9, 10, 13, 7, tzinfo=timezone.utc), [EXACT, "stop"], poll=poll)
+    assert seen == [0]                                                     # not short in September
+
+
+@pytest.mark.asyncio
+async def test_news_loop_survives_exception_and_cancels_cleanly(monkeypatch, caplog):
+    start = datetime(2026, 9, 10, 10, 7, 30, tzinfo=timezone.utc)
+    calls = []
+
+    async def flaky(state, client, http, *, clock):
+        calls.append(clock())
+        if len(calls) == 1:
+            raise RuntimeError("bug")
+
+    state, _, _ = await _run_loop(monkeypatch, start, [EXACT, EXACT, "stop"], poll=flaky)
+    assert len(calls) == 2                                                 # the next slot still ran
+    assert _logged(caplog, "News poll raised RuntimeError") == ["ERROR"]
+    assert state.news_status["lastError"] == "poll raised: RuntimeError"
+
+    async def cancelled_mid_poll(state, client, http, *, clock):
+        raise asyncio.CancelledError
+
+    await _run_loop(monkeypatch, start, [EXACT, EXACT], poll=cancelled_mid_poll)   # propagates
+
+    # A real task cancelled during a real sleep ends cancelled, no raise swallowed.
+    task = asyncio.create_task(news_poller.run_news_poller(
+        _state(), object(), object(), clock=lambda: datetime(2026, 9, 10, 10, 0, 1, tzinfo=timezone.utc)))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+
+
 # ── Staleness (commit 4c-1) ──────────────────────────────────────
+
 
 def test_news_poll_stale_after_60_minutes(monkeypatch):
     monkeypatch.setattr(news_poller.settings, "news_poll_enabled", True)

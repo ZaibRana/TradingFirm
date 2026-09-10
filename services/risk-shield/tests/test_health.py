@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 import config
 import main
+import news_poller
 
 
 @pytest.fixture
@@ -78,3 +79,32 @@ def test_health_reports_scheduter_state(stub_state, monkeypatch):
     body = stub_state().get("/health").json()
     assert body["schedulerEnabled"] is True
     assert body["lastCheckAt"] == "2026-09-10T20:20:00+00:00"
+
+
+NEWS_FIELDS = ("newsPollEnabled", "lastNewsPollAt", "newsPageSpanMinutes", "newsOldestAt",
+               "newsLastError", "finnhubConfigured")
+
+
+def test_health_reports_news_poll_state(stub_state, monkeypatch):
+    """Part 3.5: the news poller's state. lastNewsPollAt is the last success,
+    and the page's span / oldest item show a shrinking page before the overlap
+    warning fires. The Finnhub key only ever produces a boolean (G14)."""
+    monkeypatch.setattr(main.settings, "news_poll_enabled", False)
+    monkeypatch.setattr(main.settings, "finnhub_api_key", config.SecretStr(""))
+    monkeypatch.setattr(main.app.state, "news_status", news_poller.initial_news_status(), raising=False)
+    body = stub_state().get("/health").json()
+    assert {k: body[k] for k in NEWS_FIELDS} == dict.fromkeys(NEWS_FIELDS[:-1]) | {
+        "newsPollEnabled": False, "finnhubConfigured": False}
+
+    secret = "FINNHUB-KEY-5d2e9b10"
+    monkeypatch.setattr(main.settings, "news_poll_enabled", True)
+    monkeypatch.setattr(main.settings, "finnhub_api_key", config.SecretStr(secret))
+    main.app.state.news_status.update(
+        lastPollAt="2026-09-10T17:45:00+00:00", lastSuccessAt="2026-09-10T17:30:00+00:00",
+        pageSpanMinutes=2466, oldestAt="2026-09-09T00:06:48+00:00", lastError="ingest: HTTP 503")
+    resp = stub_state().get("/health")
+    assert {k: resp.json()[k] for k in NEWS_FIELDS} == {
+        "newsPollEnabled": True, "lastNewsPollAt": "2026-09-10T17:30:00+00:00",
+        "newsPageSpanMinutes": 2466, "newsOldestAt": "2026-09-09T00:06:48+00:00",
+        "newsLastError": "ingest: HTTP 503", "finnhubConfigured": True}
+    assert secret not in resp.text

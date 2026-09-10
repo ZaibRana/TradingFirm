@@ -102,27 +102,61 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Regime scheduler disabled (SCHEDULER_ENABLED is not true)")
 
+    # Market news poller (Part 3.5). news_status exists either way (small;
+    # /health and /market/health read it); the task and its two HTTP clients
+    # only when NEWS_POLL_ENABLED is true. Like the scheduler, it starts with
+    # dependencies down: polls then skip or fail and say so in lastError.
+    import news_poller
+    app.state.news_status = news_poller.initial_news_status()
+    app.state.news_task = None
+    app.state.news_clients = ()
+    if settings.news_poll_enabled:
+        import httpx
+        from monitors.finnhub_client import FinnhubClient
+        finnhub = FinnhubClient(settings.finnhub_api_key.get_secret_value())
+        ingest_http = httpx.AsyncClient(timeout=news_poller.INGEST_TIMEOUT)
+        app.state.news_clients = (finnhub, ingest_http)
+        app.state.news_task = asyncio.create_task(
+            news_poller.run_news_poller(app.state, finnhub, ingest_http)
+        )
+        logger.info(f"✅ Market news poller started (Finnhub configured: {finnhub.configured})")
+    else:
+        logger.info("Market news poller disabled (NEWS_POLL_ENABLED is not true)")
+
     logger.info(f"Risk Shield ready on port {settings.service_port}")
     yield
 
     # Shutdown
     logger.info("Shutting down Risk Shield...")
-    # The scheduler stops before the pool and Redis close, so a check never
-    # runs on a closed connection. asyncio.wait, not wait_for: wait_for would
-    # block on a task that does not honour the cancel.
-    task = getattr(app.state, "scheduler_task", None)
-    if task is not None:
+    # The scheduler and the news poller stop before the pool and Redis close,
+    # so neither runs on a closed connection. One bounded wait for both.
+    # asyncio.wait, not wait_for: wait_for would block on a task that does not
+    # honour the cancel.
+    running = {
+        name: task
+        for name, task in (("Regime scheduler", getattr(app.state, "scheduler_task", None)),
+                           ("News poller", getattr(app.state, "news_task", None)))
+        if task is not None
+    }
+    for task in running.values():
         task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=config.SCHEDULER_SHUTDOWN_TIMEOUT)
-        if not done:
-            logger.warning(
-                f"Regime scheduler did not stop within {config.SCHEDULER_SHUTDOWN_TIMEOUT}s; "
-                "closing connections anyway"
-            )
-        elif not task.cancelled() and task.exception() is not None:
-            logger.warning(f"Regime scheduler ended with {task.exception()!r}")
-        else:
-            logger.info("Regime scheduler stopped")
+    if running:
+        done, _ = await asyncio.wait(set(running.values()), timeout=config.SCHEDULER_SHUTDOWN_TIMEOUT)
+        for name, task in running.items():
+            if task not in done:
+                logger.warning(
+                    f"{name} did not stop within {config.SCHEDULER_SHUTDOWN_TIMEOUT}s; "
+                    "closing connections anyway"
+                )
+            elif not task.cancelled() and task.exception() is not None:
+                logger.warning(f"{name} ended with {task.exception()!r}")
+            else:
+                logger.info(f"{name} stopped")
+    for client in getattr(app.state, "news_clients", ()) or ():
+        try:
+            await client.aclose()
+        except Exception as e:
+            logger.warning(f"News poller client close failed: {e!r}")
     if getattr(app.state, "db_pool", None) is not None:
         await app.state.db_pool.close()
         logger.info("Database pool closed")
@@ -174,6 +208,8 @@ async def health():
         "lastCheckAt": (getattr(app.state, "check_status", None) or {}).get("lastCheckAt"),
         # Part 3.5: calendar coverage, recomputed against today on every call.
         **_calendar_health(),
+        # Part 3.5: the market news poller.
+        **_news_health(),
     }
 
 
@@ -327,6 +363,20 @@ CALENDAR_DAYS_MAX = 31
 def _now() -> datetime:
     """The clock for /market/calendar and /health's calendar fields (tests patch it)."""
     return datetime.now(timezone.utc)
+
+
+def _news_health() -> dict:
+    """/health's news poller fields (Part 3.5 decision 7). lastNewsPollAt is
+    the last *successful* poll."""
+    status = getattr(app.state, "news_status", None) or {}
+    return {
+        "newsPollEnabled": settings.news_poll_enabled,
+        "lastNewsPollAt": status.get("lastSuccessAt"),
+        "newsPageSpanMinutes": status.get("pageSpanMinutes"),
+        "newsOldestAt": status.get("oldestAt"),
+        "newsLastError": status.get("lastError"),
+        "finnhubConfigured": settings.finnhub_configured,
+    }
 
 
 def _calendar_health() -> dict:

@@ -12,6 +12,8 @@ minId, no news state in Redis).
                      check → POST in chunks → news_status (decision 7)
   stale_view         newsPollStale / lastNewsPollAt / newsLastError for
                      /market/health and the tf:risk:health payload (addition 8)
+  run_news_poller    the loop: wall-clock quarter hours, one poll per slot,
+                     never a catch-up; the daily calendar warning (decision 8)
 
 A poll is a success only when Finnhub answered a non-empty page, at least
 one item survived conversion and every chunk answered 200 (addition 8).
@@ -19,11 +21,12 @@ one item survived conversion and every chunk answered 200 (addition 8).
 
 import asyncio
 import logging
-from datetime import datetime, timezone
-from typing import Any, Callable
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable, Optional
 
 import httpx
 
+import econ_calendar
 from cache import (
     DATA_ENGINE_FINNHUB_COOLDOWN_KEY,
     SOURCE_FINNHUB,
@@ -258,6 +261,7 @@ async def poll_once(state, client, http, *, clock: Callable[[], datetime] = _utc
     )
     return {"outcome": "success", "cause": None}
 
+
 # ── Staleness (addition 8) ───────────────────────────────────────
 
 STALE_AFTER_SECONDS = 3600
@@ -279,3 +283,68 @@ def stale_view(state, now: datetime) -> dict:
         view["newsPollStale"] = (now - datetime.fromisoformat(base)).total_seconds() > STALE_AFTER_SECONDS
     return view
 
+
+# ── The loop (decision 2) ────────────────────────────────────────
+
+POLL_MINUTES = 15
+FALLBACK_SLEEP_SECONDS = POLL_MINUTES * 60
+
+
+def next_poll_after(now: datetime) -> datetime:
+    """The first wall-clock quarter hour (UTC) strictly after `now`."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    minute = now.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    return minute.replace(minute=0) + timedelta(minutes=(minute.minute // POLL_MINUTES + 1) * POLL_MINUTES)
+
+
+def _calendar_warning(now: datetime, last_day: Optional[date]) -> date:
+    """Once per ET day: the renewal WARNING while the econ calendar is short.
+    The poller is the only prod code running 24/7, so this is what fires in
+    December (decision 8). An unavailable file is load()'s ERROR, not ours."""
+    day = econ_calendar.et_today(now)
+    if day == last_day:
+        return day
+    try:
+        calendar = econ_calendar.load()
+    except econ_calendar.CalendarUnavailable:
+        return day
+    if econ_calendar.coverage_short(calendar, day):
+        logger.warning(econ_calendar.renewal_message(calendar))
+    return day
+
+
+async def run_news_poller(state, client, http, *, clock: Callable[[], datetime] = _utc_now,
+                          sleep=asyncio.sleep) -> None:
+    """
+    Forever: sleep until the next quarter hour, then poll once. A wake-up
+    before the slot polls nothing and sleeps again; a late one (laptop sleep)
+    polls once right away — the page's span covers the gap, and the overlap
+    warning says when it did not — and the next slot is counted from now, so
+    missed slots are never caught up. A raise out of a poll is a bug: ERROR,
+    and the loop goes on. Cancellation (shutdown) propagates.
+    """
+    status = state.news_status
+    status["startedAt"] = clock().isoformat()
+    calendar_day: Optional[date] = None
+    logger.info("Market news poller running")
+    while True:
+        try:
+            target = next_poll_after(clock())
+            delay = max(0.0, (target - clock()).total_seconds())
+        except Exception as e:
+            logger.error(f"News poller loop error {type(e).__name__}: {e}")
+            target, delay = None, FALLBACK_SLEEP_SECONDS
+        await sleep(delay)
+        now = clock()
+        if target is None or now < target:
+            continue
+        late = (now - target).total_seconds()
+        if late >= POLL_MINUTES * 60:
+            logger.warning(f"News poller woke {late:.0f}s after its slot: one poll now, missed slots not caught up")
+        try:
+            calendar_day = _calendar_warning(now, calendar_day)
+            await poll_once(state, client, http, clock=clock)
+        except Exception as e:
+            logger.error(f"News poll raised {type(e).__name__}: {e}")
+            status["lastError"] = f"poll raised: {type(e).__name__}"

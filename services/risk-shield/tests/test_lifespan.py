@@ -13,10 +13,14 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
+import httpx
+
 import cache
 import db
 import main
+import news_poller
 import scheduler
+from monitors.finnhub_client import FinnhubClient
 
 
 class _FakePool:
@@ -256,3 +260,71 @@ def test_lifespan_shutdown_bounded_when_task_hangs(monkeypatch, caplog):
     assert events.index("db closed") > events.index("ignored cancel")
     assert "redis closed" in events
     assert any("did not stop" in r.getMessage() for r in caplog.records)
+
+
+# ── Part 3.5: the market news poller task ────────────────────────
+
+def test_lifespan_news_poll_off_starts_no_task(monkeypatch):
+    _patch(monkeypatch)
+    monkeypatch.setattr(main.settings, "scheduler_enabled", False)
+    monkeypatch.setattr(main.settings, "news_poll_enabled", False)
+    calls = []
+
+    def spy(*a, **k):                       # synchronous: a created task would not fail the test
+        calls.append(a)
+        return asyncio.sleep(0)
+
+    monkeypatch.setattr(news_poller, "run_news_poller", spy)
+    monkeypatch.setattr(news_poller, "poll_once", spy)
+    with TestClient(main.app) as client:
+        body = client.get("/health").json()
+        assert main.app.state.news_task is None
+        assert main.app.state.news_clients == ()
+        assert main.app.state.news_status == news_poller.initial_news_status()
+        assert body["newsPollEnabled"] is False
+    assert calls == []
+
+
+def test_lifespan_news_poller_cancelled_before_close(monkeypatch, caplog):
+    events = []
+    _events_patch(monkeypatch, events)
+    monkeypatch.setattr(main.settings, "scheduler_enabled", False)
+    monkeypatch.setattr(main.settings, "news_poll_enabled", True)
+
+    async def fake_poller(state, client, http):
+        events.append("started")
+        assert state.news_status == news_poller.initial_news_status()
+        assert isinstance(client, FinnhubClient) and isinstance(http, httpx.AsyncClient)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            events.append("cancelled")
+            raise
+
+    monkeypatch.setattr(news_poller, "run_news_poller", fake_poller)
+    with TestClient(main.app) as client:
+        client.get("/health")                # lets the loop run the task's first step
+        assert main.app.state.news_task is not None
+        _, http = main.app.state.news_clients
+    assert events == ["started", "cancelled", "db closed", "redis closed"]
+    assert http.is_closed                    # the poller's clients close with it
+
+    # A poller that ignores the cancel: shutdown is still bounded.
+    events.clear()
+    monkeypatch.setattr("config.SCHEDULER_SHUTDOWN_TIMEOUT", 0.05)
+
+    async def stubborn(state, client, http):
+        events.append("started")
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            events.append("ignored cancel")
+            await asyncio.sleep(0.3)
+
+    monkeypatch.setattr(news_poller, "run_news_poller", stubborn)
+    with caplog.at_level(logging.WARNING):
+        with TestClient(main.app) as client:
+            client.get("/health")
+    assert events[:2] == ["started", "ignored cancel"]
+    assert events.index("db closed") > events.index("ignored cancel")
+    assert any("News poller did not stop" in r.getMessage() for r in caplog.records)
