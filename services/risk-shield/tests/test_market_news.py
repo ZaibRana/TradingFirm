@@ -1,17 +1,27 @@
-"""Part 3.5 — the market news poller. Converter rows (commit 4a) on the
-2026-09-10 Finnhub fixture; no network. The twin guard is here too, green
-before any poller code runs inside the twin."""
+"""Part 3.5 — the market news poller, on the 2026-09-10 Finnhub fixture.
+Converter rows (commit 4a), poll rows (4b). No network: Finnhub and
+data-engine are in-process fakes, Redis is tests/fake_redis.py. The twin
+guard is here too, green before any poller code runs inside the twin."""
 
+import asyncio
+import copy
 import json
+import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 
+import cache
 import config
 import news_poller
+from cache import MemoryCooldowns
+from monitors.errors import FinnhubError, FinnhubNotAuthorized, FinnhubRateLimited
 from news_poller import market_news_items
+from tests.fake_redis import FakeRedis
 
 FIXTURE = Path(__file__).parent / "fixtures" / "finnhub" / "general_news.json"
 ITEM_KEYS = {"publishedAt", "title", "url", "source", "summary"}
@@ -131,3 +141,347 @@ def test_twin_never_ingests_into_prod_data_engine():
     assert "//data-engine:" not in live.data_engine_url
     assert live.news_poll_enabled is False
     assert live.finnhub_configured is False
+
+
+# ── poll_once (commit 4b) ────────────────────────────────────────
+
+T0 = datetime(2026, 9, 10, 17, 30, tzinfo=timezone.utc)     # after the fixture's newest item
+LATER = T0 + timedelta(minutes=15)
+DE_URL = "http://data-engine-dev:8001"
+INGEST_URL = f"{DE_URL}/news/ingest"
+OWN_COOLDOWN = cache.cooldown_key(cache.SOURCE_FINNHUB)
+
+
+@pytest.fixture(autouse=True)
+def _poller_env(monkeypatch, caplog):
+    monkeypatch.setattr(news_poller.settings, "data_engine_url", DE_URL)
+    caplog.set_level(logging.INFO, logger="news_poller")
+
+
+class FakeFinnhub:
+    def __init__(self, page=None, *, error=None, configured=True, events=None):
+        self.page = _page() if page is None else page
+        self.error, self.configured, self.events = error, configured, events
+        self.calls = 0
+
+    async def general_news(self):
+        self.calls += 1
+        if self.events is not None:
+            self.events.append("fetch")
+        if self.error is not None:
+            raise self.error
+        return copy.deepcopy(self.page)
+
+
+class FakeIngest:
+    """data-engine's /news/ingest. Answers are used in order and the last one
+    repeats: an int is a status, an exception is raised, a float sleeps that
+    long first (for the hard timeout)."""
+
+    def __init__(self, *answers, events=None):
+        self.answers = list(answers) or [200]
+        self.posts = []
+        self.events = events
+
+    async def post(self, url, json=None):
+        self.posts.append((url, json))
+        if self.events is not None:
+            self.events.append("ingest")
+        answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        if isinstance(answer, BaseException):
+            raise answer
+        if isinstance(answer, float):
+            await asyncio.sleep(answer)
+            answer = 200
+        return httpx.Response(answer, json={"received": len(json["items"]), "sent": len(json["items"])})
+
+
+class RecordingRedis(FakeRedis):
+    def __init__(self, events, **kw):
+        super().__init__(**kw)
+        self.events = events
+
+    async def ttl(self, key):
+        self.events.append(f"ttl:{key}")
+        return await super().ttl(key)
+
+
+def _state(redis="fake"):
+    return SimpleNamespace(redis=FakeRedis() if redis == "fake" else redis,
+                           cooldowns=MemoryCooldowns(),
+                           news_status=news_poller.initial_news_status())
+
+
+async def _poll(state, finnhub=None, ingest=None, at=T0):
+    finnhub = finnhub or FakeFinnhub()
+    ingest = ingest or FakeIngest()
+    result = await news_poller.poll_once(state, finnhub, ingest, clock=lambda: at)
+    return result, finnhub, ingest
+
+
+def _bounds(page):
+    items, _ = market_news_items(page)
+    return datetime.fromisoformat(items[0]["publishedAt"]), datetime.fromisoformat(items[-1]["publishedAt"])
+
+
+def _logged(caplog, text):
+    return [r.levelname for r in caplog.records if text in r.getMessage()]
+
+
+def _many(n):
+    return [_raw(url=f"https://example.com/{i}", headline=f"Item {i}", datetime=1757500000 + 60 * i, id=i)
+            for i in range(n)]
+
+
+@pytest.mark.asyncio
+async def test_poll_once_order(monkeypatch):
+    events = []
+    real = news_poller.market_news_items
+
+    def converting(raw):
+        events.append("convert")
+        return real(raw)
+
+    monkeypatch.setattr(news_poller, "market_news_items", converting)
+    redis = RecordingRedis(events)
+    state = _state(redis)
+    result, _, _ = await _poll(state, FakeFinnhub(events=events), FakeIngest(events=events))
+
+    assert result == {"outcome": "success", "cause": None}
+    assert events == [f"ttl:{OWN_COOLDOWN}", f"ttl:{cache.DATA_ENGINE_FINNHUB_COOLDOWN_KEY}",
+                      "fetch", "convert", "ingest"]
+    assert redis.get_calls == [] and redis.set_calls == []          # no news state in Redis
+    s = state.news_status
+    assert s["lastPollAt"] == s["lastSuccessAt"] == T0.isoformat()
+    assert (s["fetched"], s["sent"], s["dropped"], s["truncated"], s["lastError"], s["consecutive422"]) == (
+        20, 20, 0, 0, None, 0)
+
+
+@pytest.mark.asyncio
+async def test_ingest_payload_shape():
+    _, _, ingest = await _poll(_state())
+    ((url, body),) = ingest.posts
+    assert url == INGEST_URL
+    assert set(body) == {"items"}
+    items = body["items"]
+    assert len(items) == 20
+    assert all(set(item) == ITEM_KEYS for item in items)               # no ticker, nothing extra
+    stamps = [datetime.fromisoformat(item["publishedAt"]) for item in items]
+    assert all(s.tzinfo is not None for s in stamps) and stamps == sorted(stamps)
+    json.dumps(body, allow_nan=False)
+
+
+@pytest.mark.asyncio
+async def test_poll_once_empty_page_is_not_a_success(caplog):
+    state = _state()
+    result, _, ingest = await _poll(state, FakeFinnhub([]))
+    assert result == {"outcome": "failed", "cause": "finnhub: empty page"}
+    assert ingest.posts == []
+    assert state.news_status["lastSuccessAt"] is None
+    assert state.news_status["lastError"] == "finnhub: empty page"
+    assert _logged(caplog, "empty page") == ["WARNING"]
+
+
+@pytest.mark.asyncio
+async def test_poll_once_all_dropped_is_not_a_success(caplog):
+    state = _state()
+    page = [_raw(url="ftp://example.com/1"), _raw(headline="   "), _raw(datetime=0)]
+    result, _, ingest = await _poll(state, FakeFinnhub(page))
+    assert result == {"outcome": "failed", "cause": "convert: every item dropped"}
+    assert ingest.posts == []
+    assert (state.news_status["fetched"], state.news_status["dropped"]) == (3, 3)
+    assert state.news_status["lastSuccessAt"] is None
+    assert _logged(caplog, "every one of 3 items was dropped") == ["WARNING"]
+
+
+@pytest.mark.asyncio
+async def test_poll_once_overlap_warning(caplog):
+    oldest, newest = _bounds(_page())
+    missed = "items may have been missed"
+    state = _state()
+
+    await _poll(state)                                          # first poll after start: nothing to compare
+    assert _logged(caplog, missed) == []
+
+    for previous, expected in ((newest, []),                   # page reaches back past it
+                               (oldest, []),                   # exactly as far back: no gap
+                               (oldest - timedelta(seconds=1), ["WARNING"])):
+        caplog.clear()
+        state.news_status["lastSuccessAt"] = previous.isoformat()
+        result, _, ingest = await _poll(state, at=LATER)
+        assert _logged(caplog, missed) == expected
+        assert result["outcome"] == "success" and len(ingest.posts) == 1   # the ingest still runs
+
+
+@pytest.mark.asyncio
+async def test_news_status_records_page_span_and_oldest():
+    page = _page()
+    oldest, newest = _bounds(page)
+    state = _state()
+    await _poll(state)
+    full_span = int((newest - oldest).total_seconds() // 60)
+    assert state.news_status["pageSpanMinutes"] == full_span
+    assert state.news_status["oldestAt"] == oldest.isoformat()
+
+    small = sorted(page, key=lambda it: it["datetime"])[-3:]
+    s_oldest, s_newest = _bounds(small)
+    await _poll(state, FakeFinnhub(small), at=LATER)
+    assert state.news_status["pageSpanMinutes"] == int((s_newest - s_oldest).total_seconds() // 60) < full_span
+    assert state.news_status["oldestAt"] == s_oldest.isoformat()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [FinnhubError("general news: timeout"),
+                                   FinnhubError("general news: HTTP 500")], ids=["timeout", "500"])
+async def test_poll_once_finnhub_error_sends_nothing(error, caplog):
+    redis = FakeRedis()
+    state = _state(redis)
+    result, finnhub, ingest = await _poll(state, FakeFinnhub(error=error))
+    assert result == {"outcome": "failed", "cause": "finnhub: FinnhubError"}
+    assert finnhub.calls == 1 and ingest.posts == []
+    assert redis.set_calls == []                                    # not a refusal: no cooldown
+    assert state.news_status["lastSuccessAt"] is None
+    assert _logged(caplog, str(error)) == ["WARNING"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error, ttl", [
+    (FinnhubRateLimited("general news: HTTP 429"), 900),
+    (FinnhubNotAuthorized("general news: HTTP 401"), 3600),
+    (FinnhubNotAuthorized("general news: HTTP 403"), 3600),
+], ids=["429", "401", "403"])
+async def test_poll_once_refusal_starts_cooldown_and_skips(error, ttl):
+    redis = FakeRedis()
+    state = _state(redis)
+    result, _, ingest = await _poll(state, FakeFinnhub(error=error))
+    assert result == {"outcome": "failed", "cause": f"finnhub: {type(error).__name__}"}
+    assert redis.ttls[OWN_COOLDOWN] == ttl and ingest.posts == []
+
+    again = FakeFinnhub()
+    result, _, ingest = await _poll(state, again, at=LATER)
+    assert result == {"outcome": "skipped", "cause": "skipped: cooldown"}
+    assert again.calls == 0 and ingest.posts == []
+
+    # No Redis: the memory clock remembers the refusal (900 s either way).
+    state = _state(None)
+    await _poll(state, FakeFinnhub(error=error))
+    result, again, _ = await _poll(state, FakeFinnhub(), at=LATER)
+    assert result["cause"] == "skipped: cooldown" and again.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_poll_once_skips_while_data_engine_finnhub_cooldown(caplog):
+    assert cache.DATA_ENGINE_FINNHUB_COOLDOWN_KEY == "tf:cache:finnhub"
+    redis = FakeRedis()
+    await redis.set("tf:cache:finnhub", "1", ex=42)                 # data-engine's write, not ours
+    result, finnhub, ingest = await _poll(_state(redis))
+    assert result == {"outcome": "skipped", "cause": "skipped: data-engine cooldown"}
+    assert finnhub.calls == 0 and ingest.posts == []
+    assert redis.set_calls == [("tf:cache:finnhub", "1", 42)]      # the poller never writes it
+
+    no_expiry = FakeRedis()
+    no_expiry.store["tf:cache:finnhub"] = "1"                       # TTL -1: not a running cooldown
+    for r in (FakeRedis(), no_expiry, FakeRedis(fail_ttl=True), None):
+        result, finnhub, _ = await _poll(_state(r))
+        assert result["outcome"] == "success" and finnhub.calls == 1
+    assert "treating as clear" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_poll_once_unconfigured_skips(caplog):
+    state = _state()
+    result, finnhub, ingest = await _poll(state, FakeFinnhub(configured=False))
+    assert result == {"outcome": "skipped", "cause": "skipped: unconfigured"}
+    assert finnhub.calls == 0 and ingest.posts == []
+    assert _logged(caplog, "FINNHUB_API_KEY is not set") == ["WARNING"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer, cause", [
+    (httpx.ConnectError("refused"), "ingest: ConnectError"),
+    (httpx.ReadTimeout("slow"), "ingest: timeout"),
+    (OSError("socket"), "ingest: OSError"),
+    (5.0, "ingest: timeout"),                                       # the hard wait_for bound
+], ids=["connect", "read-timeout", "oserror", "hard-timeout"])
+async def test_poll_once_ingest_failure_is_not_a_success(answer, cause, caplog, monkeypatch):
+    monkeypatch.setattr(news_poller, "INGEST_TIMEOUT", 0.05)
+    state = _state()
+    ingest = FakeIngest(answer, 200)
+    result, _, _ = await _poll(state, ingest=ingest)
+    assert result == {"outcome": "failed", "cause": cause}
+    assert state.news_status["lastSuccessAt"] is None
+    assert state.news_status["lastError"] == cause
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    result, _, _ = await _poll(state, ingest=ingest, at=LATER)      # the next poll resends the page
+    assert result["outcome"] == "success"
+    assert ingest.posts[0] == ingest.posts[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [307, 400, 401, 403, 404, 500, 503])
+async def test_poll_once_ingest_non_200_warns(code, caplog):
+    state = _state()
+    result, _, _ = await _poll(state, ingest=FakeIngest(code))
+    assert result == {"outcome": "failed", "cause": f"ingest: HTTP {code}"}
+    assert _logged(caplog, f"HTTP {code}") == ["WARNING"]
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert state.news_status["lastSuccessAt"] is None
+    assert state.news_status["consecutive422"] == 0
+
+
+@pytest.mark.asyncio
+async def test_poll_once_ingest_422_is_error_not_skipped(caplog):
+    state = _state()
+    ingest = FakeIngest(422)
+    result, _, _ = await _poll(state, ingest=ingest)
+    assert result == {"outcome": "failed", "cause": "ingest: HTTP 422"}
+    assert _logged(caplog, "(422)") == ["ERROR"]
+    assert state.news_status["lastSuccessAt"] is None
+
+    await _poll(state, ingest=ingest, at=LATER)
+    assert len(ingest.posts) == 2 and ingest.posts[0] == ingest.posts[1]   # the same page again
+
+
+@pytest.mark.asyncio
+async def test_poll_once_repeated_422_error_then_warning(caplog):
+    state = _state()
+    ingest = FakeIngest(422, 422, 422, 200, 422)
+    seen, counts = [], []
+    for n in range(5):
+        caplog.clear()
+        await _poll(state, ingest=ingest, at=T0 + timedelta(minutes=15 * n))
+        seen.append([(r.levelname, r.getMessage()) for r in caplog.records if "(422)" in r.getMessage()])
+        counts.append(state.news_status["consecutive422"])
+    assert [[level for level, _ in logs] for logs in seen] == [["ERROR"], ["WARNING"], ["WARNING"], [], ["ERROR"]]
+    assert "3 slots in a row" in seen[2][0][1]
+    assert counts == [1, 2, 3, 0, 1]                                # only a success resets it
+
+
+@pytest.mark.asyncio
+async def test_poll_once_chunks_success_only_after_all():
+    state = _state()
+    ingest = FakeIngest(200, 500)
+    result, _, _ = await _poll(state, FakeFinnhub(_many(250)), ingest)
+    assert [len(body["items"]) for _, body in ingest.posts] == [200, 50]
+    assert result == {"outcome": "failed", "cause": "ingest: HTTP 500"}
+    assert state.news_status["lastSuccessAt"] is None
+    assert state.news_status["sent"] == 200
+
+    ingest = FakeIngest(200)
+    result, _, _ = await _poll(state, FakeFinnhub(_many(250)), ingest, at=LATER)
+    assert result["outcome"] == "success" and state.news_status["sent"] == 250
+    assert ingest.posts[0][1]["items"][0]["url"] == "https://example.com/0"    # oldest first
+
+
+@pytest.mark.asyncio
+async def test_poll_once_repeat_page_is_resent_whole():
+    redis = FakeRedis()
+    state = _state(redis)
+    ingest = FakeIngest(200)
+    first, _, _ = await _poll(state, ingest=ingest)
+    second, _, _ = await _poll(state, ingest=ingest, at=LATER)
+    assert first["outcome"] == second["outcome"] == "success"
+    assert len(ingest.posts) == 2 and ingest.posts[0] == ingest.posts[1]
+    assert len(ingest.posts[0][1]["items"]) == 20
+    assert redis.get_calls == [] and redis.set_calls == []          # no state consulted or kept
