@@ -354,8 +354,10 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 ## 2026-09-10 — Part 3.2 → 3.3 / 3.4 carry-forward
 
 **To 3.3:**
-- **`QuotesCoolingDown` / `FredCoolingDown` is stale, not an error.** Answer it with `stale: true` and the last known body. The fetchers keep no copy once a 120 s degraded body expires, so the last known body has to be held by 3.3.
-- **Align tickers by date, never by position.** Treat `^VIX` and futures' same-day bar as intraday.
+- **3.3's spec opens with this: per-ticker dates do not line up.** The live 3.2 canary (2026-09-10) showed one download returning different date arrays per ticker: the ETFs end on the prior session (251 rows), while `^VIX` (254) and the futures (252) carry today's intraday bar. Any monitor that pairs tickers by position (RSP/SPY ratio, sector vs SPY, cross-asset) computes on mismatched days without failing. Align on `date`, and treat a same-day `^VIX` / futures bar as intraday and partial.
+- **`QuotesCoolingDown` / `FredCoolingDown` is stale, not an error.** Answer it with `stale: true` and the last known body. The fetchers keep no copy once a 120 s degraded body expires, so a last-known body must live somewhere. Two options; 3.3's spec decides:
+  - **(a) per monitor:** each of the six monitors keeps its own last-known copy.
+  - **(b) in the fetcher:** on every *full* answer (`reason: null`), the fetcher also writes a long-lived key, e.g. `tf:risk:cache:quotes:last` and `tf:risk:cache:fred:{SERIES}:last` at 24 h, and serves it with `stale: true` on `…CoolingDown`, a refusal or a degraded body. Stale is then decided in one place, not six.
 - **`^VIX` volume is always 0**, so no volume monitor may read it.
 - **Judge FRED freshness per series cadence** (daily, weekly, monthly), not against today.
 
