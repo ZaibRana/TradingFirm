@@ -19,15 +19,19 @@ from typing import Any, Callable, Optional
 
 from cache import (
     KIND_FRED,
+    KIND_FRED_LAST,
     SOURCE_FRED,
     TTL_COOLDOWN_FRED,
     TTL_COOLDOWN_FRED_AUTH,
     TTL_DEGRADED,
     TTL_FRED,
+    TTL_FRED_LAST_KNOWN,
     cached_json,
     canonical,
     cooldown_remaining,
+    get_cached_json,
     risk_key,
+    set_cached_json,
     start_cooldown,
 )
 from monitors.errors import (
@@ -135,6 +139,8 @@ async def get_series(
         body = observations_to_envelope(sid, raw, client.observation_start(), now())
         if body["dropped"]:
             logger.info(f"FRED {sid}: dropped {body['dropped']} non-numeric observations")
+        if body["reason"] is None:
+            await write_last_known(r, body)
         return body
 
     return await cached_json(
@@ -183,3 +189,80 @@ async def fred_snapshot(r, memory, client, *, now: Callable[[], datetime] = _utc
                 "dropped": body["dropped"],
             }
     return out
+
+
+# ── Last-known envelope and the view (Part 3.6a, spec decision 3) ─
+# Option (b) from 3.3: the fetcher keeps the last full envelope per series,
+# so a refusal, cooldown, error or empty answer is stale data, not an error.
+# No process-memory copy: without Redis there is no last-known (3.3's rule).
+
+VIEW_SOURCES = ("fresh", "cache", "last_known", "none")
+STALE_REASONS = (None, "age", "last_known", "no_data")
+
+
+async def write_last_known(r, body: dict) -> None:
+    """Keep a full envelope for TTL_FRED_LAST_KNOWN. A write failure is
+    logged and never fails the fetch; the previous copy stands until its TTL."""
+    if r is None:
+        return
+    try:
+        await set_cached_json(r, risk_key(KIND_FRED_LAST, body["seriesId"]), body, TTL_FRED_LAST_KNOWN)
+    except Exception as e:
+        logger.warning(f"Last-known FRED write failed for {body['seriesId']}: {e}")
+
+
+async def read_last_known(r, series_id: str) -> Optional[dict]:
+    """The last full envelope for a series, or None when Redis is absent or
+    raising, the key is missing, or it holds the wrong shape (another
+    series' id, a degraded envelope, not an envelope)."""
+    if r is None:
+        return None
+    sid = normalize_series(series_id)
+    key = risk_key(KIND_FRED_LAST, sid)
+    try:
+        body = await get_cached_json(r, key)
+    except Exception as e:
+        logger.warning(f"Last-known FRED read failed for {sid}: {e}")
+        return None
+    if body is None:
+        return None
+    if not _valid_for(sid)(body) or body["reason"] is not None:
+        logger.warning(f"Cache at {key} has the wrong shape, ignoring")
+        return None
+    return body
+
+
+def _series_view(status: str, source: str, stale_reason: Optional[str], observations: list) -> dict:
+    return {
+        "status": status,
+        "source": source,
+        "stale": stale_reason is not None,
+        "staleReason": stale_reason,
+        "latest": observations[-1] if observations else None,
+    }
+
+
+async def get_fred_view(r, memory, client, *, now: Callable[[], datetime] = _utc_now) -> dict:
+    """
+    What the macro inputs read: {SERIES: {status, source, stale, staleReason,
+    latest}} for the 8 series in plan order. fred_snapshot unchanged, then
+    every series whose status is not "ok" is filled from last-known with
+    stale: true. Never raises for a source state.
+    """
+    snapshot = await fred_snapshot(r, memory, client, now=now)
+    view: dict[str, dict] = {}
+    for sid in FRED_SERIES:
+        entry = snapshot[sid]
+        if entry["status"] == "ok":
+            source = "cache" if entry["cached"] else "fresh"
+            view[sid] = _series_view("ok", source, None, entry["observations"])
+            continue
+        last = await read_last_known(r, sid)
+        if last is None:
+            view[sid] = _series_view(entry["status"], "none", "no_data", [])
+        else:
+            view[sid] = _series_view(entry["status"], "last_known", "last_known", last["observations"])
+    stale = [sid for sid, v in view.items() if v["stale"]]
+    if stale:
+        logger.info(f"FRED view: stale {stale}")
+    return view

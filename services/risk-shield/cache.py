@@ -48,6 +48,12 @@ TTL_FRED = 21600     # 6 hours (plan 3.2)
 # 3.2 decision 3). Same number as data-engine's TTL_DOSSIER_ERROR.
 TTL_DEGRADED = 120
 TTL_LAST_KNOWN = 86400   # 24 h: how long a last-known quotes body may stand in
+# 3.6a: the last *full* envelope per FRED series, served with stale: true when
+# the source refuses, cools down, errors or answers empty (spec 3.6a decision
+# 3). 7 days, provisional: freshness is judged on observation dates, never on
+# this key's age, and 24 h would erase a monthly series after one bad day.
+KIND_FRED_LAST = "fred_last"
+TTL_FRED_LAST_KNOWN = 7 * 86400
 
 # 3.4: the last published health {score, regime, publishedAt}, which the
 # throttle compares against. 7 days so a long-dead state cannot linger.
