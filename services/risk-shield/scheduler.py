@@ -150,6 +150,24 @@ def next_slot_after(now: datetime) -> Optional[tuple[str, datetime]]:
     return None
 
 
+def last_slot_before(now: datetime) -> Optional[tuple[str, datetime]]:
+    """The latest slot starting at or before `now` (Part 3.6a decision 5:
+    the check that should already have produced a row), or None (ERROR)
+    when the calendar cannot cover the dates behind."""
+    _require_aware(now)
+    day = now.astimezone(ET).date()
+    try:
+        for offset in range(NEXT_SLOT_HORIZON_DAYS):
+            for kind, start in reversed(slots_for_day(day - timedelta(days=offset))):
+                if start <= now:
+                    return kind, start
+    except CalendarOutOfBounds as e:
+        logger.error(f"No previous health check slot: {e}")
+        return None
+    logger.error(f"No health check slot within {NEXT_SLOT_HORIZON_DAYS} days before {now.isoformat()}")
+    return None
+
+
 # ── One check (decision 4) ───────────────────────────────────────
 
 TREND_POINTS = 5     # provisional: ± points against the settle base
