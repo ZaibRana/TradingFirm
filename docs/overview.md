@@ -43,7 +43,7 @@ pub/sub, never by writing into another service's tables.
 |---|---|---|---|
 | `data-engine` | 8001 | **Functional** | Finviz screening → yfinance OHLCV → technical filters → enrichment. The only backend service with real logic. |
 | `signal-engine` | 8002 | Empty scaffold | Intended for entry/exit signal detection (zones, patterns). Only `/health` and `/` exist. |
-| `risk-shield` | 8003 | **Skeleton** | Market health scoring and regime detection (Phase 3). Part 3.1 gave it `config.py` / `db.py` / `cache.py`, a bounded fail-open lifespan and the `risk.macro_briefs` table; the endpoints are still `/health` (now reporting `db_connected` / `redis_connected` / `fredConfigured`) and `/`. Monitors, scoring and `/market/*` land in 3.2–3.4. |
+| `risk-shield` | 8003 | **Skeleton** | Market health scoring and regime detection (Phase 3). Part 3.1 gave it `config.py` / `db.py` / `cache.py`, a bounded fail-open lifespan and the `risk.macro_briefs` table; Part 3.2 added the two data fetchers (`monitors/quotes.py`, `monitors/fred.py`), which no endpoint calls yet. The endpoints are still `/health` (reporting `db_connected` / `redis_connected` / `fredConfigured`) and `/`. Monitors, scoring and `/market/*` land in 3.3–3.4. |
 | `ai-agent` | 8004 | Empty scaffold | Intended for trade grading via an LLM (`LLM_PROVIDER` env var supports Gemini/Anthropic). Only `/health` and `/` exist. |
 | `web` (dashboard) | 3000 | **Functional** | Next.js UI showing scan results, stock cards, market status. |
 
@@ -259,6 +259,47 @@ FastAPI app. Key pieces:
   (e.g. `market_cap` → `marketCap`) so FastAPI's snake_case internals
   serialize as the camelCase JSON the frontend expects.
 
+## Risk Shield service
+
+[`services/risk-shield`](../services/risk-shield) holds the Phase 3 regime
+inputs. As of Part 3.2 (spec `docs/specs/3.2.md`) these are library
+modules with no endpoint or scheduler yet (3.4 adds both):
+
+- **`monitors/quotes.py`** — `get_core_quotes(r, memory)`: one yfinance
+  1.5.1 `download` of the 17 core tickers (`SPY QQQ RSP ^VIX TLT GLD UUP
+  XLK XLU XLP XLV XLY XLF ES=F NQ=F CL=F GC=F`), daily 1y, `threads=False`,
+  timeout 5 s. It returns a JSON envelope `{asOf, tickers: {T: {date[],
+  open[], high[], low[], close[], volume[]}}, missing, reason}` cached under
+  `tf:risk:cache:quotes`: 5 min when complete, 120 s when `partial` / `empty`.
+  - **Request count:** 34 requests on a cold container (a timezone fetch
+    per ticker), 17 warm.
+  - **Rate limits:** yfinance 1.5.1 only logs them, so a handler on the
+    `yfinance` logger detects them, behind an exact version guard.
+  - **Concurrency:** a single-flight lock is held for the whole download.
+- **`monitors/fred.py` + `fred_client.py`** — FRED
+  `series/observations` for `VIXCLS DGS10 DGS2 T10Y2Y DFF DCOILWTICO
+  CPIAUCSL UNRATE`, one request per series, 800 days back, `"."` values
+  dropped. Cached per series under `tf:risk:cache:fred:{SERIES}`: 6 h, or
+  120 s when empty.
+  - **Key:** `FRED_API_KEY` travels in the `api_key` query parameter (FRED
+    has no header form), under the Alpha Vantage conditions: the `httpx`
+    logger pinned to WARNING, typed errors raised `from None`.
+  - **Bounds:** 8 s per request (`httpx` timeout plus `asyncio.wait_for`);
+    `ratelimit.fred_limiter` at 60/min with a 1 s gap.
+  - **Snapshot:** `fred_snapshot()` walks the 8 series. It stops on a
+    source-wide state and continues past a per-series error.
+- **Refusals and cooldowns** — `cache.py` carries data-engine's cooldown
+  helpers under `tf:risk:cooldown:{SOURCE}`:
+  - yfinance: a rate limit, or an all-empty download, parks the source 15 min.
+  - FRED: a 429/423 parks it 15 min, a rejected key 1 h.
+  - A refusal raises (`…RateLimited`, `…CoolingDown`) and caches nothing.
+  - `cached_json` refuses a `None` from a fetcher and takes a body-derived TTL (`ttl_for`).
+- **Live canaries** — `tests/fred_live.py` and `tests/quotes_live.py` run
+  only through the isolated `docker run` line in `docs/specs/3.2.md`:
+  default bridge network, unroutable `DATABASE_URL` / `REDIS_URL`, and
+  only `FRED_API_KEY` taken from `.env`. `tests/live_guard.py` refuses a
+  prod-looking environment.
+
 ## Web dashboard
 
 Next.js 15 / React 19 app in [`web/`](../web). `web/app/page.js` renders the
@@ -315,8 +356,9 @@ screen the market, filter candidates, enrich, display them. Everything
 downstream of that — actually generating trade signals (`signal-engine`)
 and grading trades with AI (`ai-agent`) — is still an empty FastAPI
 scaffold with no business logic. `risk-shield` has its infrastructure
-(config, pool, cache, migration, dev twin) as of Part 3.1 but no market
-logic yet. The `scanner/`
+(config, pool, cache, migration, dev twin) as of Part 3.1 and its two
+data fetchers (core quotes, FRED) as of Part 3.2, but no scoring,
+endpoint or scheduler yet. The `scanner/`
 standalone scripts predate the data-engine port and stay only as a frozen
 reference — see [`.agents/AGENTS.md`](../.agents/AGENTS.md) for the full
 rationale.
