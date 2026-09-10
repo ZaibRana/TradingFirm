@@ -7,8 +7,10 @@ is the only calendar source: nothing here calls an API (Finnhub's
 /calendar/economic is likely premium, plan §2).
 
 load() validates the file once per process and caches it only when it is
-valid. A missing or invalid file raises CalendarUnavailable (logged at ERROR)
-every time it is asked for, so a fixed file is picked up without a restart.
+valid. A missing or invalid file raises CalendarUnavailable every time it is
+asked for, so a fixed file is picked up without a restart. The ERROR is
+logged once per distinct problem, then DEBUG: /health reads the calendar on
+every Docker healthcheck (every 10 s).
 
 Renewal: the file is short when coversThrough − today (ET) < 14 days. load()
 warns about that once, at load. coverage_short(calendar, today) recomputes
@@ -19,7 +21,7 @@ file weeks before it runs short.
 import json
 import logging
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -44,6 +46,9 @@ class CalendarUnavailable(RuntimeError):
 
 # Valid calendars only, keyed by path. A failure is never cached.
 _cache: dict[str, dict] = {}
+# The last problem logged at ERROR per path, so a broken file read on every
+# healthcheck logs once, not every 10 s.
+_last_error: dict[str, str] = {}
 
 
 def et_today(now: Optional[datetime] = None) -> date:
@@ -143,9 +148,14 @@ def load(path: Optional[Path] = None, *, today: Optional[date] = None) -> dict:
             raise CalendarUnavailable(f"{path.name}: not valid JSON") from None
         calendar = validate(raw)
     except CalendarUnavailable as e:
-        logger.error(f"Econ calendar unavailable: {e}")
+        if _last_error.get(str(path)) != str(e):
+            logger.error(f"Econ calendar unavailable: {e}")
+            _last_error[str(path)] = str(e)
+        else:
+            logger.debug(f"Econ calendar still unavailable: {e}")
         raise
 
+    _last_error.pop(str(path), None)
     _cache[str(path)] = calendar
     logger.info(
         f"Econ calendar loaded: {len(calendar['events'])} events, "
@@ -154,3 +164,49 @@ def load(path: Optional[Path] = None, *, today: Optional[date] = None) -> dict:
     if coverage_short(calendar, today or et_today()):
         logger.warning(renewal_message(calendar))
     return calendar
+
+
+# ── GET /market/calendar (decision 9) ────────────────────────────
+
+def event_at(event: dict) -> datetime:
+    """An event's ET date + HH:MM as an aware UTC datetime (DST from zoneinfo)."""
+    hours, minutes = (int(part) for part in event["time"].split(":"))
+    return datetime.combine(event["date"], time(hours, minutes), tzinfo=ET).astimezone(timezone.utc)
+
+
+def window(calendar: dict, now: datetime, days: int) -> dict:
+    """
+    The endpoint body: events on ET dates today … today + days − 1, in time
+    order. Today's events stay after release, flagged `released`. A window
+    past the file's coverage answers what the file has, `coverageShort: true`
+    and a WARNING — never an error.
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    start = et_today(now)
+    end = start + timedelta(days=days - 1)
+    events = []
+    for event in calendar["events"]:          # already in time order (validate)
+        if start <= event["date"] <= end:
+            at = event_at(event)
+            events.append({
+                "date": event["date"].isoformat(),
+                "time": event["time"],
+                "datetimeUtc": at.isoformat(),
+                "type": event["type"],
+                "title": event["title"],
+                "detail": event["detail"],
+                "released": at <= now,
+            })
+    short = end > calendar["coversThrough"]
+    if short:
+        logger.warning(
+            f"Econ calendar window {start} … {end} runs past coverage ({calendar['coversThrough']})"
+        )
+    return {
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "coversThrough": calendar["coversThrough"].isoformat(),
+        "coverageShort": short,
+        "events": events,
+    }

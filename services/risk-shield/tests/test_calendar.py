@@ -1,15 +1,21 @@
-"""Part 3.5 — econ_calendar.py, the hand-maintained calendar file. No
-network, no Postgres, no Redis: the loader reads one JSON file."""
+"""Part 3.5 — econ_calendar.py and GET /market/calendar. No network, no
+Postgres, no Redis: the loader reads one JSON file, and the endpoint runs
+over stubbed app.state without the lifespan (as in test_health.py)."""
 
 import copy
 import json
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
+from fastapi.testclient import TestClient
 
 import econ_calendar
+import main
 from econ_calendar import CalendarUnavailable
+
+ET = ZoneInfo("America/New_York")
 
 # Spec 3.5 decision 8's table, copied (docs/ is not mounted in the twin).
 SPEC_TABLE = [
@@ -52,8 +58,29 @@ TODAY = date(2026, 9, 10)
 @pytest.fixture(autouse=True)
 def fresh_cache():
     econ_calendar._cache.clear()
+    econ_calendar._last_error.clear()
     yield
     econ_calendar._cache.clear()
+    econ_calendar._last_error.clear()
+
+
+def _et(y, m, d, hh, mm):
+    return datetime(y, m, d, hh, mm, tzinfo=ET)
+
+
+@pytest.fixture
+def client(monkeypatch):
+    """TestClient over stubbed state, the clock frozen at `now` (ET wall time)."""
+    def _make(now, *, path=None):
+        monkeypatch.setattr(main, "_now", lambda: now.astimezone(timezone.utc))
+        if path is not None:
+            monkeypatch.setattr(econ_calendar, "CALENDAR_PATH", path)
+        main.app.state.db_pool = None
+        main.app.state.redis = None
+        return TestClient(main.app)
+    yield _make
+    main.app.state.db_pool = None
+    main.app.state.redis = None
 
 
 def _write(tmp_path, body, name="cal.json"):
@@ -134,7 +161,7 @@ def test_calendar_loaded_once_per_process(tmp_path):
     assert econ_calendar.load(broken, today=TODAY)["coversThrough"] == date(2026, 12, 31)
 
 
-def test_calendar_renewal_warning_within_14_days(tmp_path, caplog):
+def test_calendar_renewal_warning_within_14_days(tmp_path, caplog, client):
     caplog.set_level(logging.WARNING, logger="econ_calendar")
     path = _write(tmp_path, VALID)
 
@@ -156,3 +183,133 @@ def test_calendar_renewal_warning_within_14_days(tmp_path, caplog):
     calendar = econ_calendar.load(path, today=TODAY)
     assert "renew by" not in caplog.text
     assert econ_calendar.coverage_short(calendar, date(2026, 12, 18)) is True
+
+    # /health recomputes it too, from the same cached load (no reload).
+    assert client(_et(2026, 9, 10, 12, 0), path=path).get("/health").json()["calendarCoverageShort"] is False
+    assert client(_et(2026, 12, 18, 12, 0), path=path).get("/health").json()["calendarCoverageShort"] is True
+    assert econ_calendar._cache[str(path)] is calendar
+
+
+# ── GET /market/calendar ─────────────────────────────────────────
+
+EVENT_KEYS = {"date", "time", "datetimeUtc", "type", "title", "detail", "released"}
+
+
+def _types(body):
+    return [(e["date"], e["type"]) for e in body["events"]]
+
+
+def test_calendar_window_seven_days(client):
+    resp = client(_et(2026, 9, 10, 12, 0)).get("/market/calendar")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert (body["from"], body["to"], body["coversThrough"], body["coverageShort"]) == (
+        "2026-09-10", "2026-09-16", "2026-12-31", False)
+    assert _types(body) == [("2026-09-11", "cpi"), ("2026-09-16", "fomc")]
+    cpi = body["events"][0]
+    assert set(cpi) == EVENT_KEYS
+    assert (cpi["time"], cpi["title"], cpi["detail"], cpi["released"]) == (
+        "08:30", "Consumer Price Index", "August 2026", False)
+
+
+def test_calendar_today_events_flag_released(client):
+    for now, released in ((_et(2026, 9, 11, 8, 29), False),
+                          (_et(2026, 9, 11, 8, 30), True),
+                          (_et(2026, 9, 11, 16, 0), True)):
+        events = client(now).get("/market/calendar?days=1").json()["events"]
+        assert [(e["type"], e["released"]) for e in events] == [("cpi", released)]
+
+
+def test_calendar_window_uses_eastern_date(client):
+    late = _et(2026, 9, 10, 23, 30)
+    assert late.astimezone(timezone.utc).date() == date(2026, 9, 11)
+    body = client(late).get("/market/calendar?days=1").json()
+    assert (body["from"], body["to"], body["events"]) == ("2026-09-10", "2026-09-10", [])
+
+    body = client(_et(2026, 9, 11, 0, 30)).get("/market/calendar?days=1").json()
+    assert _types(body) == [("2026-09-11", "cpi")]
+
+
+def test_calendar_datetime_utc_across_dst(client):
+    body = client(_et(2026, 9, 10, 12, 0)).get("/market/calendar?days=31").json()
+    assert [(e["type"], e["datetimeUtc"]) for e in body["events"]] == [
+        ("cpi", "2026-09-11T12:30:00+00:00"),     # EDT, UTC−4
+        ("fomc", "2026-09-16T18:00:00+00:00"),
+        ("jobs", "2026-10-02T12:30:00+00:00"),
+    ]
+    body = client(_et(2026, 11, 9, 12, 0)).get("/market/calendar?days=2").json()
+    assert [(e["type"], e["datetimeUtc"]) for e in body["events"]] == [
+        ("cpi", "2026-11-10T13:30:00+00:00"),     # EST after 2026-11-01, UTC−5
+    ]
+
+
+def test_calendar_empty_window_is_empty_list(client):
+    resp = client(_et(2026, 9, 17, 9, 0)).get("/market/calendar")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert (body["from"], body["to"], body["events"], body["coverageShort"]) == (
+        "2026-09-17", "2026-09-23", [], False)
+
+
+def test_calendar_coverage_short_flagged(client, caplog):
+    caplog.set_level(logging.WARNING, logger="econ_calendar")
+    resp = client(_et(2026, 12, 8, 9, 0)).get("/market/calendar?days=31")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert (body["to"], body["coverageShort"]) == ("2027-01-07", True)
+    assert _types(body) == [("2026-12-09", "fomc"), ("2026-12-10", "cpi")]
+    assert "runs past coverage (2026-12-31)" in caplog.text
+
+    resp = client(_et(2027, 1, 10, 9, 0)).get("/market/calendar")   # wholly past coverage
+    assert resp.status_code == 200
+    assert (resp.json()["events"], resp.json()["coverageShort"]) == ([], True)
+
+
+def test_calendar_days_validation(client):
+    c = client(_et(2026, 9, 10, 12, 0))
+    for bad in ("0", "32", "x", "-1"):
+        assert c.get(f"/market/calendar?days={bad}").status_code == 422
+    assert c.get("/market/calendar?days=1").json()["to"] == "2026-09-10"
+    assert c.get("/market/calendar?days=31").json()["to"] == "2026-10-10"
+    assert c.get("/market/calendar").json()["to"] == "2026-09-16"
+
+
+def test_calendar_missing_or_invalid_file_503(client, tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="econ_calendar")
+    now = _et(2026, 9, 10, 12, 0)
+    c = client(now, path=tmp_path / "absent.json")
+    resp = c.get("/market/calendar")
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "calendar unavailable"}
+    health = c.get("/health")
+    assert health.status_code == 200
+    assert (health.json()["calendarCoversThrough"], health.json()["calendarCoverageShort"]) == (None, None)
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1          # a broken file read on every healthcheck logs once
+
+    broken = tmp_path / "broken.json"
+    broken.write_text("{nope", encoding="utf-8")
+    assert client(now, path=broken).get("/market/calendar").status_code == 503
+    broken.write_text(json.dumps(VALID), encoding="utf-8")        # fixed: picked up, no restart
+    assert client(now, path=broken).get("/market/calendar").status_code == 200
+
+
+def test_calendar_needs_no_dependencies(client):
+    class Exploding:
+        def __getattr__(self, name):
+            raise AssertionError(f"/market/calendar touched a dependency: {name}")
+
+    c = client(_et(2026, 9, 10, 12, 0))
+    main.app.state.db_pool = Exploding()
+    main.app.state.redis = Exploding()
+    resp = c.get("/market/calendar")
+    assert resp.status_code == 200
+    assert _types(resp.json()) == [("2026-09-11", "cpi"), ("2026-09-16", "fomc")]
+
+
+def test_health_reports_calendar_coverage(client):
+    c = client(_et(2026, 9, 10, 12, 0))
+    body = c.get("/health").json()
+    assert (body["calendarCoversThrough"], body["calendarCoverageShort"]) == ("2026-12-31", False)
+    assert client(_et(2026, 12, 18, 12, 0)).get("/health").json()["calendarCoverageShort"] is True
+    assert "GET  /market/calendar?days=7" in c.get("/").json()["endpoints"]

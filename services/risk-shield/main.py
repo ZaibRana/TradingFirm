@@ -13,6 +13,8 @@ Endpoints:
   GET /market/health      — the latest health check (Postgres only, Part 3.4)
   GET /market/indicators  — the six monitors of the latest check
   GET /market/history     — checks over the last ?days=1..90 (default 30)
+  GET /market/calendar    — FOMC / CPI / jobs dates for ?days=1..31 (default 7),
+                            from data/econ_calendar.json only (Part 3.5)
 
 Port: 8003
 """
@@ -29,6 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import config
 import db
+import econ_calendar
 from config import settings
 
 # ── Logging ──────────────────────────────────────────────────────
@@ -168,6 +171,8 @@ async def health():
         # Part 3.4: whether this process schedules checks, and its last one.
         "schedulerEnabled": settings.scheduler_enabled,
         "lastCheckAt": (getattr(app.state, "check_status", None) or {}).get("lastCheckAt"),
+        # Part 3.5: calendar coverage, recomputed against today on every call.
+        **_calendar_health(),
     }
 
 
@@ -183,6 +188,7 @@ async def root():
             "GET  /market/health",
             "GET  /market/indicators",
             "GET  /market/history?days=30",
+            "GET  /market/calendar?days=7",
         ],
     }
 
@@ -304,3 +310,41 @@ async def market_history(days: int = Query(HISTORY_DAYS_DEFAULT, ge=1, le=HISTOR
             for r in rows
         ],
     }
+
+
+# ── /market/calendar (Part 3.5, spec decisions 8–9) ──────────────
+# The hand-maintained file only: no Postgres, no Redis, no network.
+
+CALENDAR_UNAVAILABLE_DETAIL = "calendar unavailable"
+CALENDAR_DAYS_DEFAULT = 7
+CALENDAR_DAYS_MAX = 31
+
+
+def _now() -> datetime:
+    """The clock for /market/calendar and /health's calendar fields (tests patch it)."""
+    return datetime.now(timezone.utc)
+
+
+def _calendar_health() -> dict:
+    """/health's calendar fields. coverage short is recomputed against today,
+    never frozen at load; both are null when the file is unavailable."""
+    try:
+        calendar = econ_calendar.load()
+    except econ_calendar.CalendarUnavailable:
+        return {"calendarCoversThrough": None, "calendarCoverageShort": None}
+    return {
+        "calendarCoversThrough": calendar["coversThrough"].isoformat(),
+        "calendarCoverageShort": econ_calendar.coverage_short(calendar, econ_calendar.et_today(_now())),
+    }
+
+
+@app.get("/market/calendar")
+async def market_calendar(days: int = Query(CALENDAR_DAYS_DEFAULT, ge=1, le=CALENDAR_DAYS_MAX)):
+    """FOMC decisions, CPI releases and jobs reports on ET dates today …
+    today + days − 1. Past the file's coverage: 200 with coverageShort, never
+    a 404. A missing or invalid file is a 503."""
+    try:
+        calendar = econ_calendar.load()
+    except econ_calendar.CalendarUnavailable:
+        raise HTTPException(status_code=503, detail=CALENDAR_UNAVAILABLE_DETAIL) from None
+    return econ_calendar.window(calendar, _now(), days)
