@@ -149,7 +149,7 @@ def test_partial_rule_uses_download_time_not_read_time():
 # ── Monitor helpers ──────────────────────────────────────────────
 
 # Bars each monitor needs before it can score (spec 3.3 decision 4).
-MIN_BARS = {"vix": 1, "spy_trend": 200, "volume": 21}
+MIN_BARS = {"vix": 1, "breadth": 20, "spy_trend": 200, "sector_rotation": 6, "volume": 21, "cross_asset": 2}
 
 
 def bdays(n, end=date(2026, 9, 9)):
@@ -302,6 +302,79 @@ def test_volume_null_volume_rows():
     assert last["score"] is None and "missing on" in last["detail"]
     empty = regime.volume(volume_view(1.2, all_null=True))
     assert empty["score"] is None and "no volume in the 20-day window" in empty["detail"]
+
+
+def last_move_view(latest, n=2):
+    """n aligned bars per ticker, every close 100 until the last bar, which
+    is `latest[T]` — so the 1-bar and 5-bar % moves are latest − 100."""
+    d = bdays(n)
+    return view_of({t: make_series(d, [100.0] * (n - 1) + [v]) for t, v in latest.items()})
+
+
+@pytest.mark.parametrize(
+    "slope, score",
+    [(1.01, 90), (1.0, 60), (-1.0, 60), (-1.01, 25)],
+)
+def test_breadth_slope_score_table(monkeypatch, slope, score):
+    monkeypatch.setattr(regime, "slope_pct", lambda values: slope)
+    view = view_of({t: make_series(bdays(20), [100.0] * 20) for t in ("RSP", "SPY")})
+    result = regime.breadth(view)
+    assert (result["score"], result["raw"]["slopePct"]) == (score, slope)
+
+
+def test_breadth_ad_unavailable_is_null_not_zero():
+    d = bdays(20)
+    rsp = make_series(d, [100.0 + 0.5 * i for i in range(20)])   # equal weight pulling ahead
+    spy = make_series(d, [100.0] * 20)
+    result = regime.breadth(view_of({"RSP": rsp, "SPY": spy}))
+    assert result["score"] == 90
+    assert "adRatio" in result["raw"] and result["raw"]["adRatio"] is None
+    assert "A/D unavailable" in result["detail"]
+
+
+@pytest.mark.parametrize(
+    "offensive_close, score",
+    [(101.01, 90), (101.0, 65), (99.0, 65), (98.99, 30), (98.0, 30), (97.99, 10)],
+    ids=["+1.01", "+1", "-1", "-1.01", "-2", "-2.01"],
+)
+def test_sector_rotation_score_table(offensive_close, score):
+    latest = {t: offensive_close for t in regime.OFFENSIVE} | {t: 100.0 for t in regime.DEFENSIVE}
+    result = regime.sector_rotation(last_move_view(latest, n=6))
+    assert result["score"] == score
+    assert result["raw"]["spreadPct"] == pytest.approx(offensive_close - 100.0)
+
+
+@pytest.mark.parametrize(
+    "tlt, gld, uup, spy, score",
+    [
+        (99.5, 99.5, 99.5, 99.5, 15),       # all four ≤ −0.5, edge inclusive
+        (100.5, 100.5, 100.5, 100.0, 25),   # havens ≥ +0.5, edge inclusive
+        (101.5, 100.5, 100.5, 99.0, 25),    # first match: 25 before 35
+        (101.01, 100.0, 100.0, 99.5, 35),   # TLT > +1.0, SPY ≤ −0.5
+        (101.0, 100.0, 100.0, 99.5, 65),    # TLT exactly +1.0 is not "sharply"
+        (100.49, 99.51, 100.0, 97.0, 80),   # havens strictly inside ±0.5
+        (100.5, 100.0, 100.0, 100.0, 65),   # +0.5 is up, not flat
+        (99.0, 101.0, 100.0, 100.0, 65),    # mixed
+    ],
+    ids=["all_down_15", "havens_up_25", "havens_up_spy_down_25", "tlt_sharp_spy_down_35",
+         "tlt_exactly_1_65", "havens_flat_80", "band_edge_up_65", "mixed_65"],
+)
+def test_cross_asset_score_table(tlt, gld, uup, spy, score):
+    view = last_move_view({"TLT": tlt, "GLD": gld, "UUP": uup, "SPY": spy})
+    assert regime.cross_asset(view)["score"] == score
+
+
+def test_monitors_registry_names_weights_tickers():
+    from monitors.quotes import CORE_TICKERS
+    assert list(MONITORS) == ["vix", "breadth", "spy_trend", "sector_rotation", "volume", "cross_asset"]
+    assert {n: m.weight for n, m in MONITORS.items()} == {
+        "vix": 25, "breadth": 20, "spy_trend": 20, "sector_rotation": 15, "volume": 10, "cross_asset": 10,
+    }
+    assert sum(m.weight for m in MONITORS.values()) == 100
+    assert MONITORS["sector_rotation"].tickers == ("XLK", "XLY", "XLF", "XLU", "XLP", "XLV")
+    used = {t for m in MONITORS.values() for t in m.tickers}
+    assert used <= set(CORE_TICKERS)
+    assert not used & {"ES=F", "NQ=F", "CL=F", "GC=F"}   # night mode is 3.4
 
 
 # ── Monitors: contract ───────────────────────────────────────────

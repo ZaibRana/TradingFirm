@@ -18,7 +18,15 @@ bars never count.
 import logging
 from typing import Callable, NamedTuple, Optional
 
-from monitors.series import UnusableSeries, align, check_ascending, complete_bars, ema, is_partial
+from monitors.series import (
+    UnusableSeries,
+    align,
+    check_ascending,
+    complete_bars,
+    ema,
+    is_partial,
+    slope_pct,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +44,12 @@ def _result(score: Optional[int], raw: dict, detail: str, stale: bool) -> dict:
 def _stale(view: dict, tickers) -> bool:
     stale = set(view.get("staleTickers") or [])
     return any(t in stale for t in tickers)
+
+
+def _pct(before: float, after: float) -> float:
+    """Percent change, multiplied before dividing so band edges such as
+    +1.0 and −0.5 come out exact."""
+    return (after - before) * 100 / before
 
 
 def _unaligned(a: dict, stale: bool, name: str) -> Optional[dict]:
@@ -195,10 +209,130 @@ def volume(view: dict) -> dict:
     return _result(score, {"ratio": ratio, "red": red, **base}, detail, stale)
 
 
-# ── Registry ─────────────────────────────────────────────────────
+# ── breadth (weight 20) ──────────────────────────────────────────
+# Plan substitute for Part 5's constituent breadth: RSP/SPY ratio slope.
+# A/D is unavailable (data-engine stores no advance/decline counts and this
+# service reads no other schema), so adRatio is null, never 0.
+
+BREADTH_WINDOW = 20
+BREADTH_SLOPE_BAND = 1.0     # provisional (spec 3.3 decision 5)
+
+
+def breadth(view: dict) -> dict:
+    tickers = ("RSP", "SPY")
+    stale = _stale(view, tickers)
+    a = align(view, tickers)
+    null = _unaligned(a, stale, "breadth")
+    if null:
+        return null
+    n = len(a["dates"])
+    if n < BREADTH_WINDOW:
+        return _result(None, {"bars": n, "droppedDates": a["droppedDates"], "adRatio": None},
+                       f"breadth: {n} aligned complete bars, need ≥ {BREADTH_WINDOW}", stale)
+
+    rsp, spy = a["close"]["RSP"][-BREADTH_WINDOW:], a["close"]["SPY"][-BREADTH_WINDOW:]
+    ratios = [r / s for r, s in zip(rsp, spy)]
+    slope = slope_pct(ratios)
+    if slope > BREADTH_SLOPE_BAND:
+        score, label = 90, "equal weight leading, broad participation"
+    elif slope >= -BREADTH_SLOPE_BAND:
+        score, label = 60, "equal weight tracking cap weight"
+    else:
+        score, label = 25, "equal weight lagging, narrow leadership"
+    raw = {"ratio": ratios[-1], "slopePct": slope, "window": BREADTH_WINDOW, "adRatio": None,
+           "droppedDates": a["droppedDates"], "date": a["dates"][-1]}
+    detail = f"RSP/SPY 20-day slope {slope:+.2f}% — {label} (A/D unavailable)"
+    return _result(score, raw, detail, stale)
+
+
+# ── sector_rotation (weight 15) ──────────────────────────────────
+
+OFFENSIVE = ("XLK", "XLY", "XLF")
+DEFENSIVE = ("XLU", "XLP", "XLV")
+SECTOR_DAYS = 5
+
+
+def sector_rotation(view: dict) -> dict:
+    tickers = OFFENSIVE + DEFENSIVE
+    stale = _stale(view, tickers)
+    a = align(view, tickers)
+    null = _unaligned(a, stale, "sector_rotation")
+    if null:
+        return null
+    n = len(a["dates"])
+    if n < SECTOR_DAYS + 1:
+        return _result(None, {"bars": n, "droppedDates": a["droppedDates"]},
+                       f"sector_rotation: {n} aligned complete bars, need ≥ {SECTOR_DAYS + 1}", stale)
+
+    def mean_return(group) -> float:
+        closes = a["close"]
+        return sum(_pct(closes[t][-(SECTOR_DAYS + 1)], closes[t][-1]) for t in group) / len(group)
+
+    offensive, defensive = mean_return(OFFENSIVE), mean_return(DEFENSIVE)
+    spread = offensive - defensive
+    if spread > 1:
+        score, label = 90, "offensive sectors leading, risk-on"
+    elif spread >= -1:
+        score, label = 65, "offensive and defensive roughly equal"
+    elif spread >= -2:
+        score, label = 30, "defensive sectors leading, risk-off"
+    else:
+        score, label = 10, "panic rotation into defensives"
+    raw = {"offensivePct": offensive, "defensivePct": defensive, "spreadPct": spread,
+           "droppedDates": a["droppedDates"], "date": a["dates"][-1]}
+    detail = f"Offensive minus defensive over 5 days {spread:+.2f} pts — {label}"
+    return _result(score, raw, detail, stale)
+
+
+# ── cross_asset (weight 10) ──────────────────────────────────────
+
+CROSS_FLAT_BAND = 0.5    # provisional (spec 3.3 decision 5)
+CROSS_SHARP_PCT = 1.0    # Part 5: "Bonds up sharply (>1% day)"
+
+
+def cross_asset(view: dict) -> dict:
+    tickers = ("TLT", "GLD", "UUP", "SPY")
+    stale = _stale(view, tickers)
+    a = align(view, tickers)
+    null = _unaligned(a, stale, "cross_asset")
+    if null:
+        return null
+    n = len(a["dates"])
+    if n < 2:
+        return _result(None, {"bars": n, "droppedDates": a["droppedDates"]},
+                       f"cross_asset: {n} aligned complete bars, need ≥ 2", stale)
+
+    pct = {t: _pct(a["close"][t][-2], a["close"][t][-1]) for t in tickers}
+    havens = (pct["TLT"], pct["GLD"], pct["UUP"])
+
+    def up(p): return p >= CROSS_FLAT_BAND
+    def down(p): return p <= -CROSS_FLAT_BAND
+    def flat(p): return -CROSS_FLAT_BAND < p < CROSS_FLAT_BAND
+
+    if all(down(p) for p in havens) and down(pct["SPY"]):
+        score, label = 15, "everything falling, bonds included — liquidity stress"
+    elif all(up(p) for p in havens):
+        score, label = 25, "bonds, gold and dollar all bid — flight to safety"
+    elif pct["TLT"] > CROSS_SHARP_PCT and down(pct["SPY"]):
+        score, label = 35, "bonds up sharply while stocks fall — risk-off"
+    elif all(flat(p) for p in havens):
+        score, label = 80, "bonds, gold and dollar calm"
+    else:
+        score, label = 65, "mixed cross-asset signals"
+    raw = {"tltPct": pct["TLT"], "gldPct": pct["GLD"], "uupPct": pct["UUP"], "spyPct": pct["SPY"],
+           "date": a["dates"][-1], "droppedDates": a["droppedDates"]}
+    detail = (f"TLT {pct['TLT']:+.2f}%, GLD {pct['GLD']:+.2f}%, UUP {pct['UUP']:+.2f}%, "
+              f"SPY {pct['SPY']:+.2f}% — {label}")
+    return _result(score, raw, detail, stale)
+
+
+# ── Registry (Part 5 order) ──────────────────────────────────────
 
 MONITORS: dict[str, Monitor] = {
     "vix": Monitor(vix, 25, ("^VIX",)),
+    "breadth": Monitor(breadth, 20, ("RSP", "SPY")),
     "spy_trend": Monitor(spy_trend, 20, ("SPY",)),
+    "sector_rotation": Monitor(sector_rotation, 15, OFFENSIVE + DEFENSIVE),
     "volume": Monitor(volume, 10, ("SPY", "QQQ")),
+    "cross_asset": Monitor(cross_asset, 10, ("TLT", "GLD", "UUP", "SPY")),
 }
