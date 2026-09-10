@@ -322,3 +322,47 @@ Do not edit or delete past entries — if a decision changes, add a new entry th
 **Why:** 3.2 opens in a fresh chat that reads these docs, not the 3.1 conversation. The first two are G6 traps that pass every mocked test.
 
 **Supersedes:** N/A.
+
+---
+
+## 2026-09-10 — Core quotes + FRED (Part 3.2)
+
+**Decision:** approved spec `docs/specs/3.2.md`. The choices later parts build on:
+
+- **FRED key in the query string** is the second approved exception to "secrets never in URLs" (FRED has no header form). It rests on the Alpha Vantage conditions, both held in `monitors/fred_client.py`: the `httpx` logger is pinned to WARNING, and every typed error is raised `from None` with a series id + status message. The body's `error_message` is inspected, never echoed.
+- **Refusal raises, an answer is cached.**
+  - A 429/423, a bad key, or a yfinance rate limit starts a source-wide cooldown and caches nothing.
+  - A body with `reason` not null (`empty`, `partial`) caches for 120 s via the restored `ttl_for` hook, never the full 5 min / 6 h.
+  - `cached_json` raises on a `None` from `fetch()`.
+- **yfinance 1.5.1 swallows `YFRateLimitError`** into a per-download dict and only logs it. A refusal is therefore detected by a handler on the `yfinance` logger (both the download-summary and tz-fetch formats), behind an exact `1.5.1` version guard. A download where all 17 tickers are empty is treated as a silent block and starts the cooldown.
+- **Quotes worst case.** Each ticker's `history()` first fetches its timezone (hard-coded 10 s) unless yfinance's on-disk cache has it, so a download is 34 requests cold and 17 warm. The per-request timeout is 5 s, giving 255 s cold and 85 s warm. There is no outer `wait_for`, because a thread can't be cancelled and the single-flight lock must be held until it returns. That lock is one per running event loop.
+- **FRED bounds.** 8 s `httpx` timeout plus an `asyncio.wait_for` hard bound; `fred_limiter` at 60/min with a 1 s gap. `fred_snapshot` stops on `FredSourceWide` (cooldown, rate limited, not authorized, unconfigured) and continues past a per-series `FredError`, so one broken series can't blank the rest. A full outage costs ~72 s per walk.
+- **Memory fallback:** without Redis, the in-memory clock can't tell a 429 from a bad key, so it remembers either FRED refusal for 900 s; the Redis path keeps 900 / 3600.
+- **Live (9 FRED + 36 yfinance requests, all clean):**
+  - FRED's missing marker is `"."`, and series lag by their release schedules (on 2026-09-10: `DGS10` 09-08, `DCOILWTICO` 09-01, `CPIAUCSL` 07-01).
+  - yfinance returns MultiIndex `(Ticker, Price)` even for one ticker, in set order rather than request order.
+  - Per-ticker dates differ: ETFs end on the prior session with 251 rows; `^VIX` and the futures include today's intraday bar (254 / 252 rows).
+  - `^VIX` volume is 0.
+  - All 17 tickers, cold, took 4.46 s.
+
+**Why:** the plan row names two modules and two TTLs. Every item above is a place where a plausible default (cache an empty answer for 6 h, trust `download` to raise, stop a walk on any error, wrap a thread in `wait_for`) would quietly break G6 or blank the regime inputs.
+
+**Supersedes:** the plan §2 call-budget line "~80" for the 5-minute regime check counts downloads. In requests it is ~1,360/day warm (17 per download), plus 17 per container start.
+
+---
+
+## 2026-09-10 — Part 3.2 → 3.3 / 3.4 carry-forward
+
+**To 3.3:**
+- **`QuotesCoolingDown` / `FredCoolingDown` is stale, not an error.** Answer it with `stale: true` and the last known body. The fetchers keep no copy once a 120 s degraded body expires, so the last known body has to be held by 3.3.
+- **Align tickers by date, never by position.** Treat `^VIX` and futures' same-day bar as intraday.
+- **`^VIX` volume is always 0**, so no volume monitor may read it.
+- **Judge FRED freshness per series cadence** (daily, weekly, monthly), not against today.
+
+**To 3.4:**
+- A scheduler tick that finds the quotes lock held skips rather than queues. Cadence stays ≥ 255 s (quotes cold worst case) and ≥ ~72 s (FRED outage walk).
+- `app.state.cooldowns = MemoryCooldowns()` is wired with the first caller.
+- **yfinance's timezone cache lives in the container filesystem,** so every prod recreate costs 17 extra requests. Decide between a named volume for the cache dir and explicitly accepting the cost.
+- **G15:** `docker compose up -d --build risk-shield` puts the 3.2 pins in the prod image. Nothing in prod calls the new modules until then.
+
+**Supersedes:** N/A.
