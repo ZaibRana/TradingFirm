@@ -9,14 +9,23 @@ without patching cache.py itself.
 
 
 class FakeRedis:
-    def __init__(self, *, fail_get=False, fail_set=False, fail_ttl=False):
+    def __init__(self, *, fail_get=False, fail_set=False, fail_ttl=False, fail_publish=False):
         self.store: dict[str, str] = {}
         self.ttls: dict[str, int] = {}
         self.fail_get = fail_get
         self.fail_set = fail_set
         self.fail_ttl = fail_ttl
+        self.fail_publish = fail_publish
         self.get_calls: list[str] = []
         self.set_calls: list[tuple[str, str, int]] = []
+        self.published: list[tuple[str, str]] = []    # (channel, message), Part 3.4
+
+    async def publish(self, channel, message):
+        """Records the message; returns 0 receivers (nobody subscribes)."""
+        if self.fail_publish:
+            raise RuntimeError("boom: redis publish")
+        self.published.append((channel, message))
+        return 0
 
     async def get(self, key):
         self.get_calls.append(key)

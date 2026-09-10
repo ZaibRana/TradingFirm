@@ -27,14 +27,14 @@ logger = logging.getLogger(__name__)
 RISK_PREFIX = "tf:risk:"
 CACHE_PREFIX = f"{RISK_PREFIX}cache:"
 
-# Pub/sub channel for regime changes (plan 3.4). Named here so 3.4 does not
-# invent a second spelling.
-CHANNEL_HEALTH = f"{RISK_PREFIX}health"
+# State that is not a cache (Part 3.4): it must outlive any cached body.
+STATE_PREFIX = f"{RISK_PREFIX}state:"
+# The health pub/sub channel lives in config.settings.health_channel (3.4):
+# the dev twin overrides it, because pub/sub ignores the Redis DB index.
 
 # Cache kinds, shipped now and used by their part.
 KIND_QUOTES = "quotes"   # 3.2: the batched core-ticker download
 KIND_FRED = "fred"       # 3.2: one FRED series
-KIND_HEALTH = "health"   # 3.4: the latest health snapshot
 # 3.3: the last *full* quotes body, served with stale: true when the source
 # refuses, cools down or comes back degraded (spec 3.3 decision 2).
 KIND_QUOTES_LAST = "quotes_last"
@@ -42,13 +42,17 @@ KIND_QUOTES_LAST = "quotes_last"
 # TTLs (seconds)
 TTL_QUOTES = 300     # 5 min (plan 3.2)
 TTL_FRED = 21600     # 6 hours (plan 3.2)
-TTL_HEALTH = 300     # 5 min, the scheduler's market-hours cadence (3.4)
 # A body that came back degraded (envelope `reason` not null: "empty",
 # "partial") is cached briefly, never for the source's full window: one
 # transient empty FRED answer must not blank a series for six hours (Part
 # 3.2 decision 3). Same number as data-engine's TTL_DOSSIER_ERROR.
 TTL_DEGRADED = 120
 TTL_LAST_KNOWN = 86400   # 24 h: how long a last-known quotes body may stand in
+
+# 3.4: the last published health {score, regime, publishedAt}, which the
+# throttle compares against. 7 days so a long-dead state cannot linger.
+STATE_HEALTH_PUBLISHED = "health_published"
+TTL_HEALTH_PUBLISHED = 7 * 86400
 
 # Source cooldowns (Part 3.2 decision 4, copied from data-engine 2.4): set
 # after a source refuses us, checked before any request. Source-wide — one
@@ -87,6 +91,17 @@ def risk_key(kind: str, name: str = "") -> str:
     if not name:
         return f"{CACHE_PREFIX}{kind}"
     return f"{CACHE_PREFIX}{kind}:{canonical(name)}"
+
+
+def state_key(name: str) -> str:
+    """
+    Key for one piece of risk-shield state: `tf:risk:state:{name}`. The
+    name goes through canonical() and is lower-cased, like risk_key's kind,
+    so " Health_Published " and "health_published" are one key (G1.5).
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("state key name must be a non-empty string")
+    return f"{STATE_PREFIX}{canonical(name).lower()}"
 
 
 # ── Connection ───────────────────────────────────────────────────

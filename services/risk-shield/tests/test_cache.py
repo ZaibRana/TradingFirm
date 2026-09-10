@@ -21,7 +21,8 @@ def test_risk_key_namespace_is_tf_risk():
     for key in (
         cache.risk_key(cache.KIND_QUOTES),
         cache.risk_key(cache.KIND_FRED, "vixcls"),
-        cache.risk_key(cache.KIND_HEALTH),
+        cache.risk_key(cache.KIND_QUOTES_LAST),
+        cache.state_key(cache.STATE_HEALTH_PUBLISHED),
     ):
         assert key.startswith("tf:risk:")
         assert not key.startswith("tf:cache:")
@@ -44,14 +45,15 @@ def test_canonical_rejects_non_string():
             cache.canonical(bad)
 
 
-def test_health_channel_constant():
-    assert cache.CHANNEL_HEALTH == "tf:risk:health"
-
-
 def test_ttl_constants():
+    """The 3.1 channel constant and TTL_HEALTH moved out in 3.4: the channel
+    is config.settings.health_channel (test_alert_throttle.py), and the
+    endpoints read Postgres, so no health snapshot is cached."""
     assert cache.TTL_QUOTES == 300        # plan 3.2: 5 min
     assert cache.TTL_FRED == 21600        # plan 3.2: 6 h
-    assert cache.TTL_HEALTH == 300        # 3.4 scheduler cadence
+    assert cache.TTL_HEALTH_PUBLISHED == 7 * 86400
+    for gone in ("CHANNEL_HEALTH", "KIND_HEALTH", "TTL_HEALTH"):
+        assert not hasattr(cache, gone)
 
 
 # ── cached_json ──────────────────────────────────────────────────
