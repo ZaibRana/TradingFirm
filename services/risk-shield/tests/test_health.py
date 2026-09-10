@@ -59,3 +59,22 @@ def test_root_lists_endpoints(stub_state):
     assert body["service"] == config.settings.service_name
     assert body["docs"] == "/docs"
     assert "GET  /health" in body["endpoints"]
+    for route in ("GET  /market/health", "GET  /market/indicators", "GET  /market/history?days=30"):
+        assert route in body["endpoints"]
+
+
+def test_health_reports_scheduter_state(stub_state, monkeypatch):
+    """Part 3.4: whether this process schedules checks, and when it last ran one."""
+    monkeypatch.setattr(main.settings, "scheduler_enabled", False)
+    monkeypatch.setattr(main.app.state, "check_status",
+                        {"lastCheckAt": None, "lastKind": None, "lastScore": None, "lastError": None},
+                        raising=False)
+    body = stub_state().get("/health").json()
+    assert body["schedulerEnabled"] is False
+    assert body["lastCheckAt"] is None
+
+    monkeypatch.setattr(main.settings, "scheduler_enabled", True)
+    main.app.state.check_status["lastCheckAt"] = "2026-09-10T20:20:00+00:00"
+    body = stub_state().get("/health").json()
+    assert body["schedulerEnabled"] is True
+    assert body["lastCheckAt"] == "2026-09-10T20:20:00+00:00"

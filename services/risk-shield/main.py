@@ -7,22 +7,28 @@ Responsibilities:
   - Crash guard alerts
   - Health check scheduling (every 5 min during market hours)
 
-Endpoints today (Part 3.1 is the skeleton; the market endpoints land in 3.4):
-  GET /health — health check, including dependency state at boot
-  GET /       — service info
+Endpoints:
+  GET /health             — service health: dependency state at boot, scheduler state
+  GET /                   — service info
+  GET /market/health      — the latest health check (Postgres only, Part 3.4)
+  GET /market/indicators  — the six monitors of the latest check
+  GET /market/history     — checks over the last ?days=1..90 (default 30)
 
 Port: 8003
 """
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 import config
+import db
 from config import settings
 
 # ── Logging ──────────────────────────────────────────────────────
@@ -159,6 +165,9 @@ async def health():
         "db_connected": getattr(app.state, "db_pool", None) is not None,
         "redis_connected": getattr(app.state, "redis", None) is not None,
         "fredConfigured": settings.fred_configured,
+        # Part 3.4: whether this process schedules checks, and its last one.
+        "schedulerEnabled": settings.scheduler_enabled,
+        "lastCheckAt": (getattr(app.state, "check_status", None) or {}).get("lastCheckAt"),
     }
 
 
@@ -171,5 +180,127 @@ async def root():
         "docs": "/docs",
         "endpoints": [
             "GET  /health",
+            "GET  /market/health",
+            "GET  /market/indicators",
+            "GET  /market/history?days=30",
+        ],
+    }
+
+
+# ── /market (Part 3.4, spec decision 7) ──────────────────────────
+# Postgres only: an endpoint never computes a score or downloads, so the
+# current answer and the history cannot disagree, and a failed insert shows
+# up as an older checkedAt.
+
+REGIME_MESSAGES = {
+    "HEALTHY": "Market conditions are favorable",
+    "CAUTIOUS": "Elevated risk — trade with caution",
+    "DANGER": "High risk — consider reducing exposure",
+    "CRITICAL": "⚠️ PROTECT CAPITAL — market in distress",
+}
+NO_CHECKS_DETAIL = "no health checks yet"      # never FastAPI's "Not Found" of a wrong route
+DB_UNAVAILABLE_DETAIL = "database unavailable"
+HISTORY_DAYS_DEFAULT = 30
+HISTORY_DAYS_MAX = 90
+
+
+async def _read(helper, *args):
+    """One db read helper; no pool or a database failure is a 503."""
+    pool = getattr(app.state, "db_pool", None)
+    if pool is None:
+        raise HTTPException(status_code=503, detail=DB_UNAVAILABLE_DETAIL)
+    try:
+        return await helper(pool, *args)
+    except db.DB_FAILURES as e:
+        logger.warning(f"/market read failed: {e!r}")
+        raise HTTPException(status_code=503, detail=DB_UNAVAILABLE_DETAIL) from None
+
+
+async def _latest_row() -> dict:
+    row = await _read(db.latest_health_check)
+    if row is None:
+        raise HTTPException(status_code=404, detail=NO_CHECKS_DETAIL)
+    return row
+
+
+def _indicators(row: dict) -> dict:
+    """The row's indicators JSONB as a dict, {} when it is not a JSON object
+    (asyncpg returns jsonb as text when no codec is set)."""
+    value = row.get("indicators")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _valid_monitors(value: Any) -> Optional[dict]:
+    if isinstance(value, dict) and all(isinstance(m, dict) for m in value.values()):
+        return value
+    return None
+
+
+@app.get("/market/health")
+async def market_health():
+    """
+    The latest check. settleScore / settleCheckedAt are the trend base (the
+    latest scored settle before that check's session open), not the last
+    published score, which lives only in the tf:risk:health payload.
+    lastScored appears only when the latest check has no score.
+    """
+    row = await _latest_row()
+    ind = _indicators(row)
+    checked_at = row["checked_at"]
+    body = {
+        "score": row["score"],
+        "regime": row["regime"],
+        "trend": row["trend"],
+        "settleScore": ind.get("settleScore"),
+        "settleCheckedAt": ind.get("settleCheckedAt"),
+        "message": REGIME_MESSAGES.get(row["regime"]),
+        "checkedAt": checked_at.isoformat(),
+        "ageSeconds": int((datetime.now(timezone.utc) - checked_at).total_seconds()),
+        "kind": ind.get("kind"),
+        "coverage": ind.get("coverage"),
+        "stale": ind.get("stale"),
+    }
+    if row["score"] is None:
+        scored = await _read(db.latest_scored_health_check)
+        body["lastScored"] = (
+            {"score": scored["score"], "regime": scored["regime"],
+             "checkedAt": scored["checked_at"].isoformat()}
+            if scored is not None else None
+        )
+    return body
+
+
+@app.get("/market/indicators")
+async def market_indicators():
+    """The six monitors of the latest check, each 3.3's contract + weight.
+    A row whose JSONB has the wrong shape answers monitors: null, never 500."""
+    row = await _latest_row()
+    ind = _indicators(row)
+    return {
+        "checkedAt": row["checked_at"].isoformat(),
+        "kind": ind.get("kind"),
+        "coverage": ind.get("coverage"),
+        "inputs": ind.get("inputs"),
+        "monitors": _valid_monitors(ind.get("monitors")),
+    }
+
+
+@app.get("/market/history")
+async def market_history(days: int = Query(HISTORY_DAYS_DEFAULT, ge=1, le=HISTORY_DAYS_MAX)):
+    """Checks over the last `days`, ascending, null scores included. An
+    empty window is 200 with rows: [] (Part 1.4's rule), not a 404."""
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = await _read(db.health_history, since)
+    return {
+        "days": days,
+        "rows": [
+            {"checkedAt": r["checked_at"].isoformat(), "score": r["score"], "regime": r["regime"],
+             "trend": r["trend"], "kind": r["kind"], "stale": r["stale"]}
+            for r in rows
         ],
     }
