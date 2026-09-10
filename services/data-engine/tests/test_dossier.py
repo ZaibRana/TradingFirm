@@ -799,7 +799,12 @@ def _get(url: str = f"/dossier/{TICKER}"):
     return TestClient(main.app).get(url)
 
 
-def test_dossier_camelcase_shape(_no_network, app_state):
+def test_dossier_camelcase_shape(_no_network, app_state, monkeypatch):
+    # Freeze the endpoint's clock to NOW (the 2026-09-09 session). Without it
+    # staleWeekdays compares TODAY's bars with the real session and the test
+    # broke at the 2026-09-10 close. Test-only: the code under test is unchanged.
+    from dossier.assemble import DossierContext
+    monkeypatch.setattr(DossierContext, "now_utc", lambda self: NOW)
     _mount_all(_no_network)
     resp = _get()
     assert resp.status_code == 200
