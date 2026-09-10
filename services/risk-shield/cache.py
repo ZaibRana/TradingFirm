@@ -35,6 +35,9 @@ CHANNEL_HEALTH = f"{RISK_PREFIX}health"
 KIND_QUOTES = "quotes"   # 3.2: the batched core-ticker download
 KIND_FRED = "fred"       # 3.2: one FRED series
 KIND_HEALTH = "health"   # 3.4: the latest health snapshot
+# 3.3: the last *full* quotes body, served with stale: true when the source
+# refuses, cools down or comes back degraded (spec 3.3 decision 2).
+KIND_QUOTES_LAST = "quotes_last"
 
 # TTLs (seconds)
 TTL_QUOTES = 300     # 5 min (plan 3.2)
@@ -45,6 +48,7 @@ TTL_HEALTH = 300     # 5 min, the scheduler's market-hours cadence (3.4)
 # transient empty FRED answer must not blank a series for six hours (Part
 # 3.2 decision 3). Same number as data-engine's TTL_DOSSIER_ERROR.
 TTL_DEGRADED = 120
+TTL_LAST_KNOWN = 86400   # 24 h: how long a last-known quotes body may stand in
 
 # Source cooldowns (Part 3.2 decision 4, copied from data-engine 2.4): set
 # after a source refuses us, checked before any request. Source-wide — one

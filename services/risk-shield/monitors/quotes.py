@@ -21,6 +21,11 @@ kept sending requests. The lock is held until the thread returns.
 REFUSAL DETECTION (decision 6): 1.5.1 catches YFRateLimitError per ticker
 and only logs it, so a handler on the "yfinance" logger watches the
 download. Version-guarded because it depends on that log format.
+
+LAST-KNOWN (Part 3.3 decision 2): every full answer is also written to
+tf:risk:cache:quotes_last for 24 h. get_quotes_view() is what the regime
+monitors read: it serves that body with stale: true on a cooldown, a
+refusal, an error or a degraded answer. Stale is decided here, once.
 """
 
 import asyncio
@@ -37,14 +42,18 @@ from yfinance.exceptions import YFRateLimitError
 
 from cache import (
     KIND_QUOTES,
+    KIND_QUOTES_LAST,
     SOURCE_YFINANCE,
     TTL_COOLDOWN_YFINANCE,
     TTL_DEGRADED,
+    TTL_LAST_KNOWN,
     TTL_QUOTES,
     cached_json,
     canonical,
     cooldown_remaining,
+    get_cached_json,
     risk_key,
+    set_cached_json,
     start_cooldown,
 )
 from monitors.errors import QuotesCoolingDown, QuotesError, QuotesRateLimited
@@ -247,10 +256,13 @@ async def get_core_quotes(r, memory, *, now: Callable[[], datetime] = _utc_now) 
             del df          # G8: nothing but the JSON envelope survives
             gc.collect()
 
-        if body["reason"] == "empty":
+        if body["reason"] is None:
+            # Before cached_json writes the main key (spec 3.3 writes table).
+            await write_last_known(r, body)
+        elif body["reason"] == "empty":
             await start_cooldown(r, memory, SOURCE_YFINANCE, TTL_COOLDOWN_YFINANCE)
             logger.warning("Core quotes: all 17 tickers empty, yfinance cooldown started")
-        elif body["reason"] == "partial":
+        else:
             logger.warning(f"Core quotes: partial, missing {body['missing']}")
         return body
 
@@ -258,3 +270,119 @@ async def get_core_quotes(r, memory, *, now: Callable[[], datetime] = _utc_now) 
         return await cached_json(
             r, risk_key(KIND_QUOTES), None, fetch, valid=valid_quotes, ttl_for=quotes_ttl
         )
+
+
+# ── Last-known body and the monitors' view (Part 3.3) ────────────
+
+def valid_last_known(body: Any) -> bool:
+    """Only a full answer is ever stored or served as last-known."""
+    return valid_quotes(body) and body["reason"] is None
+
+
+async def write_last_known(r, body: dict) -> None:
+    """Keep a copy of a full body for 24 h. A write failure is logged and
+    never fails the download; the previous copy stands until its TTL."""
+    if r is None:
+        return
+    try:
+        await set_cached_json(r, risk_key(KIND_QUOTES_LAST), body, TTL_LAST_KNOWN)
+    except Exception as e:
+        logger.warning(f"Last-known quotes write failed: {e}")
+
+
+async def read_last_known(r) -> Optional[dict]:
+    """The last full body, or None when Redis is absent or raising, the key
+    is missing or expired, or it holds unparseable JSON or the wrong shape."""
+    if r is None:
+        return None
+    key = risk_key(KIND_QUOTES_LAST)
+    try:
+        body = await get_cached_json(r, key)
+    except Exception as e:
+        logger.warning(f"Last-known quotes read failed: {e}")
+        return None
+    if body is None:
+        return None
+    if not valid_last_known(body):
+        logger.warning(f"Cache at {key} has the wrong shape, ignoring")
+        return None
+    return body
+
+
+def _entry(body: dict, ticker: str, stale: bool) -> dict:
+    return {**body["tickers"][ticker], "asOf": body["asOf"], "stale": stale}
+
+
+async def get_quotes_view(r, memory, *, now: Callable[[], datetime] = _utc_now) -> dict:
+    """
+    What the regime monitors read: {asOf, source, reason, tickers: {T:
+    {date[], open[], …, asOf, stale}}, staleTickers}. Never raises for a
+    source state; each ticker carries the asOf of the body it came from, so
+    the partial-bar rule reads the download time.
+
+    source: fresh | cached (a full or partial answer), last_known (the whole
+    view from the 24 h copy), none (nothing to serve). reason: null |
+    partial | empty | cooldown | rate_limited | error.
+    """
+    body: Optional[dict] = None
+    from_cache = False
+    try:
+        body, from_cache = await get_core_quotes(r, memory, now=now)
+        reason = body["reason"]
+    except QuotesCoolingDown:
+        reason = "cooldown"
+    except QuotesRateLimited:
+        reason = "rate_limited"
+    except QuotesError as e:
+        # A bug must not hide for 24 h behind a quiet stale flag.
+        logger.error(f"Core quotes failed, serving last-known: {e}")
+        reason = "error"
+
+    if body is not None and reason is None:
+        return {
+            "asOf": body["asOf"],
+            "source": "cached" if from_cache else "fresh",
+            "reason": None,
+            "tickers": {t: _entry(body, t, False) for t in CORE_TICKERS},
+            "staleTickers": [],
+        }
+
+    last = await read_last_known(r)
+
+    if body is not None and reason == "partial":
+        tickers = {}
+        for t in CORE_TICKERS:
+            if t in body["tickers"]:
+                tickers[t] = _entry(body, t, False)
+            elif last is not None:
+                tickers[t] = _entry(last, t, True)
+        logger.warning(
+            f"Core quotes partial: {body['missing']} "
+            f"{'from last-known ' + last['asOf'] if last else 'unavailable (no last-known)'}"
+        )
+        return {
+            "asOf": body["asOf"],
+            "source": "cached" if from_cache else "fresh",
+            "reason": "partial",
+            "tickers": tickers,
+            "staleTickers": list(body["missing"]),
+        }
+
+    # empty, cooldown, rate_limited, error: the whole view is last-known.
+    if last is not None:
+        logger.warning(f"Core quotes {reason}: serving last-known from {last['asOf']}")
+        return {
+            "asOf": last["asOf"],
+            "source": "last_known",
+            "reason": reason,
+            "tickers": {t: _entry(last, t, True) for t in CORE_TICKERS},
+            "staleTickers": list(CORE_TICKERS),
+        }
+    logger.warning(f"Core quotes {reason}: no last-known body, monitors cannot score")
+    return {
+        "asOf": None,
+        "source": "none",
+        "reason": reason,
+        "tickers": {},
+        "staleTickers": list(CORE_TICKERS),
+    }

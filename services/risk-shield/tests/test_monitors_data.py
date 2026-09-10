@@ -16,7 +16,7 @@ import pytest
 import respx
 from yfinance.exceptions import YFRateLimitError
 
-from cache import MemoryCooldowns
+from cache import KIND_QUOTES_LAST, TTL_LAST_KNOWN, MemoryCooldowns, risk_key
 from monitors import fred, quotes
 from monitors.errors import (
     FredCoolingDown,
@@ -635,3 +635,238 @@ async def test_quotes_refuses_unexpected_yfinance_version(fake_download, monkeyp
         await quotes.get_core_quotes(r, MemoryCooldowns(), now=_now)
     assert fake.calls == []
     assert KEY_QUOTES not in r.store
+
+
+# ── Part 3.3: last-known body and the monitors' view ─────────────
+
+KEY_LAST = "tf:risk:cache:quotes_last"
+LAST_AT = datetime(2026, 9, 9, 20, 30, tzinfo=timezone.utc)
+
+
+def _last_body(close=90.0):
+    df = _frame()
+    for t in quotes.CORE_TICKERS:
+        df[(t, "Close")] = close
+    return quotes.build_envelope(df, quotes.CORE_TICKERS, lambda: LAST_AT)
+
+
+def _seed_last(r, body=None):
+    r.store[KEY_LAST] = json.dumps(body if body is not None else _last_body())
+    r.ttls[KEY_LAST] = TTL_LAST_KNOWN
+
+
+def _seed_cooldown(r):
+    r.store[COOL_YF] = "1"
+    r.ttls[COOL_YF] = 900
+
+
+class KeyFailRedis(FakeRedis):
+    """Fails GET or SET on one key only, so the main quotes key stays healthy."""
+
+    def __init__(self, *, get_key=None, set_key=None):
+        super().__init__()
+        self.get_key = get_key
+        self.set_key = set_key
+
+    async def get(self, key):
+        if key == self.get_key:
+            raise RuntimeError("boom: redis get")
+        return await super().get(key)
+
+    async def set(self, key, value, ex=None):
+        if key == self.set_key:
+            self.set_calls.append((key, value, ex))
+            raise RuntimeError("boom: redis set")
+        return await super().set(key, value, ex=ex)
+
+
+def _assert_all_stale_from_last(view, reason):
+    assert (view["source"], view["reason"], view["asOf"]) == ("last_known", reason, LAST_AT.isoformat())
+    assert view["staleTickers"] == list(quotes.CORE_TICKERS)
+    assert list(view["tickers"]) == list(quotes.CORE_TICKERS)
+    assert all(e["stale"] and e["asOf"] == LAST_AT.isoformat() for e in view["tickers"].values())
+    assert view["tickers"]["SPY"]["close"] == [90.0] * 3
+
+
+def test_last_known_key_namespace():
+    assert risk_key(KIND_QUOTES_LAST) == KEY_LAST
+    assert TTL_LAST_KNOWN == 86400
+
+
+@pytest.mark.asyncio
+async def test_quotes_full_answer_writes_last_known(fake_download):
+    fake_download()
+    r = FakeRedis()
+    body, _ = await quotes.get_core_quotes(r, MemoryCooldowns(), now=_now)
+    assert json.loads(r.store[KEY_LAST]) == body
+    assert r.ttls[KEY_LAST] == 86400
+    assert [k for k, _, _ in r.set_calls] == [KEY_LAST, KEY_QUOTES]   # before the main key
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty_for", [("ES=F", "NQ=F"), quotes.CORE_TICKERS], ids=["partial", "empty"])
+async def test_quotes_degraded_answer_never_writes_last_known(fake_download, empty_for):
+    fake_download(frame=_frame(empty_for=empty_for))
+    r = FakeRedis()
+    body, _ = await quotes.get_core_quotes(r, MemoryCooldowns(), now=_now)
+    assert body["reason"] in ("partial", "empty")
+    assert KEY_LAST not in r.store
+    assert all(k != KEY_LAST for k, _, _ in r.set_calls)
+
+
+@pytest.mark.asyncio
+async def test_quotes_view_fresh_nothing_stale(fake_download):
+    fake_download()
+    view = await quotes.get_quotes_view(FakeRedis(), MemoryCooldowns(), now=_now)
+    assert set(view) == {"asOf", "source", "reason", "tickers", "staleTickers"}
+    assert (view["asOf"], view["source"], view["reason"], view["staleTickers"]) == (
+        NOW.isoformat(), "fresh", None, []
+    )
+    assert list(view["tickers"]) == list(quotes.CORE_TICKERS)
+    spy = view["tickers"]["SPY"]
+    assert (spy["asOf"], spy["stale"], spy["close"]) == (NOW.isoformat(), False, [100.5] * 3)
+
+
+@pytest.mark.asyncio
+async def test_quotes_view_cooldown_serves_last_known_stale(fake_download):
+    fake = fake_download()
+    r = FakeRedis()
+    _seed_last(r)
+    _seed_cooldown(r)
+    view = await quotes.get_quotes_view(r, MemoryCooldowns(), now=_now)
+    _assert_all_stale_from_last(view, "cooldown")
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_quotes_view_refusal_serves_last_known_stale(fake_download):
+    fake_download(log=RATE_LIMIT_LOGS[0])
+    r = FakeRedis()
+    _seed_last(r)
+    view = await quotes.get_quotes_view(r, MemoryCooldowns(), now=_now)
+    _assert_all_stale_from_last(view, "rate_limited")
+    assert KEY_QUOTES not in r.store
+
+
+@pytest.mark.asyncio
+async def test_quotes_view_error_serves_last_known_stale(fake_download, caplog):
+    fake_download(raises=RuntimeError("socket gone"))
+    r = FakeRedis()
+    _seed_last(r)
+    with caplog.at_level(logging.ERROR, logger="monitors.quotes"):
+        view = await quotes.get_quotes_view(r, MemoryCooldowns(), now=_now)
+    _assert_all_stale_from_last(view, "error")
+    assert any(rec.levelno == logging.ERROR and rec.name == "monitors.quotes" for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_quotes_view_partial_fills_missing_from_last_known(fake_download):
+    fake_download(frame=_frame(empty_for=("ES=F", "NQ=F")))
+    r = FakeRedis()
+    _seed_last(r)
+    view = await quotes.get_quotes_view(r, MemoryCooldowns(), now=_now)
+    assert (view["source"], view["reason"], view["asOf"]) == ("fresh", "partial", NOW.isoformat())
+    assert view["staleTickers"] == ["ES=F", "NQ=F"]
+    assert list(view["tickers"]) == list(quotes.CORE_TICKERS)
+    spy, es = view["tickers"]["SPY"], view["tickers"]["ES=F"]
+    assert (spy["close"][-1], spy["asOf"], spy["stale"]) == (100.5, NOW.isoformat(), False)
+    assert (es["close"][-1], es["asOf"], es["stale"]) == (90.0, LAST_AT.isoformat(), True)
+
+
+@pytest.mark.asyncio
+async def test_quotes_view_empty_serves_last_known(fake_download):
+    fake_download(frame=_frame(empty_for=quotes.CORE_TICKERS))
+    r = FakeRedis()
+    _seed_last(r)
+    view = await quotes.get_quotes_view(r, MemoryCooldowns(), now=_now)
+    _assert_all_stale_from_last(view, "empty")
+
+
+@pytest.mark.asyncio
+async def test_quotes_view_no_last_known_is_empty_not_error(fake_download):
+    fake = fake_download()
+    r = FakeRedis()
+    _seed_cooldown(r)
+    view = await quotes.get_quotes_view(r, MemoryCooldowns(), now=_now)
+    assert view == {
+        "asOf": None, "source": "none", "reason": "cooldown",
+        "tickers": {}, "staleTickers": list(quotes.CORE_TICKERS),
+    }
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored",
+    [
+        "{}",
+        json.dumps({**_last_body(), "tickers": {"SPY": {}}, "missing": []}),
+        json.dumps({**_last_body(), "reason": "partial"}),
+    ],
+    ids=["bare_empty_dict", "ticker_list_change", "reason_not_null"],
+)
+async def test_quotes_last_known_wrong_shape_ignored(fake_download, stored):
+    fake_download()
+    r = FakeRedis()
+    r.store[KEY_LAST] = stored
+    _seed_cooldown(r)
+    view = await quotes.get_quotes_view(r, MemoryCooldowns(), now=_now)
+    assert (view["source"], view["reason"], view["tickers"]) == ("none", "cooldown", {})
+
+
+@pytest.mark.asyncio
+async def test_quotes_last_known_corrupt_json_is_absent(fake_download, caplog):
+    fake_download()
+    r = FakeRedis()
+    r.store[KEY_LAST] = "{not json"
+    _seed_cooldown(r)
+    with caplog.at_level(logging.WARNING, logger="cache"):
+        view = await quotes.get_quotes_view(r, MemoryCooldowns(), now=_now)
+    assert (view["source"], view["reason"], view["tickers"]) == ("none", "cooldown", {})
+    assert any("not valid JSON" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_quotes_view_without_redis_has_no_last_known(fake_download):
+    fake = fake_download()
+    memory = MemoryCooldowns()
+    fresh = await quotes.get_quotes_view(None, memory, now=_now)   # nowhere to write, no raise
+    assert (fresh["source"], fresh["reason"]) == ("fresh", None)
+    memory.start("YFINANCE")
+    view = await quotes.get_quotes_view(None, memory, now=_now)
+    assert (view["source"], view["reason"], view["tickers"]) == ("none", "cooldown", {})
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_quotes_last_known_set_raise_still_returns_body(fake_download, caplog):
+    fake_download()
+    r = KeyFailRedis(set_key=KEY_LAST)
+    with caplog.at_level(logging.WARNING, logger="monitors.quotes"):
+        body, from_cache = await quotes.get_core_quotes(r, MemoryCooldowns(), now=_now)
+    assert (body["reason"], from_cache) == (None, False)
+    assert KEY_LAST not in r.store
+    assert r.ttls[KEY_QUOTES] == 300
+    assert any("Last-known quotes write failed" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_quotes_last_known_get_raise_is_absent(fake_download):
+    fake_download()
+    r = KeyFailRedis(get_key=KEY_LAST)
+    _seed_last(r)
+    _seed_cooldown(r)
+    view = await quotes.get_quotes_view(r, MemoryCooldowns(), now=_now)
+    assert (view["source"], view["reason"], view["tickers"]) == ("none", "cooldown", {})
+
+
+@pytest.mark.asyncio
+async def test_quotes_view_cache_hit_no_last_known_write(fake_download):
+    fake = fake_download()
+    r = FakeRedis()
+    await quotes.get_quotes_view(r, MemoryCooldowns(), now=_now)
+    r.set_calls.clear()
+    view = await quotes.get_quotes_view(r, MemoryCooldowns(), now=_now)
+    assert (view["source"], view["reason"], view["staleTickers"]) == ("cached", None, [])
+    assert r.set_calls == []
+    assert len(fake.calls) == 1
