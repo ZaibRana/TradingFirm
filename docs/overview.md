@@ -420,8 +420,7 @@ scaffold with no business logic. `risk-shield` has its infrastructure
 (config, pool, cache, migration, dev twin) as of Part 3.1 and its two
 data fetchers (core quotes, FRED) as of Part 3.2, its health score and
 regime as of Part 3.3, and a market-hours scheduler plus the `/market/*`
-read endpoints as of Part 3.4. The scheduler is enabled in prod compose,
-and the prod rebuild that starts it waits for a go (`docs/progress.md`). The `scanner/`
+read endpoints as of Part 3.4, running in prod since 2026-09-10. The `scanner/`
 standalone scripts predate the data-engine port and stay only as a frozen
 reference — see [`.agents/AGENTS.md`](../.agents/AGENTS.md) for the full
 rationale.
