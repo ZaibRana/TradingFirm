@@ -14,8 +14,9 @@ module loads without them.
 
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Optional
+from zoneinfo import ZoneInfo
 
 from cache import (
     KIND_FRED,
@@ -232,36 +233,96 @@ async def read_last_known(r, series_id: str) -> Optional[dict]:
     return body
 
 
-def _series_view(status: str, source: str, stale_reason: Optional[str], observations: list) -> dict:
+# ── Freshness by series cadence (Part 3.6a, spec decision 4) ─────
+# (cadence, maxAgeDays): the most calendar days (ET) the latest observation
+# may lag before the series reads stale. Provisional. The 2026-09-10 step 0
+# live check found every daily series 1 day behind (DGS10 skips Labor Day),
+# CPIAUCSL 71 days (the eve of a release; ~74 is the longest normal age) and
+# UNRATE 40 (~62 the longest normal). DCOILWTICO was 1 day that run but ~9
+# days in 3.2's canary, hence 14. Daily 6 = a Thanksgiving-length gap + lag.
+FRED_CADENCE = {
+    "VIXCLS": ("daily", 6),
+    "DGS10": ("daily", 6),
+    "DGS2": ("daily", 6),
+    "T10Y2Y": ("daily", 6),
+    "DFF": ("daily", 6),
+    "DCOILWTICO": ("daily", 14),
+    "CPIAUCSL": ("monthly", 80),
+    "UNRATE": ("monthly", 70),
+}
+ET = ZoneInfo("America/New_York")
+MONTH_AGO_DAYS = 30
+YEAR_AGO_DAYS = 365
+
+
+def _on_or_before(observations: list, day: date) -> Optional[dict]:
+    """The last observation dated on or before `day` (observations ascend)."""
+    for obs in reversed(observations):
+        if date.fromisoformat(obs["date"]) <= day:
+            return obs
+    return None
+
+
+def compact_points(observations: list) -> dict:
+    """{latest, monthAgo, yearAgo}: the last observation, and the last one on
+    or before latest − 30 / − 365 days. None where history is too short. The
+    arrays themselves never leave the view."""
+    if not observations:
+        return {"latest": None, "monthAgo": None, "yearAgo": None}
+    latest = observations[-1]
+    latest_day = date.fromisoformat(latest["date"])
+    return {
+        "latest": latest,
+        "monthAgo": _on_or_before(observations, latest_day - timedelta(days=MONTH_AGO_DAYS)),
+        "yearAgo": _on_or_before(observations, latest_day - timedelta(days=YEAR_AGO_DAYS)),
+    }
+
+
+def _series_view(sid: str, status: str, source: str, stale_reason: Optional[str],
+                 observations: list, today: date) -> dict:
+    """One series for the inputs. Stale reasons, first match: no_data,
+    last_known, then age (the latest observation older than maxAgeDays)."""
+    cadence, max_age = FRED_CADENCE[sid]
+    points = compact_points(observations)
+    age = (today - date.fromisoformat(points["latest"]["date"])).days if points["latest"] else None
+    if stale_reason is None and age is not None and age > max_age:
+        stale_reason = "age"
     return {
         "status": status,
         "source": source,
         "stale": stale_reason is not None,
         "staleReason": stale_reason,
-        "latest": observations[-1] if observations else None,
+        "cadence": cadence,
+        "maxAgeDays": max_age,
+        "ageDays": age,
+        **points,
     }
 
 
 async def get_fred_view(r, memory, client, *, now: Callable[[], datetime] = _utc_now) -> dict:
     """
     What the macro inputs read: {SERIES: {status, source, stale, staleReason,
-    latest}} for the 8 series in plan order. fred_snapshot unchanged, then
-    every series whose status is not "ok" is filled from last-known with
-    stale: true. Never raises for a source state.
+    cadence, maxAgeDays, ageDays, latest, monthAgo, yearAgo}} for the 8
+    series in plan order. fred_snapshot unchanged, then every series whose
+    status is not "ok" is filled from last-known with stale: true, and every
+    series is judged against its cadence on the ET date. Never raises for a
+    source state.
     """
+    today = now().astimezone(ET).date()
     snapshot = await fred_snapshot(r, memory, client, now=now)
     view: dict[str, dict] = {}
     for sid in FRED_SERIES:
         entry = snapshot[sid]
         if entry["status"] == "ok":
             source = "cache" if entry["cached"] else "fresh"
-            view[sid] = _series_view("ok", source, None, entry["observations"])
+            view[sid] = _series_view(sid, "ok", source, None, entry["observations"], today)
             continue
         last = await read_last_known(r, sid)
         if last is None:
-            view[sid] = _series_view(entry["status"], "none", "no_data", [])
+            view[sid] = _series_view(sid, entry["status"], "none", "no_data", [], today)
         else:
-            view[sid] = _series_view(entry["status"], "last_known", "last_known", last["observations"])
+            view[sid] = _series_view(sid, entry["status"], "last_known", "last_known",
+                                     last["observations"], today)
     stale = [sid for sid, v in view.items() if v["stale"]]
     if stale:
         logger.info(f"FRED view: stale {stale}")

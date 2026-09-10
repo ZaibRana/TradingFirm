@@ -68,6 +68,14 @@ def _seed_last(r, sids=fred.FRED_SERIES, **kw):
         r.store[_last_key(sid)] = json.dumps(_envelope(sid, **kw))
 
 
+SOURCE_KEYS = ("status", "source", "stale", "staleReason", "latest")
+
+
+def _pick(entry):
+    """The source-state keys (commit 3a); cadence keys are 3b's own rows."""
+    return {k: entry[k] for k in SOURCE_KEYS}
+
+
 # ── Last-known writes ────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -124,8 +132,8 @@ async def test_fred_view_refusal_serves_last_known_stale(exc, status):
     _seed_last(r)
     view = await fred.get_fred_view(r, MemoryCooldowns(), FakeFredClient(raises={"VIXCLS": exc}), now=_now)
     assert list(view) == list(fred.FRED_SERIES)
-    assert view["VIXCLS"] == {"status": status, "source": "last_known", "stale": True,
-                              "staleReason": "last_known", "latest": {"date": "2026-09-01", "value": 2.5}}
+    assert _pick(view["VIXCLS"]) == {"status": status, "source": "last_known", "stale": True,
+                                     "staleReason": "last_known", "latest": {"date": "2026-09-01", "value": 2.5}}
     for sid in fred.FRED_SERIES[1:]:
         assert view[sid]["status"] == "skipped"
         assert view[sid]["source"] == "last_known" and view[sid]["stale"] is True
@@ -138,12 +146,12 @@ async def test_fred_view_series_error_serves_last_known():
     client = FakeFredClient(raises={"DGS2": FredError("DGS2: HTTP 404")})
     view = await fred.get_fred_view(r, MemoryCooldowns(), client, now=_now)
     assert client.calls == list(fred.FRED_SERIES)
-    assert view["DGS2"] == {"status": "error", "source": "last_known", "stale": True,
-                            "staleReason": "last_known", "latest": {"date": "2026-09-01", "value": 2.5}}
+    assert _pick(view["DGS2"]) == {"status": "error", "source": "last_known", "stale": True,
+                                   "staleReason": "last_known", "latest": {"date": "2026-09-01", "value": 2.5}}
     for sid in fred.FRED_SERIES:
         if sid != "DGS2":
-            assert view[sid] == {"status": "ok", "source": "fresh", "stale": False, "staleReason": None,
-                                 "latest": {"date": "2026-09-08", "value": 4.12}}
+            assert _pick(view[sid]) == {"status": "ok", "source": "fresh", "stale": False, "staleReason": None,
+                                        "latest": {"date": "2026-09-08", "value": 4.12}}
 
 
 @pytest.mark.asyncio
@@ -165,8 +173,9 @@ async def test_fred_view_no_last_known_is_no_data():
     """The twin: no key, nothing stored. No raise, every series says why."""
     client = FakeFredClient(raises={"VIXCLS": FredNotConfigured("VIXCLS: FRED_API_KEY is not set")})
     view = await fred.get_fred_view(FakeRedis(), MemoryCooldowns(), client, now=_now)
-    assert view["VIXCLS"] == {"status": "unconfigured", "source": "none", "stale": True,
-                              "staleReason": "no_data", "latest": None}
+    assert _pick(view["VIXCLS"]) == {"status": "unconfigured", "source": "none", "stale": True,
+                                     "staleReason": "no_data", "latest": None}
+    assert view["VIXCLS"]["ageDays"] is None and view["VIXCLS"]["monthAgo"] is None
     assert all(view[s]["staleReason"] == "no_data" and view[s]["status"] == "skipped"
                for s in fred.FRED_SERIES[1:])
 
@@ -208,3 +217,74 @@ async def test_fred_view_repeat_call_is_cached():
     assert all(v["source"] == "fresh" for v in first.values())
     assert all(v["source"] == "cache" and v["stale"] is False for v in second.values())
     assert [v["latest"] for v in first.values()] == [v["latest"] for v in second.values()]
+
+
+# ── Freshness by cadence (commit 3b, spec decision 4) ────────────
+
+def test_fred_cadence_table_covers_every_series():
+    """Spec 3.6a decision 4's table, set from the step 0 live check."""
+    assert set(fred.FRED_CADENCE) == set(fred.FRED_SERIES)
+    assert fred.FRED_CADENCE == {
+        "VIXCLS": ("daily", 6), "DGS10": ("daily", 6), "DGS2": ("daily", 6),
+        "T10Y2Y": ("daily", 6), "DFF": ("daily", 6), "DCOILWTICO": ("daily", 14),
+        "CPIAUCSL": ("monthly", 80), "UNRATE": ("monthly", 70),
+    }
+
+
+def _body_ending(day):
+    return _obs((day.isoformat(), "1.0"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sid", fred.FRED_SERIES)
+async def test_fred_freshness_by_series_cadence(sid):
+    today = NOW.astimezone(fred.ET).date()
+    max_age = fred.FRED_CADENCE[sid][1]
+    from datetime import timedelta
+
+    at_limit = FakeFredClient(bodies={sid: _body_ending(today - timedelta(days=max_age))})
+    view = await fred.get_fred_view(FakeRedis(), MemoryCooldowns(), at_limit, now=_now)
+    assert (view[sid]["ageDays"], view[sid]["stale"], view[sid]["staleReason"]) == (max_age, False, None)
+    assert view[sid]["cadence"] == fred.FRED_CADENCE[sid][0] and view[sid]["maxAgeDays"] == max_age
+
+    past = FakeFredClient(bodies={sid: _body_ending(today - timedelta(days=max_age + 1))})
+    view = await fred.get_fred_view(FakeRedis(), MemoryCooldowns(), past, now=_now)
+    assert (view[sid]["ageDays"], view[sid]["stale"], view[sid]["staleReason"]) == (max_age + 1, True, "age")
+    assert view[sid]["status"] == "ok" and view[sid]["source"] == "fresh"
+
+
+def test_fred_compact_points():
+    obs = [{"date": d, "value": v} for d, v in (
+        ("2025-08-01", 1.0), ("2025-09-10", 2.0), ("2025-09-12", 3.0),   # year-ago window
+        ("2026-08-05", 4.0), ("2026-08-12", 5.0),                         # month-ago window (gap to 09-08)
+        ("2026-09-08", 6.0),
+    )]
+    assert fred.compact_points(obs) == {
+        "latest": {"date": "2026-09-08", "value": 6.0},
+        "monthAgo": {"date": "2026-08-05", "value": 4.0},    # last on or before 2026-08-09
+        "yearAgo": {"date": "2025-08-01", "value": 1.0},     # last on or before 2025-09-08
+    }
+    # History too short for either comparison point.
+    assert fred.compact_points(obs[-2:]) == {
+        "latest": {"date": "2026-09-08", "value": 6.0}, "monthAgo": None, "yearAgo": None}
+    assert fred.compact_points(obs[-1:]) == {"latest": obs[-1], "monthAgo": None, "yearAgo": None}
+    assert fred.compact_points([]) == {"latest": None, "monthAgo": None, "yearAgo": None}
+
+
+@pytest.mark.asyncio
+async def test_fred_view_never_carries_observation_arrays():
+    view = await fred.get_fred_view(FakeRedis(), MemoryCooldowns(), FakeFredClient(), now=_now)
+    for entry in view.values():
+        assert set(entry) == {"status", "source", "stale", "staleReason", "cadence", "maxAgeDays",
+                              "ageDays", "latest", "monthAgo", "yearAgo"}
+
+
+@pytest.mark.asyncio
+async def test_fred_age_uses_eastern_date():
+    """03:30 UTC on 09-11 is 23:30 ET on 09-10: a daily series ending 09-04
+    is 6 days old (fresh), not 7 (stale by the UTC date)."""
+    late = datetime(2026, 9, 11, 3, 30, tzinfo=timezone.utc)
+    client = FakeFredClient(bodies={"DGS10": _obs(("2026-09-04", "4.0"))})
+    view = await fred.get_fred_view(FakeRedis(), MemoryCooldowns(), client, now=lambda: late)
+    assert view["DGS10"]["ageDays"] == 6
+    assert view["DGS10"]["stale"] is False
