@@ -77,11 +77,42 @@ async def lifespan(app: FastAPI):
         logger.warning(f"⚠️  Database unavailable (health checks not persisted): {e!r}")
         app.state.db_pool = None
 
+    # Regime scheduler (Part 3.4 decision 8). The cooldown clock and the
+    # status dict exist either way (small, and /health reads the status);
+    # the task only when SCHEDULER_ENABLED is true. It starts even with both
+    # dependencies down: checks then run without cache, publish or rows.
+    from cache import MemoryCooldowns
+    app.state.cooldowns = MemoryCooldowns()
+    app.state.check_status = {"lastCheckAt": None, "lastKind": None, "lastScore": None, "lastError": None}
+    app.state.scheduler_task = None
+    if settings.scheduler_enabled:
+        import scheduler
+        app.state.scheduler_task = asyncio.create_task(scheduler.run_scheduler(app.state))
+        logger.info("✅ Regime scheduler started")
+    else:
+        logger.info("Regime scheduler disabled (SCHEDULER_ENABLED is not true)")
+
     logger.info(f"Risk Shield ready on port {settings.service_port}")
     yield
 
     # Shutdown
     logger.info("Shutting down Risk Shield...")
+    # The scheduler stops before the pool and Redis close, so a check never
+    # runs on a closed connection. asyncio.wait, not wait_for: wait_for would
+    # block on a task that does not honour the cancel.
+    task = getattr(app.state, "scheduler_task", None)
+    if task is not None:
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=config.SCHEDULER_SHUTDOWN_TIMEOUT)
+        if not done:
+            logger.warning(
+                f"Regime scheduler did not stop within {config.SCHEDULER_SHUTDOWN_TIMEOUT}s; "
+                "closing connections anyway"
+            )
+        elif not task.cancelled() and task.exception() is not None:
+            logger.warning(f"Regime scheduler ended with {task.exception()!r}")
+        else:
+            logger.info("Regime scheduler stopped")
     if getattr(app.state, "db_pool", None) is not None:
         await app.state.db_pool.close()
         logger.info("Database pool closed")

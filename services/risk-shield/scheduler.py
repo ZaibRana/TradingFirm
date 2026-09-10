@@ -17,6 +17,7 @@ Every function takes an aware `now` or a `clock`; nothing reads the time
 directly.
 """
 
+import asyncio
 import logging
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -243,3 +244,71 @@ async def run_check(state, kind: str, *, clock: Callable[[], datetime] = _utc_no
         f"published {bool(published and published['published'])}"
     )
     return {"health": health, "trend": trend, "settle": settle, "published": published, "errors": errors}
+
+
+# ── The loop (decision 3) ────────────────────────────────────────
+
+FALLBACK_SLEEP_SECONDS = 300    # when no next slot can be computed
+MAX_MISSED_SCAN = 2000          # bounds the missed-slot count after a long sleep
+
+
+def _missed_between(last_start: Optional[datetime], due_start: datetime) -> int:
+    """Slots strictly between the last slot handled and `due_start`."""
+    if last_start is None:
+        return 0
+    missed, cursor = 0, last_start
+    for _ in range(MAX_MISSED_SCAN):
+        nxt = next_slot_after(cursor)
+        if nxt is None or nxt[1] >= due_start:
+            break
+        missed += 1
+        cursor = nxt[1]
+    return missed
+
+
+async def _guarded_check(state, kind: str, clock: Callable[[], datetime]) -> None:
+    """A raise out of a check is a bug: logged, and the loop goes on."""
+    try:
+        await run_check(state, kind, clock=clock)
+    except Exception as e:
+        logger.error(f"Health check ({kind}) raised {type(e).__name__}: {e}")
+        status = getattr(state, "check_status", None)
+        if isinstance(status, dict):
+            status["lastError"] = type(e).__name__
+
+
+async def run_scheduler(state, *, clock: Callable[[], datetime] = _utc_now, sleep=asyncio.sleep) -> None:
+    """
+    Forever: sleep until the next slot, re-read the clock, run the slot if
+    it is due and at most GRACE_SECONDS late. Checks are awaited in sequence,
+    so two never overlap. A late slot (a check overran it, the laptop slept,
+    a restart) is skipped with a WARNING naming how many were missed, never
+    caught up. After a check the clock is re-read before sleeping, so a check
+    that ran into the next slot's grace window still runs it. Cancellation
+    (shutdown) propagates.
+    """
+    logger.info("Regime scheduler running")
+    last_start: Optional[datetime] = None
+    while True:
+        try:
+            now = clock()
+            due = slot_for(now)
+            if due is not None and due[1] != last_start:
+                kind, start = due
+                late = (now - start).total_seconds()
+                missed = _missed_between(last_start, start) + (1 if late > GRACE_SECONDS else 0)
+                last_start = start
+                if missed:
+                    logger.warning(
+                        f"Missed {missed} health check slot(s) up to {start.isoformat()} "
+                        f"(woke {late:.0f}s after that slot)"
+                    )
+                if late <= GRACE_SECONDS:
+                    await _guarded_check(state, kind, clock)
+                    continue
+            nxt = next_slot_after(clock())
+            delay = FALLBACK_SLEEP_SECONDS if nxt is None else max(0.0, (nxt[1] - clock()).total_seconds())
+        except Exception as e:
+            logger.error(f"Scheduler loop error {type(e).__name__}: {e}")
+            delay = FALLBACK_SLEEP_SECONDS
+        await sleep(delay)

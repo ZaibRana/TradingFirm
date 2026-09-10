@@ -262,3 +262,110 @@ async def test_run_check_skips_when_quotes_lock_held(monkeypatch, caplog):
     assert quotes.download_in_flight() is False
     assert calls == [] and log == []
     assert any("skipped" in r.getMessage() for r in caplog.records)
+
+
+# ── run_scheduler ────────────────────────────────────────────────
+
+def loop_sleep(clock, stop_after, *, advance=True):
+    """A fake sleep that moves the fake clock and cancels on the Nth call."""
+    calls = []
+
+    async def sleep(seconds):
+        calls.append(seconds)
+        if len(calls) >= stop_after:
+            raise asyncio.CancelledError
+        if advance:
+            clock.t += timedelta(seconds=seconds)
+
+    return sleep, calls
+
+
+def patch_run_check(monkeypatch, *, raise_on=(), overrun=None):
+    runs = []
+
+    async def fake(state, kind, *, clock):
+        runs.append((kind, clock()))
+        if len(runs) in raise_on:
+            raise RuntimeError("monitor bug")
+        if overrun is not None and len(runs) == 1:
+            clock.t += overrun
+
+    monkeypatch.setattr(scheduler, "run_check", fake)
+    return runs
+
+
+@pytest.mark.asyncio
+async def test_loop_survives_check_exception(monkeypatch, caplog):
+    clock = Clock(et(2026, 9, 10, 9, 30))
+    state = make_state([])
+    runs = patch_run_check(monkeypatch, raise_on=(1,))
+    sleep, sleeps = loop_sleep(clock, stop_after=2)
+    with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
+        await scheduler.run_scheduler(state, clock=clock, sleep=sleep)
+    assert [t for _, t in runs] == [et(2026, 9, 10, 9, 30), et(2026, 9, 10, 9, 35)]
+    assert sleeps[0] == 300
+    assert any("raised RuntimeError" in r.getMessage() for r in caplog.records)
+    assert state.check_status["lastError"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_loop_runs_slot_within_grace_only(monkeypatch, caplog):
+    for offset, ran in ((60, True), (61, False)):
+        clock = Clock(et(2026, 9, 10, 9, 30) + timedelta(seconds=offset))
+        runs = patch_run_check(monkeypatch)
+        sleep, sleeps = loop_sleep(clock, stop_after=1)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING), pytest.raises(asyncio.CancelledError):
+            await scheduler.run_scheduler(make_state([]), clock=clock, sleep=sleep)
+        assert bool(runs) is ran, offset
+        missed = any("Missed 1 health check slot" in r.getMessage() for r in caplog.records)
+        assert missed is (not ran), offset
+        assert sleeps == [pytest.approx(300 - offset)]     # to 09:35, never back to 09:30
+
+
+@pytest.mark.asyncio
+async def test_loop_skips_missed_slots_never_catches_up(monkeypatch, caplog):
+    clock = Clock(et(2026, 9, 10, 9, 30))
+    runs = patch_run_check(monkeypatch, overrun=timedelta(minutes=11, seconds=30))   # ends 09:41:30
+    sleep, sleeps = loop_sleep(clock, stop_after=2)
+    with caplog.at_level(logging.WARNING), pytest.raises(asyncio.CancelledError):
+        await scheduler.run_scheduler(make_state([]), clock=clock, sleep=sleep)
+    assert [t for _, t in runs] == [et(2026, 9, 10, 9, 30), et(2026, 9, 10, 9, 45)]
+    assert any("Missed 2 health check slot" in r.getMessage() for r in caplog.records)   # 09:35, 09:40
+    assert sleeps[0] == pytest.approx(210)
+
+
+@pytest.mark.asyncio
+async def test_loop_runs_each_slot_once(monkeypatch):
+    clock = Clock(et(2026, 9, 10, 9, 30, 10))
+    runs = patch_run_check(monkeypatch)
+    sleep, sleeps = loop_sleep(clock, stop_after=3, advance=False)
+    with pytest.raises(asyncio.CancelledError):
+        await scheduler.run_scheduler(make_state([]), clock=clock, sleep=sleep)
+    assert len(runs) == 1 and len(sleeps) == 3
+
+
+@pytest.mark.asyncio
+async def test_loop_cancel_is_clean(monkeypatch):
+    # During the sleep: Saturday noon, the real asyncio.sleep until Monday.
+    task = asyncio.create_task(scheduler.run_scheduler(make_state([]), clock=Clock(et(2026, 9, 12, 12, 0))))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+
+    # During a check.
+    started = asyncio.Event()
+
+    async def hanging(state, kind, *, clock):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(scheduler, "run_check", hanging)
+    task = asyncio.create_task(scheduler.run_scheduler(make_state([]), clock=Clock(et(2026, 9, 10, 9, 30))))
+    await asyncio.wait_for(started.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()

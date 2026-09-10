@@ -78,6 +78,7 @@ def test_config_secretstr_masks_key():
 
 def test_startup_timeout_constant():
     assert config.STARTUP_TIMEOUT == 5.0
+    assert config.SCHEDULER_SHUTDOWN_TIMEOUT == 5.0     # Part 3.4 decision 8
 
 
 def test_scheduler_disabled_by_default(monkeypatch):

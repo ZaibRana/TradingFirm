@@ -20,6 +20,11 @@ from pydantic_settings import BaseSettings
 # the lifespan tests monkeypatch this down to keep the slow paths fast.
 STARTUP_TIMEOUT = 5.0
 
+# How long shutdown waits for the cancelled scheduler task before closing
+# the pool and Redis anyway (Part 3.4 decision 8). A check inside the
+# yfinance thread cannot be cancelled. Read at call time, like the above.
+SCHEDULER_SHUTDOWN_TIMEOUT = 5.0
+
 
 class Settings(BaseSettings):
     """Risk Shield service configuration."""
