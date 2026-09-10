@@ -1,12 +1,16 @@
 """Part 3.3 — the regime monitors and their bar helpers, on synthetic
 columnar series. Pure functions of a view: no socket, no Redis, no clock."""
 
+import copy
 import inspect
+import json
 import logging
+from datetime import date, timedelta
 
 import pytest
 
-from monitors import series
+from monitors import regime, series
+from monitors.regime import MONITORS
 from monitors.series import UnusableSeries, align, complete_bars, ema, is_partial, slope_pct
 
 AS_OF = "2026-09-10T21:00:00+00:00"   # 17:00 EDT: a bar dated 09-10 is complete
@@ -140,3 +144,209 @@ def test_partial_rule_uses_download_time_not_read_time():
     assert align(downloaded_1620, ["SPY"])["dates"] == ["2026-09-09", "2026-09-10"]
     source = inspect.getsource(series)
     assert ".now(" not in source and "time.time" not in source
+
+
+# ── Monitor helpers ──────────────────────────────────────────────
+
+# Bars each monitor needs before it can score (spec 3.3 decision 4).
+MIN_BARS = {"vix": 1, "spy_trend": 200, "volume": 21}
+
+
+def bdays(n, end=date(2026, 9, 9)):
+    """n weekday ISO dates ending at `end` (a Wednesday, the prior session)."""
+    out, d = [], end
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d.isoformat())
+        d -= timedelta(days=1)
+    return out[::-1]
+
+
+def full_view(n=230, stale=(), drop=(), bars=None):
+    """All 17 core tickers, gently rising, 1M volume each; ^VIX flat at 18.
+    `bars` truncates the named tickers to that many bars."""
+    from monitors.quotes import CORE_TICKERS
+    entries = {}
+    for k, t in enumerate(CORE_TICKERS):
+        if t in drop:
+            continue
+        size = (bars or {}).get(t, n)
+        closes = [18.0] * size if t == "^VIX" else [100.0 + k + 0.1 * i for i in range(size)]
+        entries[t] = make_series(bdays(size), closes)
+    return view_of(entries, stale=stale)
+
+
+def vix_view(closes, as_of=AS_OF, dates=None):
+    return view_of({"^VIX": make_series(dates or bdays(len(closes)), closes)}, as_of=as_of)
+
+
+def spy_view(closes):
+    return view_of({"SPY": make_series(bdays(len(closes)), closes)})
+
+
+def volume_view(last_ratio, red=False, window_nulls=0, last_null=False, all_null=False):
+    """21 aligned bars: the window sums to 1,000,000 a day (SPY 600k + QQQ
+    400k); the last day's whole sum sits on SPY so the ratio is exact."""
+    d = bdays(21)
+    spy_vol = [600_000] * 20 + [None if last_null else round(last_ratio * 1_000_000)]
+    qqq_vol = [400_000] * 20 + [0]
+    for i in range(20 if all_null else window_nulls):
+        spy_vol[i] = None
+    spy_close = [100.0] * 20 + [99.0 if red else 101.0]
+    return view_of({
+        "SPY": make_series(d, spy_close, volumes=spy_vol),
+        "QQQ": make_series(d, [300.0] * 21, volumes=qqq_vol),
+    })
+
+
+# ── Monitors: alignment carried from commit 1 ────────────────────
+
+def test_align_no_common_dates_scores_null():
+    spy = make_series(bdays(21), [100.0] * 21)
+    qqq = make_series(bdays(21, end=date(2025, 6, 4)), [300.0] * 21)
+    result = regime.volume(view_of({"SPY": spy, "QQQ": qqq}))
+    assert (result["score"], result["stale"]) == (None, False)
+    assert result["raw"]["droppedDates"] == 42
+    assert "need ≥ 21" in result["detail"]
+
+
+def test_vix_uses_intraday_bar_and_flags_partial():
+    view = vix_view([20.0, 20.0, 23.0], as_of="2026-09-10T18:00:00+00:00",   # 14:00 EDT
+                    dates=["2026-09-08", "2026-09-09", "2026-09-10"])
+    result = regime.vix(view)
+    assert result["score"] == 60
+    assert result["raw"] == {"level": 23.0, "prevClose": 20.0, "changePct": pytest.approx(15.0),
+                             "date": "2026-09-10", "partial": True}
+
+
+def test_no_monitor_reads_vix_volume():
+    quiet, loud = full_view(), full_view()
+    quiet["tickers"]["^VIX"]["volume"] = [0] * 230
+    loud["tickers"]["^VIX"]["volume"] = [9_000_000_000] * 230
+    for name, m in MONITORS.items():
+        assert m.fn(quiet) == m.fn(loud), name
+        assert "^VIX" not in m.tickers or name == "vix"
+
+
+# ── Monitors: scoring tables ─────────────────────────────────────
+
+@pytest.mark.parametrize(
+    "level, score",
+    [(10, 95), (14.99, 95), (15, 80), (19.99, 80), (20, 60), (25, 40), (30, 20),
+     (39.99, 20), (40, 20), (40.01, 5), (45, 5)],
+)
+def test_vix_score_table(level, score):
+    assert regime.vix(vix_view([float(level), float(level)]))["score"] == score
+
+
+@pytest.mark.parametrize(
+    "prev, latest, score",
+    [(20.0, 24.0, 60), (20.0, 24.01, 45), (37.0, 45.0, 0)],
+    ids=["exactly_x1.20_no_penalty", "above_x1.20_minus_15", "vix45_spike_floor_0"],
+)
+def test_vix_spike_penalty(prev, latest, score):
+    assert regime.vix(vix_view([prev, latest]))["score"] == score
+
+
+def test_vix_single_bar_no_spike_check():
+    result = regime.vix(vix_view([45.0]))
+    assert result["score"] == 5
+    assert (result["raw"]["prevClose"], result["raw"]["changePct"]) == (None, None)
+
+
+def _flat_then(*segments, base=100.0, base_bars=200):
+    closes = [base] * base_bars
+    for value, count in segments:
+        closes += value if isinstance(value, list) else [value] * count
+    return closes
+
+
+@pytest.mark.parametrize(
+    "closes, score",
+    [
+        (_flat_then(([99.0 - i for i in range(20)], 0)), 5),      # below the 200, lows falling
+        (_flat_then((90.0, 20)), 15),                               # below all three, lows flat
+        (_flat_then((80.0, 60), (90.0, 10), base=120.0, base_bars=150), 25),  # bounce under the 200
+        ([100.0 + 0.5 * i for i in range(220)], 95),                # above all three
+        (_flat_then((120.0, 15), (113.0, 5)), 70),                  # dip under the 20 only
+        (_flat_then((120.0, 15), (105.0, 5)), 45),                  # under the 50, over the 200
+    ],
+    ids=["lower_lows_5", "below_all_15", "bounce_below_200_25", "above_all_95",
+         "below_20_only_70", "above_200_only_45"],
+)
+def test_spy_trend_score_table(closes, score):
+    assert regime.spy_trend(spy_view(closes))["score"] == score
+
+
+def test_spy_trend_close_equal_to_ema_counts_as_below(monkeypatch):
+    monkeypatch.setattr(regime, "ema", lambda values, span: [values[-1]] * len(values))
+    result = regime.spy_trend(spy_view([100.0] * 220))
+    assert result["score"] == 15      # equal to all three EMAs, flat lows: "below all three"
+
+
+@pytest.mark.parametrize(
+    "ratio, red, score",
+    [(1.19, False, 85), (1.2, False, 60), (1.79, True, 60), (1.8, True, 30), (2.5, True, 30),
+     (2.51, True, 10), (1.8, False, 60), (2.0, False, 60), (2.01, False, 80)],
+)
+def test_volume_score_table(ratio, red, score):
+    result = regime.volume(volume_view(ratio, red=red))
+    assert result["score"] == score
+    assert result["raw"]["ratio"] == ratio and result["raw"]["red"] is red
+
+
+def test_volume_null_volume_rows():
+    some = regime.volume(volume_view(1.2, window_nulls=5))    # excluded: mean still 1,000,000
+    assert (some["score"], some["raw"]["ratio"]) == (60, 1.2)
+    last = regime.volume(volume_view(1.2, last_null=True))
+    assert last["score"] is None and "missing on" in last["detail"]
+    empty = regime.volume(volume_view(1.2, all_null=True))
+    assert empty["score"] is None and "no volume in the 20-day window" in empty["detail"]
+
+
+# ── Monitors: contract ───────────────────────────────────────────
+
+def _insufficient_view(name):
+    need = MIN_BARS[name] - 1
+    return full_view(bars={t: need for t in MONITORS[name].tickers})
+
+
+@pytest.mark.parametrize("name", list(MONITORS))
+def test_monitor_insufficient_history_scores_null(name):
+    result = MONITORS[name].fn(_insufficient_view(name))
+    assert (result["score"], result["stale"]) == (None, False)
+    assert f"need ≥ {MIN_BARS[name]}" in result["detail"]
+
+
+@pytest.mark.parametrize("name", list(MONITORS))
+def test_monitor_missing_ticker_scores_null_stale(name):
+    tickers = MONITORS[name].tickers
+    result = MONITORS[name].fn(full_view(drop=tickers, stale=tickers))
+    assert (result["score"], result["stale"]) == (None, True)
+    assert "unavailable" in result["detail"]
+
+
+@pytest.mark.parametrize("state", ["ok", "null", "stale"])
+@pytest.mark.parametrize("name", list(MONITORS))
+def test_every_monitor_returns_the_contract(name, state):
+    tickers = MONITORS[name].tickers
+    view = {"ok": full_view(), "null": full_view(drop=tickers), "stale": full_view(stale=tickers)}[state]
+    result = MONITORS[name].fn(view)
+    assert set(result) == {"score", "raw", "detail", "stale"}
+    score = result["score"]
+    if state == "null":
+        assert score is None
+    else:
+        assert type(score) is int and 0 <= score <= 100
+    assert result["stale"] is (state == "stale")
+    assert isinstance(result["detail"], str) and result["detail"]
+    assert isinstance(result["raw"], dict)
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize("name", list(MONITORS))
+def test_monitors_are_pure_repeat_call_identical(name):
+    view = full_view()
+    before = copy.deepcopy(view)
+    assert MONITORS[name].fn(view) == MONITORS[name].fn(view)
+    assert view == before
