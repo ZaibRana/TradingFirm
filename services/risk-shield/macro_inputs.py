@@ -23,9 +23,11 @@ from typing import Any, Optional
 import httpx
 
 import db
+import econ_calendar
 import news_poller
 import scheduler
 from config import settings
+from monitors.fred import get_fred_view
 
 logger = logging.getLogger(__name__)
 
@@ -235,3 +237,105 @@ def news_freshness(news: dict, state, now: datetime) -> dict:
     poller's three keys, unchanged from news_poller.stale_view (null = the
     poller is off in this process, never "unknown")."""
     return {"newsStatus": news.get("status"), **news_poller.stale_view(state, now)}
+
+
+# ── Calendar and FRED (decision 5) ───────────────────────────────
+
+CALENDAR_DAYS = 7
+
+
+def calendar_section(now: datetime) -> dict:
+    """econ_calendar.window for the next 7 ET days plus renewalDue (the
+    14-day renewal flag). An unavailable file is status "unavailable"
+    (load() already logged it)."""
+    try:
+        calendar = econ_calendar.load()
+    except econ_calendar.CalendarUnavailable:
+        return {"status": "unavailable", "from": None, "to": None, "coversThrough": None,
+                "coverageShort": None, "renewalDue": None, "events": []}
+    return {"status": "ok", **econ_calendar.window(calendar, now, CALENDAR_DAYS),
+            "renewalDue": econ_calendar.coverage_short(calendar, econ_calendar.et_today(now))}
+
+
+def calendar_freshness(calendar: dict) -> dict:
+    return {"calendarStatus": calendar["status"],
+            "calendarWindowShort": bool(calendar["coverageShort"]),
+            "calendarRenewalDue": calendar["renewalDue"]}
+
+
+def fred_freshness(fred: dict) -> dict:
+    return {"fredStaleSeries": [sid for sid, entry in fred.items() if entry["stale"]]}
+
+
+# ── The document (decisions 5–6) ─────────────────────────────────
+
+INPUTS_MAX_BYTES = 64_000     # compact UTF-8 JSON; read at call time (tests patch it)
+
+
+class InputsTooLarge(RuntimeError):
+    """Still over INPUTS_MAX_BYTES with no news left: a bug, never a data state."""
+
+
+def any_stale(freshness: dict) -> bool:
+    """True when any input the brief reads is missing, late or empty.
+    calendarRenewalDue is maintenance (the inputs are still right) and a null
+    newsPollStale is no evidence, so neither counts."""
+    return bool(
+        freshness["healthStatus"] != "ok" or freshness["healthStale"] or freshness["healthMonitorsStale"]
+        or not freshness["settlePresent"]
+        or freshness["newsStatus"] != "ok" or freshness["newsPollStale"] is True
+        or freshness["calendarStatus"] != "ok" or freshness["calendarWindowShort"]
+        or freshness["fredStaleSeries"]
+    )
+
+
+def encoded_size(doc: dict) -> int:
+    """Compact JSON bytes. allow_nan=False: a NaN raises ValueError here."""
+    return len(json.dumps(doc, allow_nan=False, separators=(",", ":")).encode("utf-8"))
+
+
+def bound(doc: dict) -> dict:
+    """Drop the oldest news items (the list is newest first) until the
+    document fits INPUTS_MAX_BYTES, counting them in news.trimmedForSize."""
+    news = doc["news"]
+    while encoded_size(doc) > INPUTS_MAX_BYTES:
+        if not news["items"]:
+            raise InputsTooLarge(f"macro inputs over {INPUTS_MAX_BYTES} bytes with no news left")
+        news["items"].pop()
+        news["trimmedForSize"] += 1
+        news["count"] = len(news["items"])
+    if news["trimmedForSize"]:
+        logger.warning(f"Macro inputs: {news['trimmedForSize']} oldest news item(s) dropped for size")
+    return doc
+
+
+async def assemble_inputs(state, fred_client, http, *, now: datetime) -> dict:
+    """
+    The inputs document on `state` (db_pool, redis, cooldowns, news_status).
+    Sections fail on their own and say why; only a bug raises. Reads only:
+    Postgres, data-engine, the calendar file and FRED through its cache.
+    """
+    health, settle = await health_section(getattr(state, "db_pool", None), now)
+    news = await news_section(http)
+    calendar = calendar_section(now)
+    fred = await get_fred_view(getattr(state, "redis", None), getattr(state, "cooldowns", None),
+                               fred_client, now=lambda: now)
+    freshness = {
+        **health_freshness(health),
+        "settlePresent": settle["present"],
+        **news_freshness(news, state, now),
+        **calendar_freshness(calendar),
+        **fred_freshness(fred),
+    }
+    freshness["anyStale"] = any_stale(freshness)
+    return bound({
+        "schemaVersion": SCHEMA_VERSION,
+        "assembledAt": now.isoformat(),
+        "ready": health_ready(health),
+        "health": health,
+        "settle": settle,
+        "news": news,
+        "calendar": calendar,
+        "fred": fred,
+        "freshness": freshness,
+    })

@@ -372,3 +372,171 @@ def test_inputs_freshness_carries_news_poll_state(monkeypatch):
 
     monkeypatch.setattr(news_poller.settings, "news_poll_enabled", False)
     assert macro_inputs.news_freshness(news, state, now)["newsPollStale"] is None
+
+
+# ── The document (commit 4c) ─────────────────────────────────────
+
+import econ_calendar
+from cache import MemoryCooldowns
+from monitors import fred
+from monitors.errors import FredError
+from tests.fake_redis import FakeRedis
+
+
+class FakeFred:
+    """A FRED client: one daily observation per series ending `last`; raises per series."""
+
+    def __init__(self, last="2026-09-09", raises=None):
+        self.last, self.raises, self.calls = last, raises or {}, []
+
+    def observation_start(self):
+        return "2024-07-02"
+
+    async def observations(self, sid):
+        self.calls.append(sid)
+        if sid in self.raises:
+            raise self.raises[sid]
+        return {"observations": [{"date": "2026-08-01", "value": "1.0"}, {"date": self.last, "value": "2.0"}]}
+
+
+def test_inputs_calendar_section(monkeypatch):
+    section = macro_inputs.calendar_section(et(2026, 9, 10, 14, 7))
+    assert section["status"] == "ok"
+    assert (section["from"], section["to"]) == ("2026-09-10", "2026-09-16")
+    assert [(e["date"], e["type"]) for e in section["events"]] == [("2026-09-11", "cpi"), ("2026-09-16", "fomc")]
+    assert macro_inputs.calendar_freshness(section) == {
+        "calendarStatus": "ok", "calendarWindowShort": False, "calendarRenewalDue": False}
+
+    late = macro_inputs.calendar_section(et(2026, 12, 28, 9, 0))
+    assert late["coverageShort"] is True and late["renewalDue"] is True
+    assert macro_inputs.calendar_freshness(late)["calendarWindowShort"] is True
+
+    def unavailable():
+        raise econ_calendar.CalendarUnavailable("econ_calendar.json: cannot read (FileNotFoundError)")
+    monkeypatch.setattr(econ_calendar, "load", unavailable)
+    gone = macro_inputs.calendar_section(et(2026, 9, 10, 14, 7))
+    assert gone == {"status": "unavailable", "from": None, "to": None, "coversThrough": None,
+                    "coverageShort": None, "renewalDue": None, "events": []}
+    assert macro_inputs.calendar_freshness(gone) == {
+        "calendarStatus": "unavailable", "calendarWindowShort": False, "calendarRenewalDue": None}
+
+
+@pytest.mark.asyncio
+async def test_inputs_fred_section():
+    now = et(2026, 9, 10, 14, 7)
+    client = FakeFred(raises={"DGS2": FredError("DGS2: HTTP 500")})
+    state = _state(pool=None)
+    doc = await macro_inputs.assemble_inputs(state, client, _http(_answer(json_body=[])), now=now)
+    assert doc["fred"] == await fred.get_fred_view(FakeRedis(), MemoryCooldowns(),
+                                                   FakeFred(raises={"DGS2": FredError("x")}), now=lambda: now)
+    assert doc["fred"]["DGS2"]["staleReason"] == "no_data"
+    assert doc["freshness"]["fredStaleSeries"] == ["DGS2"]
+    # An age-stale series is listed too; nothing carries observation arrays.
+    old = await macro_inputs.assemble_inputs(_state(pool=None), FakeFred(last="2026-08-20"),
+                                             _http(_answer(json_body=[])), now=now)
+    assert old["freshness"]["fredStaleSeries"] == [s for s in fred.FRED_SERIES if fred.FRED_CADENCE[s][1] < 21]
+    assert all("observations" not in entry for entry in old["fred"].values())
+
+
+GOOD = {"healthStatus": "ok", "healthStale": False, "healthMonitorsStale": False, "healthAgeMinutes": 2,
+        "settlePresent": True, "newsStatus": "ok", "newsPollStale": False, "lastNewsPollAt": None,
+        "newsLastError": None, "calendarStatus": "ok", "calendarWindowShort": False,
+        "calendarRenewalDue": False, "fredStaleSeries": []}
+
+
+@pytest.mark.parametrize("flip, stale", [
+    ({}, False),
+    ({"healthStatus": "no_checks"}, True), ({"healthStatus": "unavailable"}, True),
+    ({"healthStale": True}, True), ({"healthMonitorsStale": True}, True),
+    ({"settlePresent": False}, True),
+    ({"newsStatus": "empty"}, True), ({"newsStatus": "unavailable"}, True),
+    ({"newsPollStale": True}, True),
+    ({"calendarStatus": "unavailable"}, True), ({"calendarWindowShort": True}, True),
+    ({"fredStaleSeries": ["CPIAUCSL"]}, True),
+    ({"calendarRenewalDue": True}, False),     # maintenance, not stale input
+    ({"newsPollStale": None}, False),          # poller off: no evidence
+    ({"healthAgeMinutes": 909}, False),        # the age alone is not a verdict
+], ids=lambda v: str(v))
+def test_inputs_any_stale_truth_table(flip, stale):
+    assert macro_inputs.any_stale({**GOOD, **flip}) is stale
+
+
+def _doc(n_items, text="x"):
+    items = [{"publishedAt": f"2026-09-10T17:{i % 60:02d}:00+00:00", "source": "S",
+              "title": f"{i}" + text, "summary": text} for i in range(n_items)]
+    return {"schemaVersion": 1, "health": {}, "fred": {}, "freshness": {},
+            "news": {"status": "ok", "count": n_items, "trimmedForSize": 0, "items": items}}
+
+
+def test_inputs_bounded_and_strict_json(monkeypatch, caplog):
+    # The real limit: 50 items of 300 four-byte characters are ~180 KB.
+    worst = _doc(50, text="\U0001F4C8" * 300)
+    assert macro_inputs.encoded_size(worst) > macro_inputs.INPUTS_MAX_BYTES
+    with caplog.at_level(logging.WARNING, logger="macro_inputs"):
+        bounded = macro_inputs.bound(worst)
+    assert macro_inputs.encoded_size(bounded) <= macro_inputs.INPUTS_MAX_BYTES
+    kept = bounded["news"]["count"]
+    assert 0 < kept < 50 and bounded["news"]["trimmedForSize"] == 50 - kept
+    assert [i["title"][:2] for i in bounded["news"]["items"]] == [f"{i}\U0001F4C8"[:2] for i in range(kept)]
+    assert any("dropped for size" in r.getMessage() for r in caplog.records)
+
+    # Under the limit: untouched.
+    small = _doc(3)
+    assert macro_inputs.bound(small)["news"]["trimmedForSize"] == 0
+
+    # Still over with no news left: a bug.
+    monkeypatch.setattr(macro_inputs, "INPUTS_MAX_BYTES", 10)
+    with pytest.raises(macro_inputs.InputsTooLarge):
+        macro_inputs.bound(_doc(2))
+
+    # A NaN anywhere is refused (allow_nan=False).
+    monkeypatch.setattr(macro_inputs, "INPUTS_MAX_BYTES", 64_000)
+    nan = _doc(1)
+    nan["health"]["score"] = float("nan")
+    with pytest.raises(ValueError):
+        macro_inputs.bound(nan)
+
+
+def _state(pool, redis=None):
+    return SimpleNamespace(db_pool=pool, redis=redis if redis is not None else FakeRedis(),
+                           cooldowns=MemoryCooldowns(), news_status=news_poller.initial_news_status())
+
+
+@pytest.mark.asyncio
+async def test_inputs_repeat_call_is_read_only(monkeypatch):
+    monkeypatch.setattr(news_poller.settings, "news_poll_enabled", False)
+    now = et(2026, 9, 10, 14, 7)
+    redis = FakeRedis()
+    pool = HealthPool(latest=_row(et(2026, 9, 10, 14, 5, 2)),
+                      settle={"checked_at": et(2026, 9, 9, 16, 20, 2), "score": 63})
+    state = _state(pool, redis)
+    client = FakeFred()
+    async with _http(_answer(json_body=[_item(30), _item(20)])) as http:
+        first = await macro_inputs.assemble_inputs(state, client, http, now=now)
+        sets_after_first = list(redis.set_calls)
+        second = await macro_inputs.assemble_inputs(state, client, http, now=now + timedelta(seconds=1))
+
+    assert list(first) == ["schemaVersion", "assembledAt", "ready", "health", "settle", "news",
+                           "calendar", "fred", "freshness"]
+    assert list(first["freshness"]) == list(GOOD) + ["anyStale"]
+    assert first["ready"] is True and first["freshness"]["anyStale"] is False
+    assert first["freshness"]["newsPollStale"] is None
+    # Equal except assembledAt and FRED's source, which is fresh on the first
+    # read and cache on the repeat (6 h cache; test_fred_view_repeat_call_is_cached).
+    def without_volatile(doc):
+        body = {k: v for k, v in doc.items() if k != "assembledAt"}
+        body["fred"] = {sid: {k: v for k, v in e.items() if k != "source"} for sid, e in doc["fred"].items()}
+        return body
+    assert without_volatile(first) == without_volatile(second)
+    assert {e["source"] for e in first["fred"].values()} == {"fresh"}
+    assert {e["source"] for e in second["fred"].values()} == {"cache"}
+    assert second["assembledAt"] == (now + timedelta(seconds=1)).isoformat()
+
+    # Writes: only FRED's own cache and last-known keys, and none on the repeat.
+    assert sets_after_first and all(k.startswith(("tf:risk:cache:fred:", "tf:risk:cache:fred_last:"))
+                                    for k, _, _ in sets_after_first)
+    assert redis.set_calls == sets_after_first
+    assert len(client.calls) == 8
+    assert {sql for sql, _ in pool.calls} <= {db.LATEST_HEALTH_CHECK_SQL, db.SETTLE_BASE_SQL,
+                                              db.LATEST_SCORED_HEALTH_CHECK_SQL}
+    json.dumps(first, allow_nan=False)
