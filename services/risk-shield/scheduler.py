@@ -28,6 +28,7 @@ import pandas as pd
 
 import db
 import news_poller
+import wallclock
 from monitors import quotes
 from scoring.alert_manager import publish_health
 from scoring.health_calculator import compute_health
@@ -239,9 +240,13 @@ async def run_check(state, kind: str, *, clock: Callable[[], datetime] = _utc_no
     trend = trend_from(health["score"], settle["score"] if settle else None)
 
     published = None
+    # The first check after a host pause carries it, published or not (3.4 follow-up addition 1).
+    paused = getattr(state, "pending_paused_seconds", None)
+    state.pending_paused_seconds = None
     try:
         published = await publish_health(r, health, trend, now=checked_at,
-                                         news=news_poller.stale_view(state, checked_at))
+                                         news=news_poller.stale_view(state, checked_at),
+                                         paused_seconds=paused)
     except Exception as e:
         _failure("publish", e, errors)
 
@@ -299,12 +304,16 @@ async def _guarded_check(state, kind: str, clock: Callable[[], datetime]) -> Non
 
 async def run_scheduler(state, *, clock: Callable[[], datetime] = _utc_now, sleep=asyncio.sleep) -> None:
     """
-    Forever: sleep until the next slot, re-read the clock, run the slot if
-    it is due and at most GRACE_SECONDS late. Checks are awaited in sequence,
-    so two never overlap. A late slot (a check overran it, the laptop slept,
-    a restart) is skipped with a WARNING naming how many were missed, never
-    caught up. After a check the clock is re-read before sleeping, so a check
-    that ran into the next slot's grace window still runs it. Cancellation
+    Forever: wait for the next slot through wallclock (sleeps of ≤ 60 s, the
+    clock re-read after each; 3.4 follow-up), then run the slot if it is due
+    and at most GRACE_SECONDS late. Checks are awaited in sequence, so two
+    never overlap. A late slot (a check overran it, the laptop slept, a
+    restart) is skipped with a WARNING naming how many were missed, never
+    caught up; so are the slots a wake between slots passed. A loop that has
+    handled no slot yet reports only the one it lands in (the restart rule).
+    After a check the clock is re-read before waiting, so a check that ran
+    into the next slot's grace window still runs it. A host pause the harness
+    saw is kept for the next check's payload (addition 1). Cancellation
     (shutdown) propagates.
     """
     logger.info("Regime scheduler running")
@@ -326,9 +335,20 @@ async def run_scheduler(state, *, clock: Callable[[], datetime] = _utc_now, slee
                 if late <= GRACE_SECONDS:
                     await _guarded_check(state, kind, clock)
                     continue
+            elif last_start is not None:
+                passed = last_slot_before(now)
+                if passed is not None and passed[1] > last_start:
+                    start = passed[1]
+                    logger.warning(
+                        f"Missed {_missed_between(last_start, start) + 1} health check slot(s) up to "
+                        f"{start.isoformat()} (woke {(now - start).total_seconds():.0f}s after that slot)"
+                    )
+                    last_start = start
             nxt = next_slot_after(clock())
-            delay = FALLBACK_SLEEP_SECONDS if nxt is None else max(0.0, (nxt[1] - clock()).total_seconds())
+            target = nxt[1] if nxt is not None else clock() + timedelta(seconds=FALLBACK_SLEEP_SECONDS)
         except Exception as e:
             logger.error(f"Scheduler loop error {type(e).__name__}: {e}")
-            delay = FALLBACK_SLEEP_SECONDS
-        await sleep(delay)
+            target = clock() + timedelta(seconds=FALLBACK_SLEEP_SECONDS)
+        wake = await wallclock.sleep_until(target, clock=clock, sleep=sleep, log=logger)
+        if wake.paused_seconds:
+            state.pending_paused_seconds = (getattr(state, "pending_paused_seconds", None) or 0) + wake.paused_seconds

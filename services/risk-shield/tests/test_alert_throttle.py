@@ -226,11 +226,28 @@ async def test_publish_payload_shape_and_channel(monkeypatch):
         "previousScore": 45, "previousRegime": "CAUTIOUS", "trend": "declining", "stale": True,
         "coverage": 100, "checkedAt": NOW.isoformat(), "monitors": {"vix": 30, "breadth": None},
         "newsPollStale": None, "lastNewsPollAt": None, "newsLastError": None,     # Part 3.5, no view passed
+        "pausedSeconds": None,                                                    # 3.4 follow-up, no pause
     }
     bad = health(30)
     bad["coverage"] = float("nan")
     with pytest.raises(ValueError):
         await publish_health(FakeRedis(), bad, None, now=NOW)
+
+
+@pytest.mark.asyncio
+async def test_payload_keys_append_only_paused_seconds():
+    """3.4 follow-up addition 1: pausedSeconds is appended; the 14 earlier keys keep their order."""
+    assert alert_manager.PAYLOAD_KEYS == (
+        "score", "regime", "reason", "recovery", "previousScore", "previousRegime",
+        "trend", "stale", "coverage", "checkedAt", "monitors",
+        "newsPollStale", "lastNewsPollAt", "newsLastError", "pausedSeconds")
+    assert alert_manager.NEWS_KEYS == ("newsPollStale", "lastNewsPollAt", "newsLastError")
+    r = FakeRedis()
+    await publish_health(r, health(72), None, now=NOW)
+    await publish_health(r, health(40), None, now=NOW + timedelta(minutes=15), paused_seconds=56844)
+    first, second = [payload for _, payload in messages(r)]
+    assert first["pausedSeconds"] is None
+    assert second["pausedSeconds"] == 56844 and tuple(second) == alert_manager.PAYLOAD_KEYS
 
 
 @pytest.mark.asyncio

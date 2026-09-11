@@ -264,20 +264,59 @@ async def test_run_check_skips_when_quotes_lock_held(monkeypatch, caplog):
     assert any("skipped" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.asyncio
+async def test_run_check_carries_paused_seconds_once(monkeypatch):
+    state = make_state([], rows=[YESTERDAY_SETTLE])
+    state.pending_paused_seconds = 56844
+    patch_compute(monkeypatch, [], 72)
+    await scheduler.run_check(state, "market", clock=Clock(MARKET_AT))                            # initial
+    assert state.pending_paused_seconds is None
+    patch_compute(monkeypatch, [], 40)
+    await scheduler.run_check(state, "market", clock=Clock(MARKET_AT + timedelta(minutes=15)))    # regime change
+    first, second = [json.loads(raw) for _, raw in state.redis.published]
+    assert (first["pausedSeconds"], second["pausedSeconds"]) == (56844, None)
+
+    # A first check after a pause that doesn't publish still consumes it.
+    state.pending_paused_seconds = 600
+    await scheduler.run_check(state, "market", clock=Clock(MARKET_AT + timedelta(minutes=20)))    # held
+    assert len(state.redis.published) == 2 and state.pending_paused_seconds is None
+
+    # A check skipped by the quotes lock leaves it for the next one.
+    state.pending_paused_seconds = 600
+    async with quotes._download_lock():
+        assert await scheduler.run_check(state, "market", clock=Clock(MARKET_AT + timedelta(minutes=25))) is None
+    assert state.pending_paused_seconds == 600
+
+
 # ── run_scheduler ────────────────────────────────────────────────
 
-def loop_sleep(clock, stop_after, *, advance=True):
-    """A fake sleep that moves the fake clock and cancels on the Nth call."""
+def loop_sleep(clock, *, stop_at, freeze=None):
+    """A fake chunk sleep that moves the fake clock. The chunk that would
+    reach `stop_at` is recorded and cancels instead. freeze=(chunk start,
+    wake): the chunk starting then ends at `wake` (the host paused)."""
     calls = []
 
     async def sleep(seconds):
         calls.append(seconds)
-        if len(calls) >= stop_after:
+        if clock.t + timedelta(seconds=seconds) >= stop_at:
             raise asyncio.CancelledError
-        if advance:
+        if freeze is not None and clock.t == freeze[0]:
+            clock.t = freeze[1]
+        else:
             clock.t += timedelta(seconds=seconds)
 
     return sleep, calls
+
+
+def recording_check(monkeypatch):
+    """Records (kind, time, the pending pause the check would carry)."""
+    runs = []
+
+    async def fake(state, kind, *, clock):
+        runs.append((kind, clock(), getattr(state, "pending_paused_seconds", None)))
+
+    monkeypatch.setattr(scheduler, "run_check", fake)
+    return runs
 
 
 def patch_run_check(monkeypatch, *, raise_on=(), overrun=None):
@@ -299,11 +338,11 @@ async def test_loop_survives_check_exception(monkeypatch, caplog):
     clock = Clock(et(2026, 9, 10, 9, 30))
     state = make_state([])
     runs = patch_run_check(monkeypatch, raise_on=(1,))
-    sleep, sleeps = loop_sleep(clock, stop_after=2)
+    sleep, sleeps = loop_sleep(clock, stop_at=et(2026, 9, 10, 9, 40))
     with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
         await scheduler.run_scheduler(state, clock=clock, sleep=sleep)
     assert [t for _, t in runs] == [et(2026, 9, 10, 9, 30), et(2026, 9, 10, 9, 35)]
-    assert sleeps[0] == 300
+    assert sleeps[:5] == [60] * 5                        # 3.4 follow-up: 300 s in chunks
     assert any("raised RuntimeError" in r.getMessage() for r in caplog.records)
     assert state.check_status["lastError"] == "RuntimeError"
 
@@ -313,36 +352,121 @@ async def test_loop_runs_slot_within_grace_only(monkeypatch, caplog):
     for offset, ran in ((60, True), (61, False)):
         clock = Clock(et(2026, 9, 10, 9, 30) + timedelta(seconds=offset))
         runs = patch_run_check(monkeypatch)
-        sleep, sleeps = loop_sleep(clock, stop_after=1)
+        sleep, sleeps = loop_sleep(clock, stop_at=et(2026, 9, 10, 9, 35))
         caplog.clear()
         with caplog.at_level(logging.WARNING), pytest.raises(asyncio.CancelledError):
             await scheduler.run_scheduler(make_state([]), clock=clock, sleep=sleep)
         assert bool(runs) is ran, offset
         missed = any("Missed 1 health check slot" in r.getMessage() for r in caplog.records)
         assert missed is (not ran), offset
-        assert sleeps == [pytest.approx(300 - offset)]     # to 09:35, never back to 09:30
+        assert sum(sleeps) == 300 - offset and max(sleeps) <= 60, offset    # to 09:35, never back to 09:30
 
 
 @pytest.mark.asyncio
 async def test_loop_skips_missed_slots_never_catches_up(monkeypatch, caplog):
     clock = Clock(et(2026, 9, 10, 9, 30))
     runs = patch_run_check(monkeypatch, overrun=timedelta(minutes=11, seconds=30))   # ends 09:41:30
-    sleep, sleeps = loop_sleep(clock, stop_after=2)
+    sleep, sleeps = loop_sleep(clock, stop_at=et(2026, 9, 10, 9, 50))
     with caplog.at_level(logging.WARNING), pytest.raises(asyncio.CancelledError):
         await scheduler.run_scheduler(make_state([]), clock=clock, sleep=sleep)
     assert [t for _, t in runs] == [et(2026, 9, 10, 9, 30), et(2026, 9, 10, 9, 45)]
     assert any("Missed 2 health check slot" in r.getMessage() for r in caplog.records)   # 09:35, 09:40
-    assert sleeps[0] == pytest.approx(210)
+    assert sleeps[:4] == [60, 60, 60, 30]                                                # 210 s in chunks
 
 
 @pytest.mark.asyncio
 async def test_loop_runs_each_slot_once(monkeypatch):
+    # The harness hands back the same instant twice (a wall clock stepped back after a wake).
     clock = Clock(et(2026, 9, 10, 9, 30, 10))
     runs = patch_run_check(monkeypatch)
-    sleep, sleeps = loop_sleep(clock, stop_after=3, advance=False)
+    waits = []
+
+    async def same_instant(target, *, clock, sleep, log):
+        waits.append(target)
+        if len(waits) == 3:
+            raise asyncio.CancelledError
+        return scheduler.wallclock.Wake(clock(), None)
+
+    monkeypatch.setattr(scheduler.wallclock, "sleep_until", same_instant)
     with pytest.raises(asyncio.CancelledError):
+        await scheduler.run_scheduler(make_state([]), clock=clock)
+    assert len(runs) == 1 and len(waits) == 3
+
+
+@pytest.mark.asyncio
+async def test_loop_mac_sleep_16h_warns_on_wake_and_resumes(monkeypatch, caplog):
+    # 2026-09-10: booted 17:07:15 ET after the settle, nothing handled yet;
+    # the chunk starting 17:45:15 ET ends when the Mac wakes, Fri 09:32:39 ET.
+    clock = Clock(et(2026, 9, 10, 17, 7, 15))
+    runs = recording_check(monkeypatch)
+    sleep, sleeps = loop_sleep(clock, stop_at=et(2026, 9, 11, 9, 40),
+                               freeze=(et(2026, 9, 10, 17, 45, 15), et(2026, 9, 11, 9, 32, 39)))
+    with caplog.at_level(logging.WARNING), pytest.raises(asyncio.CancelledError):
         await scheduler.run_scheduler(make_state([]), clock=clock, sleep=sleep)
-    assert len(runs) == 1 and len(sleeps) == 3
+    assert max(sleeps) == 60
+    assert runs == [("market", et(2026, 9, 11, 9, 35), 56844)]          # 09:30 was woken for too late
+    assert [r.getMessage() for r in caplog.records] == [
+        "host paused ~15h 47m (wall +56844 s, process +0 s)",
+        "Missed 1 health check slot(s) up to 2026-09-11T13:30:00+00:00 (woke 159s after that slot)",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_loop_wake_between_slots_warns_missed(monkeypatch, caplog):
+    # Last check Fri 09:35; the chunk starting 09:36 ET takes 16 h, waking Sat 01:36 ET.
+    clock = Clock(et(2026, 9, 11, 9, 35))
+    runs = recording_check(monkeypatch)
+    sleep, sleeps = loop_sleep(clock, stop_at=et(2026, 9, 14, 9, 35),
+                               freeze=(et(2026, 9, 11, 9, 36), et(2026, 9, 12, 1, 36)))
+    with caplog.at_level(logging.WARNING), pytest.raises(asyncio.CancelledError):
+        await scheduler.run_scheduler(make_state([]), clock=clock, sleep=sleep)
+    assert runs == [("market", et(2026, 9, 11, 9, 35), None), ("market", et(2026, 9, 14, 9, 30), 57600)]
+    assert max(sleeps) == 60
+    assert [r.getMessage() for r in caplog.records] == [                 # 09:40 … 16:00 = 77, + settle
+        "host paused ~16h 0m (wall +57600 s, process +0 s)",
+        "Missed 78 health check slot(s) up to 2026-09-11T20:20:00+00:00 (woke 33360s after that slot)",
+    ]
+
+    # A fresh loop booted at that moment has handled nothing: it reports nothing.
+    clock = Clock(et(2026, 9, 12, 1, 36))
+    sleep, _ = loop_sleep(clock, stop_at=et(2026, 9, 12, 1, 40))
+    caplog.clear()
+    with caplog.at_level(logging.WARNING), pytest.raises(asyncio.CancelledError):
+        await scheduler.run_scheduler(make_state([]), clock=clock, sleep=sleep)
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_loop_full_session_every_slot_once(monkeypatch, caplog):
+    clock = Clock(et(2026, 9, 10, 9, 29))
+    runs = patch_run_check(monkeypatch)
+    sleep, sleeps = loop_sleep(clock, stop_at=et(2026, 9, 10, 16, 26))
+    with caplog.at_level(logging.WARNING), pytest.raises(asyncio.CancelledError):
+        await scheduler.run_scheduler(make_state([]), clock=clock, sleep=sleep)
+    market = [("market", et(2026, 9, 10, 9, 30) + timedelta(minutes=5 * i)) for i in range(79)]
+    assert runs == market + [("settle", et(2026, 9, 10, 16, 20))]
+    assert max(sleeps) == 60 and caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_loop_error_fallback_is_chunked(monkeypatch, caplog):
+    clock = Clock(et(2026, 9, 10, 16, 10))                # between the close and the settle
+    runs = patch_run_check(monkeypatch)
+    real_slot_for, calls = scheduler.slot_for, []
+
+    def flaky(now):
+        calls.append(now)
+        if len(calls) == 1:
+            raise RuntimeError("gating bug")
+        return real_slot_for(now)
+
+    monkeypatch.setattr(scheduler, "slot_for", flaky)
+    sleep, sleeps = loop_sleep(clock, stop_at=et(2026, 9, 10, 16, 25))
+    with caplog.at_level(logging.WARNING), pytest.raises(asyncio.CancelledError):
+        await scheduler.run_scheduler(make_state([]), clock=clock, sleep=sleep)
+    assert [r.getMessage() for r in caplog.records] == ["Scheduler loop error RuntimeError: gating bug"]
+    assert sleeps[:10] == [60] * 10                       # the 300 s fallback, then 16:15 → 16:20
+    assert runs == [("settle", et(2026, 9, 10, 16, 20))]
 
 
 @pytest.mark.asyncio
