@@ -42,6 +42,7 @@ import econ_calendar
 import macro_brief
 import macro_inputs
 import news_poller
+import scheduler
 from config import settings
 
 # ── Logging ──────────────────────────────────────────────────────
@@ -105,7 +106,6 @@ async def lifespan(app: FastAPI):
     app.state.check_status = {"lastCheckAt": None, "lastKind": None, "lastScore": None, "lastError": None}
     app.state.scheduler_task = None
     if settings.scheduler_enabled:
-        import scheduler
         app.state.scheduler_task = asyncio.create_task(scheduler.run_scheduler(app.state))
         logger.info("✅ Regime scheduler started")
     else:
@@ -151,8 +151,11 @@ async def lifespan(app: FastAPI):
     app.state.brief_status = macro_brief.initial_brief_status()
     app.state.brief_lock = asyncio.Lock()
     app.state.ai_agent_client = AiAgentClient(settings.ai_agent_url) if settings.macro_brief_enabled else None
-    app.state.brief_task = None
+    app.state.brief_task = app.state.brief_queue = None
     if settings.macro_brief_enabled:
+        # The regime trigger (decision 5): run_check's publish hook feeds a size-1 queue the loop waits on.
+        app.state.brief_queue = asyncio.Queue(maxsize=1)
+        scheduler.on_check_published = macro_brief.request_brief
         app.state.brief_task = asyncio.create_task(macro_brief.run_brief_loop(app.state, app.state.ai_agent_client))
         logger.info("✅ Macro brief loop started")
     else:
@@ -163,6 +166,7 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down Risk Shield...")
+    scheduler.on_check_published = None       # no brief request into a loop that is stopping (3.6b)
     # The scheduler and the news poller stop before the pool and Redis close,
     # so neither runs on a closed connection. One bounded wait for both.
     # asyncio.wait, not wait_for: wait_for would block on a task that does not

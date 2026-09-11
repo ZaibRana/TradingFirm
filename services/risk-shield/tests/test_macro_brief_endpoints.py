@@ -216,6 +216,7 @@ def test_generate_endpoint_outcomes(post_with, monkeypatch):
 
 import cache
 import httpx
+import scheduler
 
 import ai_agent_client
 from ai_agent_client import AiAgentClient
@@ -267,7 +268,8 @@ def test_lifespan_brief_off_starts_no_task(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING), TestClient(main.app) as client:
         body = client.get("/health").json()
         state = main.app.state
-        assert (state.brief_task, state.ai_agent_client, getattr(state, "brief_queue", None)) == (None, None, None)
+        assert (state.brief_task, state.ai_agent_client, state.brief_queue, scheduler.on_check_published) == (
+            None, None, None, None)
         assert state.brief_status == macro_brief.initial_brief_status() and not state.brief_lock.locked()
         assert body["macroBriefEnabled"] is False
         assert client.post("/macro/brief/generate").json() == {"detail": "macro brief disabled"}
@@ -298,7 +300,10 @@ def test_lifespan_brief_task_cancelled_before_close(monkeypatch, caplog):
     monkeypatch.setattr(macro_brief, "run_brief_loop", loop)
     with TestClient(main.app) as client:
         client.get("/health")                                         # lets the task run its first step
-        assert isinstance(main.app.state.brief_task, asyncio.Task)
+        state = main.app.state
+        assert isinstance(state.brief_task, asyncio.Task) and state.brief_queue.maxsize == 1
+        assert scheduler.on_check_published is macro_brief.request_brief
+    assert scheduler.on_check_published is None                      # reset on shutdown
     assert events == ["started", "cancelled", "ai-agent closed", "db closed", "redis closed"]
 
     # A loop that ignores the cancel (stuck mid-call): shutdown is still bounded.

@@ -25,6 +25,7 @@ import macro_inputs
 import scheduler
 import wallclock
 from ai_agent_client import AiAgentBadResponse, AiAgentError
+from scoring.alert_manager import REASON_CRITICAL, REASON_REGIME_CHANGE
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,19 @@ async def generate_once(state, client, *, trigger: str, clock: Callable[[], date
             logger.warning(f"Macro brief ({trigger}) skipped: database unavailable")
             return _not_stored(status, SKIPPED, "database unavailable")
 
+        # Regime requests are debounced by stored briefs read from Postgres (decision 5): a
+        # failed attempt never debounces the next one, and a restart forgets nothing.
+        if trigger in DEBOUNCE:
+            window, counted = DEBOUNCE[trigger]
+            try:
+                last = await db.last_brief_at(pool, counted)
+            except db.DB_FAILURES as e:
+                logger.warning(f"Macro brief ({trigger}) skipped: the debounce read failed ({type(e).__name__})")
+                return _not_stored(status, SKIPPED, "database unavailable")
+            if last is not None and clock() - last < window:
+                logger.info(f"Macro brief ({trigger}) debounced: a brief was stored at {last.isoformat()}")
+                return {"outcome": SKIPPED, "cause": "debounced", "id": None, "row": None}
+
         # Assembled directly, never GET /macro/brief/inputs' 60 s reuse.
         inputs = await macro_inputs.assemble_inputs(state, state.fred_client, state.inputs_http, now=clock())
         if not inputs["ready"]:
@@ -102,6 +116,55 @@ async def generate_once(state, client, *, trigger: str, clock: Callable[[], date
                       lastError=None)
     logger.info(f"Macro brief ({trigger}) stored: {row['id']}, {regime} {score}")
     return {"outcome": GENERATED, "cause": None, "id": row["id"], "row": row}
+
+
+# ── The regime trigger (decision 5) ──────────────────────────────
+
+# trigger → (window, the trigger whose stored briefs count; None = any). The 30 min
+# rule covers "a scheduled brief ran in the last 30 min"; CRITICAL has its own cap.
+DEBOUNCE = {REASON_REGIME_CHANGE: (timedelta(minutes=30), None),
+            REASON_CRITICAL: (timedelta(minutes=60), REASON_CRITICAL)}
+
+
+def request_brief(state, reason: str) -> None:
+    """scheduler.on_check_published while MACRO_BRIEF_ENABLED: queue a brief
+    for a regime_change or critical publish (initial and score_move never do).
+    Never awaits, never raises: a full queue drops the request (one is already
+    waiting, and the debounce would absorb it), and a bug is an ERROR."""
+    queue = getattr(state, "brief_queue", None)
+    if reason not in DEBOUNCE or queue is None:
+        return
+    try:
+        queue.put_nowait(reason)
+    except asyncio.QueueFull:
+        logger.debug(f"Macro brief request ({reason}) dropped: one is already queued")
+    except Exception as e:
+        logger.error(f"Macro brief request ({reason}) raised {type(e).__name__}: {e}")
+
+
+def queue_wait(state) -> Callable:
+    """The loop's default chunk wait: the next queued request at once, or None
+    when `seconds` pass (asyncio.wait_for on the queue). No queue: a plain sleep."""
+    async def wait(seconds: float) -> Optional[str]:
+        queue = getattr(state, "brief_queue", None)
+        if queue is None:
+            await asyncio.sleep(seconds)
+            return None
+        try:
+            return await asyncio.wait_for(queue.get(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return None
+    return wait
+
+
+async def _handle_request(state, client, reason: str, clock: Callable[[], datetime]) -> None:
+    """A queued request: one generation now, its debounce deciding. A raise is a
+    bug: ERROR, and the loop waits on toward the same slot."""
+    try:
+        await generate_once(state, client, trigger=reason, clock=clock)
+    except Exception as e:
+        logger.error(f"Macro brief request ({reason}) raised {type(e).__name__}: {e}")
+        state.brief_status["lastError"] = f"request raised: {type(e).__name__}"
 
 
 # ── The schedule (decision 3) ────────────────────────────────────
@@ -188,19 +251,18 @@ async def _handle_wake(state, client, slot: datetime, clock: Callable[[], dateti
         state.brief_status["lastError"] = f"slot raised: {type(e).__name__}"
 
 
-async def _sleep(seconds: float) -> None:
-    await asyncio.sleep(seconds)
-
-
-async def run_brief_loop(state, client, *, clock: Callable[[], datetime] = _utc_now, wait=_sleep) -> None:
+async def run_brief_loop(state, client, *, clock: Callable[[], datetime] = _utc_now, wait=None) -> None:
     """
     Forever: wait for the next slot in repeated wait(wallclock.wait_seconds(
     target, clock())) chunks of ≤ 60 s, the clock re-read after each, so a Mac
     sleep is noticed within one chunk of waking (v2 item 7); then handle the
-    wake. At boot only a slot whose grace still holds counts (a restart at
-    07:45 checks 07:30). No next slot is an ERROR and a 300 s wait through the
-    same chunks. Cancellation (shutdown) propagates.
+    wake. A chunk that answers a queued request (default wait: queue_wait)
+    generates it at once and waits on toward the same slot. At boot only a
+    slot whose grace still holds counts (a restart at 07:45 checks 07:30). No
+    next slot is an ERROR and a 300 s wait through the same chunks.
+    Cancellation (shutdown) propagates.
     """
+    wait = wait or queue_wait(state)
     logger.info("Macro brief loop running")
     booting = True
     while True:
@@ -214,6 +276,8 @@ async def run_brief_loop(state, client, *, clock: Callable[[], datetime] = _utc_
         booting = False
         target = slot or clock() + timedelta(seconds=FALLBACK_WAIT_SECONDS)
         while (seconds := wallclock.wait_seconds(target, clock())) > 0:
-            await wait(seconds)
+            reason = await wait(seconds)
+            if reason is not None:
+                await _handle_request(state, client, reason, clock)
         if slot is not None:
             await _handle_wake(state, client, slot, clock)

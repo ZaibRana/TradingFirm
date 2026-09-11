@@ -189,6 +189,11 @@ def previous_close_before(day: date) -> Optional[datetime]:
 
 TREND_POINTS = 5     # provisional: ± points against the settle base
 
+# Called as on_check_published(state, reason) after a check publishes (Part 3.6b
+# decision 5). None unless the lifespan sets it (MACRO_BRIEF_ENABLED), so the
+# scheduler knows nothing of the macro brief. It must not block; a raise is logged.
+on_check_published: Optional[Callable[[Any, str], None]] = None
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -265,6 +270,13 @@ async def run_check(state, kind: str, *, clock: Callable[[], datetime] = _utc_no
                                          paused_seconds=paused)
     except Exception as e:
         _failure("publish", e, errors)
+
+    hook = on_check_published
+    if hook is not None and published and published["published"]:
+        try:
+            hook(state, published["reason"])
+        except Exception as e:
+            _failure("publish hook", e, errors)
 
     if pool is None:
         logger.warning(f"Health check ({kind}) not recorded: database unavailable")

@@ -430,3 +430,159 @@ async def test_brief_loop_survives_exception_and_cancels_cleanly(monkeypatch, ca
         await macro_brief.run_brief_loop(r.state, r.client, clock=clock, wait=wait)
     assert (waits[:5], looked[:2], runs) == ([60] * 5, [THU_0700, et(2026, 9, 10, 7, 5)],
                                              [("slot", et(2026, 9, 10, 7, 30))])
+
+
+# ── The regime trigger (decision 5, commit 6) ────────────────────
+
+from tests.test_scheduler import MARKET_AT, YESTERDAY_SETTLE, make_state, patch_compute
+
+
+def patch_publish(monkeypatch, log, published):
+    """run_check's publish step answers `published`, or raises it."""
+    async def fake(r, health, trend, **kwargs):
+        log.append("publish")
+        if isinstance(published, Exception):
+            raise published
+        return published
+
+    monkeypatch.setattr(scheduler, "publish_health", fake)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("published, queued", [
+    ({"published": True, "reason": "regime_change"}, ["regime_change"]),
+    ({"published": True, "reason": "critical"}, ["critical"]),
+    ({"published": True, "reason": "initial"}, []),
+    ({"published": True, "reason": "score_move"}, []),
+    ({"published": False, "reason": None}, []),
+    (RuntimeError("publish bug"), []),
+], ids=["regime_change", "critical", "initial", "score_move", "nothing", "publish-raises"])
+async def test_run_check_requests_brief_on_regime_change_and_critical(monkeypatch, published, queued):
+    log, fired = [], []
+    state = make_state(log, rows=[YESTERDAY_SETTLE])
+    state.brief_queue = asyncio.Queue(maxsize=1)
+    patch_compute(monkeypatch, log, 72)
+    patch_publish(monkeypatch, log, published)
+
+    def hook(hook_state, reason):                                     # what the lifespan wires: request_brief
+        log.append("hook")
+        fired.append(reason)
+        macro_brief.request_brief(hook_state, reason)
+
+    monkeypatch.setattr(scheduler, "on_check_published", hook)
+    await scheduler.run_check(state, "market", clock=Clock(MARKET_AT))
+    did_publish = isinstance(published, dict) and published["published"]
+    assert log == ["compute", "publish"] + ["hook"] * did_publish + ["insert"]   # once, after publish, before insert
+    assert fired == ([published["reason"]] if did_publish else [])
+    assert [state.brief_queue.get_nowait() for _ in range(state.brief_queue.qsize())] == queued
+
+
+@pytest.mark.asyncio
+async def test_request_brief_queue_bounded_drop_if_full(monkeypatch, caplog):
+    assert scheduler.on_check_published is None                      # flag off: run_check's cost is this None check
+    state = SimpleNamespace(brief_queue=None)
+    macro_brief.request_brief(state, "critical")                     # no queue: nothing
+    state.brief_queue = asyncio.Queue(maxsize=1)
+    with caplog.at_level(logging.DEBUG, logger="macro_brief"):
+        macro_brief.request_brief(state, "regime_change")            # empty: queued
+        for _ in range(3):
+            macro_brief.request_brief(state, "critical")             # full: dropped, DEBUG only
+    assert (state.brief_queue.qsize(), state.brief_queue.get_nowait()) == (1, "regime_change")
+    assert own_records(caplog, logging.DEBUG) == [
+        ("DEBUG", "Macro brief request (critical) dropped: one is already queued")] * 3
+
+    class BrokenQueue:
+        def put_nowait(self, item):
+            raise RuntimeError("queue bug")
+
+    log = []
+    state = make_state(log, rows=[YESTERDAY_SETTLE])
+    state.brief_queue = BrokenQueue()
+    patch_compute(monkeypatch, log, 72)
+    patch_publish(monkeypatch, log, {"published": True, "reason": "regime_change"})
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        for hook in (macro_brief.request_brief, lambda s, reason: 1 / 0):   # put_nowait raises; the hook raises
+            monkeypatch.setattr(scheduler, "on_check_published", hook)
+            result = await scheduler.run_check(state, "market", clock=Clock(MARKET_AT))
+            assert log[-1] == "insert"                                # never raises into run_check
+    assert [r.getMessage() for r in caplog.records] == [
+        "Macro brief request (regime_change) raised RuntimeError: queue bug",
+        "Health check publish hook raised ZeroDivisionError: division by zero"]
+    assert result["errors"] == ["publish hook: ZeroDivisionError"]
+
+
+@pytest.mark.asyncio
+async def test_regime_brief_debounced_30_min(monkeypatch, caplog):
+    stored_at = NOW - timedelta(minutes=29)
+    r = rig(monkeypatch, rows=[{"generated_at": stored_at, "trigger": "manual"}])     # any trigger counts
+    r.state.brief_status["lastError"] = "ai-agent: HTTP 503"
+    with caplog.at_level(logging.INFO, logger="macro_brief"):
+        result = await macro_brief.generate_once(r.state, r.client, trigger="regime_change", clock=Clock(NOW))
+    assert result == {"outcome": "skipped", "cause": "debounced", "id": None, "row": None}
+    assert (r.calls, r.agent.requests, r.state.brief_status["lastError"]) == ([], [], "ai-agent: HTTP 503")
+    assert own_records(caplog, logging.INFO)[-1] == (
+        "INFO", f"Macro brief (regime_change) debounced: a brief was stored at {stored_at.isoformat()}")
+
+    r = rig(monkeypatch, rows=[{"generated_at": NOW - timedelta(minutes=31), "trigger": "slot"}])
+    result = await macro_brief.generate_once(r.state, r.client, trigger="regime_change", clock=Clock(NOW))
+    assert result["outcome"] == "generated"
+
+    # A failed attempt 1 min ago stored nothing, so it debounces nothing; process memory does not count either.
+    r = rig(monkeypatch, answers=((503, {"detail": "busy"}), (200, brief())))
+    first = await macro_brief.generate_once(r.state, r.client, trigger="regime_change",
+                                            clock=Clock(NOW - timedelta(minutes=1)))
+    r.state.brief_status["lastBriefAt"] = (NOW - timedelta(minutes=1)).isoformat()
+    second = await macro_brief.generate_once(r.state, r.client, trigger="regime_change", clock=Clock(NOW))
+    assert (first["outcome"], second["outcome"], len(r.agent.requests)) == ("failed", "generated", 2)
+
+    # The debounce read fails: skipped, never a guess.
+    r = rig(monkeypatch, fail_read=asyncpg.InterfaceError("connection lost"))
+    result = await macro_brief.generate_once(r.state, r.client, trigger="regime_change", clock=Clock(NOW))
+    assert (result["cause"], r.calls, r.agent.requests, r.state.brief_status["lastError"]) == (
+        "database unavailable", [], [], "database unavailable")
+
+
+@pytest.mark.asyncio
+async def test_critical_brief_capped_60_min(monkeypatch):
+    for rows, outcome in (([{"generated_at": NOW - timedelta(minutes=59), "trigger": "critical"}], "skipped"),
+                          ([{"generated_at": NOW - timedelta(minutes=61), "trigger": "critical"}], "generated"),
+                          ([{"generated_at": NOW - timedelta(minutes=5), "trigger": "slot"},
+                            {"generated_at": NOW - timedelta(minutes=20), "trigger": "regime_change"}], "generated")):
+        r = rig(monkeypatch, rows=rows)
+        result = await macro_brief.generate_once(r.state, r.client, trigger="critical", clock=Clock(NOW))
+        assert (result["outcome"], len(r.agent.requests)) == (outcome, int(outcome == "generated")), rows
+    assert macro_brief.DEBOUNCE == {"regime_change": (timedelta(minutes=30), None),
+                                    "critical": (timedelta(minutes=60), "critical")}
+
+
+@pytest.mark.asyncio
+async def test_brief_loop_consumes_queue_between_slots(monkeypatch, caplog):
+    # The default wait: a queued request at once, else None when the chunk ends; no queue is a plain sleep.
+    state = SimpleNamespace(brief_queue=asyncio.Queue(maxsize=1))
+    wait = macro_brief.queue_wait(state)
+    assert await wait(0.01) is None
+    macro_brief.request_brief(state, "critical")
+    assert await asyncio.wait_for(wait(60), 1) == "critical"
+    assert await macro_brief.queue_wait(SimpleNamespace(brief_queue=None))(0.01) is None
+
+    # In the loop: requests at 10:00 and 11:00 generate at once (the second raises: ERROR, the loop goes on),
+    # and the 12:30 slot still runs on time.
+    r = rig(monkeypatch)
+    r.state.brief_queue = asyncio.Queue(maxsize=1)
+    runs, clock = record_generations(monkeypatch, raise_on=(2,)), Clock(et(2026, 9, 10, 9, 59))
+    chunk, waits = loop_wait(clock, stop_at=et(2026, 9, 10, 12, 31))
+    publishes = {et(2026, 9, 10, 10, 0): "regime_change", et(2026, 9, 10, 11, 0): "critical"}
+
+    async def wait(seconds):
+        if clock.t in publishes:                                      # run_check's hook firing mid-wait
+            macro_brief.request_brief(r.state, publishes.pop(clock.t))
+        return r.state.brief_queue.get_nowait() if not r.state.brief_queue.empty() else await chunk(seconds)
+
+    with caplog.at_level(logging.ERROR, logger="macro_brief"), pytest.raises(asyncio.CancelledError):
+        await macro_brief.run_brief_loop(r.state, r.client, clock=clock, wait=wait)
+    assert runs == [("regime_change", et(2026, 9, 10, 10, 0)), ("critical", et(2026, 9, 10, 11, 0)),
+                    ("slot", et(2026, 9, 10, 12, 30))]
+    assert own_records(caplog, logging.ERROR) == [
+        ("ERROR", "Macro brief request (critical) raised RuntimeError: generation bug")]
+    assert r.state.brief_status["lastError"] == "request raised: RuntimeError" and max(waits) <= 60
