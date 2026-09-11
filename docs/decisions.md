@@ -648,3 +648,15 @@ The shared ×1.3–1.8 put 3.5's code above its band (1,119 vs ~770–1,060) and
 **Why:** Docker's monotonic clock stops while the Mac sleeps. One sleep toward 13:30 UTC slept through the 2026-09-11 open.
 
 **Supersedes:** 3.4 spec decision 3's single sleep to the next slot, and 3.5's single sleep to the quarter hour.
+
+---
+
+## 2026-09-11 — 3.4 follow-up deployed in-session on explicit go
+
+**Decision:** 3.4 follow-up deployed in-session on explicit go; reason: unfixed sleep bug in prod put tonight's settle at risk.
+- An exception to the G15 timing rule (after the 20:20 UTC settle), with at most one skipped slot accepted.
+- The recreate ran 61 s after a slot's row landed, so the new container didn't run that slot again. The stop conditions (`/health` not 200 within 60 s, a loop's "running" line missing, any ERROR in the first 2 min) rolled back to `rollback-3.6a` without asking.
+
+**Why:** the reason above. Waiting for 20:20 UTC left the settle to a scheduler that a Mac sleep could stall.
+
+**Supersedes:** N/A. A one-off exception to the 2026-09-10 G15 timing entry.
