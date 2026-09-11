@@ -534,8 +534,8 @@ added the econ calendar and the market news poller (with data-engine's
 `POST /news/ingest`), deployed to prod on 2026-09-10. Part 3.6a added the
 macro brief's inputs and `GET /macro/brief/inputs` (with data-engine's
 `GET /news/market` and migration 006), deployed to prod on 2026-09-10. Part
-3.6b added brief generation behind `MACRO_BRIEF_ENABLED` (off); it is in the
-repo, not yet deployed to prod, and ai-agent's route comes with 4.6. The `scanner/`
+3.6b added brief generation behind `MACRO_BRIEF_ENABLED` (off), deployed to
+prod on 2026-09-11; ai-agent's route comes with 4.6. The `scanner/`
 standalone scripts predate the data-engine port and stay only as a frozen
 reference — see [`.agents/AGENTS.md`](../.agents/AGENTS.md) for the full
 rationale.
