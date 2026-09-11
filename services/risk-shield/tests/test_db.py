@@ -103,11 +103,15 @@ PREV = datetime(2026, 9, 9, 20, 20, tzinfo=timezone.utc)
 
 
 class _RecordingPool:
-    def __init__(self, row=None, rows=()):
-        self.row, self.rows, self.calls = row, list(rows), []
+    def __init__(self, row=None, rows=(), value=None):
+        self.row, self.rows, self.value, self.calls = row, list(rows), value, []
 
     async def execute(self, sql, *args):
         self.calls.append(("execute", sql, args))
+
+    async def fetchval(self, sql, *args):
+        self.calls.append(("fetchval", sql, args))
+        return self.value
 
     async def fetchrow(self, sql, *args):
         self.calls.append(("fetchrow", sql, args))
@@ -198,3 +202,40 @@ async def test_health_history_query():
     assert result[1]["score"] is None
     assert set(result[0]) == {"checked_at", "score", "regime", "trend", "kind", "stale"}
     assert await db.health_history(_RecordingPool(rows=[]), since) == []
+
+
+# ── risk.macro_briefs (Part 3.6b) ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_macro_brief_queries():
+    body, inputs = {"oneParagraph": "p", "keyRisks": ["r"]}, {"schemaVersion": 1, "news": {"items": []}}
+    fields = dict(generated_at=AT, regime="CAUTIOUS", health_score=64, brief_text="p", brief=body, inputs=inputs,
+                  trigger="slot")
+    pool = _RecordingPool(value="3f0c9a52-6d1e-4b7a-9c1f-2a6e8d4b5c70")
+    assert await db.insert_macro_brief(pool, **fields) == "3f0c9a52-6d1e-4b7a-9c1f-2a6e8d4b5c70"
+    [(op, sql, args)] = pool.calls
+    assert op == "fetchval"
+    assert _flat(sql) == ("INSERT INTO risk.macro_briefs (generated_at, regime, health_score, brief_text, brief, "
+                          "inputs, trigger) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7) RETURNING id")
+    assert (*args[:4], json.loads(args[4]), json.loads(args[5]), args[6]) == (
+        AT, "CAUTIOUS", 64, "p", body, inputs, "slot")
+    pool.calls.clear()
+    for field in ("brief", "inputs"):                      # a NaN in either body never reaches SQL
+        with pytest.raises(ValueError):
+            await db.insert_macro_brief(pool, **{**fields, field: {"x": float("nan")}})
+    assert pool.calls == []
+
+    stored = {"id": "3f0c9a52-6d1e-4b7a-9c1f-2a6e8d4b5c70", "generated_at": AT, "trigger": "slot",
+              "regime": "CAUTIOUS", "health_score": 64, "brief_text": "p", "brief": json.dumps(body),
+              "inputs": json.dumps(inputs)}
+    pool = _RecordingPool(row=stored)
+    assert await db.latest_macro_brief(pool) == {**stored, "brief": body, "inputs": inputs}
+    assert _flat(pool.calls[0][1]) == ("SELECT id, generated_at, trigger, regime, health_score, brief_text, brief, "
+                                       "inputs FROM risk.macro_briefs ORDER BY generated_at DESC LIMIT 1")
+    assert await db.latest_macro_brief(_RecordingPool(row=None)) is None
+
+    pool = _RecordingPool(value=PREV)
+    assert (await db.last_brief_at(pool), await db.last_brief_at(pool, "critical")) == (PREV, PREV)
+    assert [(op, args) for op, _, args in pool.calls] == [("fetchval", (None,)), ("fetchval", ("critical",))]
+    assert _flat(pool.calls[0][1]) == ("SELECT max(generated_at) FROM risk.macro_briefs "
+                                       "WHERE $1::text IS NULL OR trigger = $1")

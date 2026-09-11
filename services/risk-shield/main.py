@@ -17,6 +17,7 @@ Endpoints:
                             from data/econ_calendar.json only (Part 3.5)
   GET /macro/brief/inputs — the macro brief's inputs document with freshness
                             flags, reused for 60 s (Part 3.6a)
+  GET /macro/brief        — the latest stored macro brief, Postgres only (Part 3.6b)
 
 Port: 8003
 """
@@ -235,6 +236,8 @@ async def health():
         **_news_health(),
         # Part 3.6a: whether this process may generate macro briefs (3.6b).
         "macroBriefEnabled": settings.macro_brief_enabled,
+        # Part 3.6b: the last stored brief, and the last attempt's error.
+        **_brief_health(),
     }
 
 
@@ -252,6 +255,7 @@ async def root():
             "GET  /market/history?days=30",
             "GET  /market/calendar?days=7",
             "GET  /macro/brief/inputs",
+            "GET  /macro/brief",
         ],
     }
 
@@ -281,7 +285,7 @@ async def _read(helper, *args):
     try:
         return await helper(pool, *args)
     except db.DB_FAILURES as e:
-        logger.warning(f"/market read failed: {e!r}")
+        logger.warning(f"Postgres read failed ({helper.__name__}): {e!r}")
         raise HTTPException(status_code=503, detail=DB_UNAVAILABLE_DETAIL) from None
 
 
@@ -460,3 +464,48 @@ async def macro_brief_inputs():
         doc = await macro_inputs.assemble_inputs(state, state.fred_client, state.inputs_http, now=_now())
         state.inputs_last = (_monotonic(), doc)
     return {**doc, "cached": False}
+
+
+# ── /macro/brief (Part 3.6b, spec decision 6) ────────────────────
+# The stored brief only: GET never generates, whatever MACRO_BRIEF_ENABLED
+# says. brief_status is process memory, written by each generation.
+
+NO_BRIEF_DETAIL = "no macro brief yet"
+
+
+def _brief_health() -> dict:
+    """/health's brief fields: lastBriefAt / lastBriefTrigger describe the last
+    stored brief, lastBriefError the last attempt (null after a success)."""
+    status = getattr(app.state, "brief_status", None) or {}
+    return {"lastBriefAt": status.get("lastBriefAt"), "lastBriefTrigger": status.get("lastTrigger"),
+            "lastBriefError": status.get("lastError")}
+
+
+def _brief_body(row: dict, *, include_inputs: bool = False) -> dict:
+    """The body for one stored brief. freshness is the stored inputs' own
+    block; the inputs themselves only when asked."""
+    inputs = row["inputs"]
+    body = {
+        "id": str(row["id"]),
+        "generatedAt": row["generated_at"].isoformat(),
+        "ageMinutes": int((_now() - row["generated_at"]).total_seconds() // 60),
+        "trigger": row["trigger"],
+        "regime": row["regime"],
+        "healthScore": row["health_score"],
+        "briefText": row["brief_text"],
+        "brief": row["brief"],
+        "freshness": inputs.get("freshness") if isinstance(inputs, dict) else None,
+    }
+    if include_inputs:
+        body["inputs"] = inputs
+    return body
+
+
+@app.get("/macro/brief")
+async def macro_brief(include_inputs: bool = Query(False, alias="includeInputs")):
+    """The latest stored brief. No row is a 404, distinct from a wrong route;
+    no pool or a database failure is a 503."""
+    row = await _read(db.latest_macro_brief)
+    if row is None:
+        raise HTTPException(status_code=404, detail=NO_BRIEF_DETAIL)
+    return _brief_body(row, include_inputs=include_inputs)

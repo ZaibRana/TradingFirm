@@ -178,3 +178,55 @@ async def health_history(pool, since: datetime) -> list[dict]:
         }
         for row in rows
     ]
+
+
+# ── risk.macro_briefs (Part 3.6b, spec decision 2) ───────────────
+# Columns from 005 + 006. A row exists only for a valid ai-agent answer on
+# ready inputs; generate_once decides that, these helpers only store and read.
+
+INSERT_MACRO_BRIEF_SQL = """
+INSERT INTO risk.macro_briefs (generated_at, regime, health_score, brief_text, brief, inputs, trigger)
+VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7)
+RETURNING id
+"""
+
+LATEST_MACRO_BRIEF_SQL = """
+SELECT id, generated_at, trigger, regime, health_score, brief_text, brief, inputs
+FROM risk.macro_briefs
+ORDER BY generated_at DESC
+LIMIT 1
+"""
+
+# The debounce and the manual cooldown count stored briefs only (decision 5).
+LAST_BRIEF_AT_SQL = """
+SELECT max(generated_at) FROM risk.macro_briefs
+WHERE $1::text IS NULL OR trigger = $1
+"""
+
+
+def _json_value(value: Any) -> Any:
+    """A JSONB column as Python (asyncpg returns jsonb as text without a codec)."""
+    return json.loads(value) if isinstance(value, str) else value
+
+
+async def insert_macro_brief(pool, *, generated_at: datetime, regime: Optional[str], health_score: Optional[int],
+                             brief_text: str, brief: dict, inputs: dict, trigger: str) -> str:
+    """One row; the new id. Both JSONB bodies are dumped with allow_nan=False,
+    so a NaN raises ValueError before any SQL."""
+    brief_json, inputs_json = json.dumps(brief, allow_nan=False), json.dumps(inputs, allow_nan=False)
+    new_id = await pool.fetchval(INSERT_MACRO_BRIEF_SQL, generated_at, regime, health_score, brief_text,
+                                 brief_json, inputs_json, trigger)
+    return str(new_id)
+
+
+async def latest_macro_brief(pool) -> Optional[dict]:
+    """The newest row with brief and inputs decoded, or None."""
+    row = await pool.fetchrow(LATEST_MACRO_BRIEF_SQL)
+    if row is None:
+        return None
+    return {**dict(row), "brief": _json_value(row["brief"]), "inputs": _json_value(row["inputs"])}
+
+
+async def last_brief_at(pool, trigger: Optional[str] = None) -> Optional[datetime]:
+    """max(generated_at) over every stored brief, or one trigger's; None when there is none."""
+    return await pool.fetchval(LAST_BRIEF_AT_SQL, trigger)
