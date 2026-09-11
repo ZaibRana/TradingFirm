@@ -108,9 +108,11 @@ ORDER BY checked_at ASC
 """
 
 
-def health_indicators(health: dict, kind: str, settle: Optional[dict]) -> str:
+def health_indicators(health: dict, kind: str, settle: Optional[dict],
+                      paused_seconds: Optional[int] = None) -> str:
     """The indicators JSONB for one check. allow_nan=False: a NaN from a
-    monitor bug raises ValueError here, before any SQL."""
+    monitor bug raises ValueError here, before any SQL. pausedSeconds is the
+    host pause before this check (3.4 follow-up addition 2), else null."""
     return json.dumps({
         "kind": kind,
         "coverage": health.get("coverage"),
@@ -120,14 +122,15 @@ def health_indicators(health: dict, kind: str, settle: Optional[dict]) -> str:
         "inputs": health.get("inputs") or {},
         "settleScore": settle["score"] if settle else None,
         "settleCheckedAt": settle["checkedAt"].isoformat() if settle else None,
+        "pausedSeconds": paused_seconds,
     }, allow_nan=False)
 
 
 async def insert_health_check(pool, health: dict, kind: str, trend: Optional[str],
-                              settle: Optional[dict]) -> None:
+                              settle: Optional[dict], paused_seconds: Optional[int] = None) -> None:
     """One row per check, null scores included. checked_at is the snapshot's
     own checkedAt, never DEFAULT now()."""
-    indicators = health_indicators(health, kind, settle)
+    indicators = health_indicators(health, kind, settle, paused_seconds)
     await pool.execute(
         INSERT_HEALTH_CHECK_SQL,
         datetime.fromisoformat(health["checkedAt"]),

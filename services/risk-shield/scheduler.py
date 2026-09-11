@@ -254,7 +254,7 @@ async def run_check(state, kind: str, *, clock: Callable[[], datetime] = _utc_no
         logger.warning(f"Health check ({kind}) not recorded: database unavailable")
     else:
         try:
-            await db.insert_health_check(pool, health, kind, trend, settle)
+            await db.insert_health_check(pool, health, kind, trend, settle, paused_seconds=paused)
         except Exception as e:
             _failure("insert", e, errors)
 

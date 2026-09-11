@@ -276,16 +276,17 @@ async def test_run_check_carries_paused_seconds_once(monkeypatch):
     first, second = [json.loads(raw) for _, raw in state.redis.published]
     assert (first["pausedSeconds"], second["pausedSeconds"]) == (56844, None)
 
-    # A first check after a pause that doesn't publish still consumes it.
+    # A first check after a pause that doesn't publish still consumes it, and its row keeps it (addition 2).
     state.pending_paused_seconds = 600
     await scheduler.run_check(state, "market", clock=Clock(MARKET_AT + timedelta(minutes=20)))    # held
     assert len(state.redis.published) == 2 and state.pending_paused_seconds is None
+    assert [json.loads(args[4])["pausedSeconds"] for args in state.db_pool.inserts] == [56844, None, 600]
 
-    # A check skipped by the quotes lock leaves it for the next one.
+    # A check skipped by the quotes lock leaves it for the next one, and writes no row.
     state.pending_paused_seconds = 600
     async with quotes._download_lock():
         assert await scheduler.run_check(state, "market", clock=Clock(MARKET_AT + timedelta(minutes=25))) is None
-    assert state.pending_paused_seconds == 600
+    assert state.pending_paused_seconds == 600 and len(state.db_pool.inserts) == 3
 
 
 # ── run_scheduler ────────────────────────────────────────────────
