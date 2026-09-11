@@ -252,7 +252,7 @@ def _answer(status=200, json_body=None, content=None, seen=None):
 async def test_inputs_news_from_data_engine():
     body = [_item(30), _item(20, title="T" * 400, source=None, summary=None), _item(10, summary="S" * 500)]
     async with _http(_answer(json_body=body)) as http:
-        news = await macro_inputs.news_section(http)
+        news = await macro_inputs.news_section(http, 24)
     assert news == {
         "status": "ok", "cause": None, "hours": 24, "limit": 50, "count": 3, "truncated": 2,
         "trimmedForSize": 0,
@@ -268,19 +268,34 @@ async def test_inputs_news_from_data_engine():
 
 
 @pytest.mark.asyncio
-async def test_inputs_news_request_within_route_bounds():
+@pytest.mark.parametrize("now, hours", [
+    (et(2026, 9, 15, 7, 30), 24),         # Tue: Mon 16:00, 15.5 h → the floor
+    (et(2026, 9, 11, 16, 30), 25),        # Fri 16:30: Thu 16:00, 24.5 h
+    (et(2026, 9, 14, 7, 30), 64),         # Mon: Fri 16:00, 63.5 h
+    (et(2026, 9, 8, 7, 30), 88),          # Tue after Labor Day: Fri 09-04 16:00, 87.5 h
+    (et(2026, 11, 27, 7, 30), 40),        # Fri after Thanksgiving: Wed 16:00, 39.5 h
+    (et(2026, 12, 28, 7, 30), 91),        # Mon after Christmas Fri: Thu 12-24's 13:00 early close, 90.5 h
+    (et(2026, 12, 28, 16, 30), 96),       # the same Monday's 16:30 slot: 99.5 h → the ceiling, never 100
+], ids=["tue", "fri-1630", "mon", "after-labor-day", "after-thanksgiving", "after-christmas",
+        "after-christmas-1630-ceiling"])
+async def test_inputs_news_request_within_route_bounds(monkeypatch, now, hours):
+    """Spec 3.6b decision 4: every assembly asks for the hours since the latest
+    XNYS close before today, and the document stores the window it used."""
+    monkeypatch.setattr(news_poller.settings, "news_poll_enabled", False)
     seen = []
     async with _http(_answer(json_body=[_item(1)], seen=seen)) as http:
-        await macro_inputs.news_section(http)
+        doc = await macro_inputs.assemble_inputs(_state(pool=None), FakeFred(), http, now=now)
     (request,) = seen
     assert request.method == "GET"
     assert str(request.url).split("?")[0] == f"{DE_URL}/news/market"
-    assert dict(request.url.params) == {"hours": "24", "limit": "50"}
-    # The pinned copy of data-engine's bounds (spec 3.6a decision 2).
-    assert (macro_inputs.DATA_ENGINE_NEWS_MAX_HOURS, macro_inputs.DATA_ENGINE_NEWS_MAX_LIMIT) == (168, 100), (
+    assert dict(request.url.params) == {"hours": str(hours), "limit": "50"}
+    assert (doc["news"]["hours"], doc["news"]["limit"], macro_inputs.news_hours(now)) == (hours, 50, hours)
+    # The window's bounds, beside the pinned copy of data-engine's (spec 3.6a decision 2).
+    assert (macro_inputs.NEWS_HOURS_MIN, macro_inputs.NEWS_HOURS_MAX, macro_inputs.DATA_ENGINE_NEWS_MAX_HOURS,
+            macro_inputs.DATA_ENGINE_NEWS_MAX_LIMIT) == (24, 96, 168, 100)
+    assert macro_inputs.NEWS_HOURS_MAX <= macro_inputs.DATA_ENGINE_NEWS_MAX_HOURS, (
         "data-engine's GET /news/market bounds are pinned there by "
         "test_news_market_bounds_pinned_for_risk_shield. Change both.")
-    assert 1 <= macro_inputs.NEWS_HOURS <= macro_inputs.DATA_ENGINE_NEWS_MAX_HOURS
     assert 1 <= macro_inputs.NEWS_LIMIT <= macro_inputs.DATA_ENGINE_NEWS_MAX_LIMIT
 
 
@@ -289,7 +304,7 @@ async def test_inputs_news_empty_is_flagged():
     """An empty 24 h is a failure of the feed, not a quiet day: the section
     says so, and the anyStale truth table (commit 4c) counts it."""
     async with _http(_answer(json_body=[])) as http:
-        news = await macro_inputs.news_section(http)
+        news = await macro_inputs.news_section(http, 24)
     assert (news["status"], news["count"], news["items"], news["cause"]) == ("empty", 0, [], None)
     state = SimpleNamespace(news_status=news_poller.initial_news_status())
     assert macro_inputs.news_freshness(news, state, et(2026, 9, 10, 14, 7))["newsStatus"] == "empty"
@@ -328,7 +343,7 @@ async def test_inputs_news_unavailable(handler, cause, monkeypatch, caplog):
 
     with caplog.at_level(logging.WARNING, logger="macro_inputs"):
         async with _http(counting) as http:
-            news = await macro_inputs.news_section(http)
+            news = await macro_inputs.news_section(http, 24)
     assert (news["status"], news["cause"], news["items"]) == ("unavailable", cause, [])
     assert len(calls) == 1                     # no retry, no redirect followed
     assert [r.levelname for r in caplog.records] == ["WARNING"]
@@ -343,10 +358,10 @@ async def test_inputs_news_bad_body(caplog):
     with caplog.at_level(logging.DEBUG, logger="macro_inputs"):
         for body, _ in bodies + bodies:          # each problem twice
             async with _http(_answer(json_body=body)) as http:
-                news = await macro_inputs.news_section(http)
+                news = await macro_inputs.news_section(http, 24)
             assert (news["status"], news["cause"], news["items"]) == ("unavailable", "bad body", [])
         async with _http(_answer(content=b"<html>")) as http:
-            assert (await macro_inputs.news_section(http))["cause"] == "bad body"
+            assert (await macro_inputs.news_section(http, 24))["cause"] == "bad body"
     errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
     assert len(errors) == 3                      # one per distinct problem, never repeated
     assert any("not a list" in m for m in errors) and any("item missing title" in m for m in errors)

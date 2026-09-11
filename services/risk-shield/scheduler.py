@@ -169,6 +169,22 @@ def last_slot_before(now: datetime) -> Optional[tuple[str, datetime]]:
     return None
 
 
+def previous_close_before(day: date) -> Optional[datetime]:
+    """The close (UTC) of the latest XNYS session on an ET date before `day`,
+    early closes included (Part 3.6b decision 4), or None (ERROR) when the
+    calendar cannot cover the dates behind."""
+    try:
+        for offset in range(1, NEXT_SLOT_HORIZON_DAYS + 1):
+            bounds = session_bounds(day - timedelta(days=offset))
+            if bounds is not None:
+                return bounds[1]
+    except CalendarOutOfBounds as e:
+        logger.error(f"No previous XNYS close: {e}")
+        return None
+    logger.error(f"No XNYS close within {NEXT_SLOT_HORIZON_DAYS} days before {day}")
+    return None
+
+
 # ── One check (decision 4) ───────────────────────────────────────
 
 TREND_POINTS = 5     # provisional: ± points against the settle base

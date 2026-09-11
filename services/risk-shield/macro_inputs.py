@@ -17,6 +17,7 @@ Each section has a *_freshness() fragment; the fragments merge into
 import asyncio
 import json
 import logging
+import math
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -151,7 +152,10 @@ def health_freshness(health: dict) -> dict:
 
 # ── News (decision 5) ────────────────────────────────────────────
 
-NEWS_HOURS = 24
+# The window (3.6b decision 4) is news_hours(), clamped to these and kept
+# beside the data-engine bound it must stay under.
+NEWS_HOURS_MIN = 24
+NEWS_HOURS_MAX = 96
 NEWS_LIMIT = 50
 # data-engine's GET /news/market bounds (spec 3.6a decision 2), a pinned copy:
 # the two services share no package. data-engine pins its side in
@@ -168,24 +172,36 @@ NEWS_STATUSES = ("ok", "empty", "unavailable")
 _bad_body_logged: set[str] = set()
 
 
-def _news(status: str, cause: Optional[str] = None, items: Optional[list] = None, truncated: int = 0) -> dict:
+def news_hours(now: datetime) -> int:
+    """Hours since the latest XNYS close before now's ET date, rounded up and
+    clamped to NEWS_HOURS_MIN…NEWS_HOURS_MAX, so Monday's 07:30 brief reaches
+    back to Friday's close (3.6b decision 4). No close in reach gives the
+    minimum (scheduler has logged the ERROR)."""
+    close = scheduler.previous_close_before(now.astimezone(scheduler.ET).date())
+    if close is None:
+        return NEWS_HOURS_MIN
+    return max(NEWS_HOURS_MIN, min(NEWS_HOURS_MAX, math.ceil((now - close).total_seconds() / 3600)))
+
+
+def _news(status: str, hours: int, cause: Optional[str] = None, items: Optional[list] = None,
+          truncated: int = 0) -> dict:
     items = items or []
-    return {"status": status, "cause": cause, "hours": NEWS_HOURS, "limit": NEWS_LIMIT,
+    return {"status": status, "cause": cause, "hours": hours, "limit": NEWS_LIMIT,
             "count": len(items), "truncated": truncated, "trimmedForSize": 0, "items": items}
 
 
-def _bad_body(problem: str) -> dict:
+def _bad_body(hours: int, problem: str) -> dict:
     if problem not in _bad_body_logged:
         _bad_body_logged.add(problem)
         logger.error(f"Macro inputs: data-engine /news/market answered a bad body ({problem})")
     else:
         logger.debug(f"Macro inputs: data-engine /news/market bad body again ({problem})")
-    return _news("unavailable", "bad body")
+    return _news("unavailable", hours, "bad body")
 
 
-async def news_section(http) -> dict:
+async def news_section(http, hours: int) -> dict:
     """
-    One GET {data_engine_url}/news/market?hours=24&limit=50, no retry. 200 with
+    One GET {data_engine_url}/news/market?hours=<hours>&limit=50, no retry. 200 with
     a list is "ok" ("empty" for []); a non-200, a transport error or a timeout
     is "unavailable" with the cause (WARNING); a body that is not a list of
     items is "unavailable" / "bad body" (ERROR once per problem). Items keep
@@ -193,43 +209,43 @@ async def news_section(http) -> dict:
     first; the url stays in data-engine.
     """
     url = f"{settings.data_engine_url.rstrip('/')}/news/market"
-    params = {"hours": NEWS_HOURS, "limit": NEWS_LIMIT}
+    params = {"hours": hours, "limit": NEWS_LIMIT}
     try:
         resp = await asyncio.wait_for(http.get(url, params=params), timeout=NEWS_TIMEOUT)
     except (asyncio.TimeoutError, httpx.TimeoutException):
         # First: asyncio.TimeoutError is TimeoutError, an OSError.
         logger.warning("Macro inputs: data-engine /news/market timed out")
-        return _news("unavailable", "timeout")
+        return _news("unavailable", hours, "timeout")
     except (httpx.HTTPError, OSError) as e:
         logger.warning(f"Macro inputs: data-engine /news/market unreachable ({type(e).__name__})")
-        return _news("unavailable", type(e).__name__)
+        return _news("unavailable", hours, type(e).__name__)
     if resp.status_code != 200:
         logger.warning(f"Macro inputs: data-engine /news/market answered HTTP {resp.status_code}")
-        return _news("unavailable", f"HTTP {resp.status_code}")
+        return _news("unavailable", hours, f"HTTP {resp.status_code}")
 
     try:
         body = resp.json()
     except ValueError:
-        return _bad_body("not JSON")
+        return _bad_body(hours, "not JSON")
     if not isinstance(body, list):
-        return _bad_body("not a list")
+        return _bad_body(hours, "not a list")
 
     items, truncated = [], 0
     for raw in body:
         if not isinstance(raw, dict):
-            return _bad_body("item not an object")
+            return _bad_body(hours, "item not an object")
         missing = [k for k in ("publishedAt", "source", "title", "summary") if k not in raw]
         if missing:
-            return _bad_body(f"item missing {missing[0]}")
+            return _bad_body(hours, f"item missing {missing[0]}")
         title, summary, source = raw["title"], raw["summary"] or "", raw["source"]
         if not isinstance(raw["publishedAt"], str) or not isinstance(title, str) or not isinstance(summary, str):
-            return _bad_body("item field not a string")
+            return _bad_body(hours, "item field not a string")
         if len(title) > NEWS_TEXT_MAX or len(summary) > NEWS_TEXT_MAX:
             truncated += 1
         items.append({"publishedAt": raw["publishedAt"],
                       "source": source if isinstance(source, str) else None,
                       "title": title[:NEWS_TEXT_MAX], "summary": summary[:NEWS_TEXT_MAX]})
-    return _news("ok" if items else "empty", items=items, truncated=truncated)
+    return _news("ok" if items else "empty", hours, items=items, truncated=truncated)
 
 
 def news_freshness(news: dict, state, now: datetime) -> dict:
@@ -316,7 +332,7 @@ async def assemble_inputs(state, fred_client, http, *, now: datetime) -> dict:
     Postgres, data-engine, the calendar file and FRED through its cache.
     """
     health, settle = await health_section(getattr(state, "db_pool", None), now)
-    news = await news_section(http)
+    news = await news_section(http, news_hours(now))
     calendar = calendar_section(now)
     fred = await get_fred_view(getattr(state, "redis", None), getattr(state, "cooldowns", None),
                                fred_client, now=lambda: now)
