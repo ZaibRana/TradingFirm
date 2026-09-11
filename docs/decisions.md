@@ -636,3 +636,15 @@ The shared ×1.3–1.8 put 3.5's code above its band (1,119 vs ~770–1,060) and
 **Why:** it explains the alternating `fresh` / `cached` rows and their ~2.5 s / ~0 s write offsets, which otherwise look like a fault.
 
 **Supersedes:** N/A.
+
+---
+
+## 2026-09-11 — Loops wait on the wall clock in ≤ 60 s sleeps (Part 3.4 follow-up)
+
+**Decision:**
+- Every scheduling loop waits through `wallclock.sleep_until`: sleeps of at most 60 s, the wall clock re-read after each. The scheduler also reports slots passed by a wake between slots.
+- A sleep whose wall elapsed beats its process elapsed by more than 120 s logs `host paused ~Xh Ym`. The next check's payload carries `pausedSeconds`; `PAYLOAD_KEYS` is append-only.
+
+**Why:** Docker's monotonic clock stops while the Mac sleeps. One sleep toward 13:30 UTC slept through the 2026-09-11 open.
+
+**Supersedes:** 3.4 spec decision 3's single sleep to the next slot, and 3.5's single sleep to the quarter hour.

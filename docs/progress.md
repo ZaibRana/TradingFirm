@@ -44,11 +44,17 @@ One row per part from `docs/plan-analyst-watcher.md`. Updated at the end of ever
   - 19:00:00 UTC `100 fetched, 100 sent, 0 dropped, 0 truncated, page span 2444 min`; prod `_MARKET` 0 → 100
   - 19:15:00 `100 fetched, 100 sent, page span 2409 min`; 100 → 103 (97 duplicates absorbed); no overlap warning; `newsPollStale: false`
 - **Slots:** the rebuild window held no slot boundary, and 19:00 ran on the new image. 18:45 and 18:55 UTC have no `health_checks` row. Both fell before the rebuild, on the old image, whose logs went with the recreate, so the cause is unknown. |
-| 3.6a | done, G15 waiting | b3c1cce, cfcb681, 88cd366, 4106dae, 1740c5d, 1768eb8, 85fb611, 25f8079 | 2026-09-10 | Spec `docs/specs/3.6a.md` (v2 + amendments A–C). Plan row 3.6 split into 3.6a / 3.6b (`452062d`, decisions). **Built:**
+| 3.6a | done | b3c1cce, cfcb681, 88cd366, 4106dae, 1740c5d, 1768eb8, 85fb611, 25f8079 | 2026-09-10 | Spec `docs/specs/3.6a.md` (v2 + amendments A–C). Plan row 3.6 split into 3.6a / 3.6b (`452062d`, decisions). **Built:**
 - migration 006 (`macro_briefs.brief`, `trigger`)
 - data-engine `GET /news/market`
 - FRED last-known (7 d), refusals as stale, freshness by series cadence
 - `macro_inputs.assemble_inputs` + `GET /macro/brief/inputs` (60 s reuse)
 - `MACRO_BRIEF_ENABLED` / `AI_AGENT_URL`, off in prod, twin hard-coded off / `.invalid`
 
-**Step 0:** 8 FRED requests (one per series), all 200; the cadence table stood. **Verified:** risk-shield 448 → 546, data-engine 435 → 452 in the twins. Twin round trip: health `ok`, settle present, 20 news items via `:8011`, calendar `ok`, FRED `no_data`, `anyStale: true`, second call `cached: true`; dev rows deleted. Pre-part slot check: no gaps on `72b8099801a1` 19:00–20:20 UTC. **Estimate:** code 678 vs 663–969, tests 1,263 vs 1,244–1,778; 4a re-cut to its measured 369. **Outside 3.6a:** `2325d49` froze the clock in `test_dossier_camelcase_shape` (a hard-coded 09-09 broke at the 09-10 close). **G15 waiting:** migrate 006, rebuild data-engine, rebuild risk-shield. |
+**Step 0:** 8 FRED requests (one per series), all 200; the cadence table stood. **Verified:** risk-shield 448 → 546, data-engine 435 → 452 in the twins. Twin round trip: health `ok`, settle present, 20 news items via `:8011`, calendar `ok`, FRED `no_data`, `anyStale: true`, second call `cached: true`; dev rows deleted. Pre-part slot check: no gaps on `72b8099801a1` 19:00–20:20 UTC. **Estimate:** code 678 vs 663–969, tests 1,263 vs 1,244–1,778; 4a re-cut to its measured 369. **Outside 3.6a:** `2325d49` froze the clock in `test_dossier_camelcase_shape` (a hard-coded 09-09 broke at the 09-10 close). **G15 done 2026-09-10** (recorded 2026-09-11): 006 on prod (`schema_migrations` 001–006); data-engine `b829dfb8e97c` and risk-shield `de71ecbae2b2`, both up ~21:07 UTC. |
+| 3.4 follow-up | done, G15 tonight | 84c7453, 783f21d, 8f0d576 | 2026-09-11 | Spec `docs/specs/3.4-follow-up.md` (approved + addition 1). **Built:**
+- `wallclock.py`: sleeps of ≤ 60 s, the wall clock re-read after each, a `host paused` WARNING when wall beats process time by > 120 s
+- both loops wait through it; the scheduler also warns for slots a wake between slots passed
+- `pausedSeconds` appended to the health payload for the first check after a pause
+
+**Verified:** risk-shield 546 → 562 in the twin (16 new tests, 8 updated in place). A real 130 s wait in the twin slept 60.06 / 60.03 / 9.93 s. No direct `sleep(` outside `wallclock.py` and `ratelimit.py`. **Correction during commit 3:** one expected pause line assumed a 60 s process clock; loop tests use the real one (`~2h 1m`). **Estimate:** code 120 vs 111–162; tests 339 vs 348–495 (commits 2 and 3 under their floors). **G15:** `rollback-3.6a` = `de71ecbae2b2` tagged; the rebuild waits for tonight's 20:20 UTC settle row. |

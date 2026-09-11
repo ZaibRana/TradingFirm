@@ -43,7 +43,7 @@ pub/sub, never by writing into another service's tables.
 |---|---|---|---|
 | `data-engine` | 8001 | **Functional** | Finviz screening → yfinance OHLCV → technical filters → enrichment. The only backend service with real logic. |
 | `signal-engine` | 8002 | Empty scaffold | Intended for entry/exit signal detection (zones, patterns). Only `/health` and `/` exist. |
-| `risk-shield` | 8003 | **Partial** | Market health scoring and regime detection (Phase 3). Part 3.1 gave it `config.py` / `db.py` / `cache.py`, a bounded fail-open lifespan and the `risk.macro_briefs` table; Part 3.2 added the two data fetchers (`monitors/quotes.py`, `monitors/fred.py`); Part 3.3 added the six regime monitors, the health score and the regime classifier (`scoring/`). Part 3.4 added the scheduler that runs them in market hours (prod only, `SCHEDULER_ENABLED`), writes `risk.health_checks` and publishes `tf:risk:health`, and `GET /market/health`, `/market/indicators`, `/market/history` beside `/health` and `/`. Part 3.5 added `GET /market/calendar` (a hand-maintained econ calendar file) and the market news poller (Finnhub general news every 15 min into data-engine's `POST /news/ingest`, prod only, `NEWS_POLL_ENABLED`). Part 3.6a added the macro brief's inputs: `GET /macro/brief/inputs` (health rows, data-engine's `GET /news/market`, the calendar, a FRED view with last-known and cadence freshness), the `MACRO_BRIEF_ENABLED` flag (off) and migration 006. Night mode (3.4b) and brief generation (3.6b) are not built. |
+| `risk-shield` | 8003 | **Partial** | Market health scoring and regime detection (Phase 3). Part 3.1 gave it `config.py` / `db.py` / `cache.py`, a bounded fail-open lifespan and the `risk.macro_briefs` table; Part 3.2 added the two data fetchers (`monitors/quotes.py`, `monitors/fred.py`); Part 3.3 added the six regime monitors, the health score and the regime classifier (`scoring/`). Part 3.4 added the scheduler that runs them in market hours (prod only, `SCHEDULER_ENABLED`), writes `risk.health_checks` and publishes `tf:risk:health`, and `GET /market/health`, `/market/indicators`, `/market/history` beside `/health` and `/`. Part 3.5 added `GET /market/calendar` (a hand-maintained econ calendar file) and the market news poller (Finnhub general news every 15 min into data-engine's `POST /news/ingest`, prod only, `NEWS_POLL_ENABLED`). Part 3.6a added the macro brief's inputs: `GET /macro/brief/inputs` (health rows, data-engine's `GET /news/market`, the calendar, a FRED view with last-known and cadence freshness), the `MACRO_BRIEF_ENABLED` flag (off) and migration 006. The 3.4 follow-up moved both loops onto `wallclock.py` (sleeps of ≤ 60 s, a host-pause WARNING, `pausedSeconds` on the payload). Night mode (3.4b) and brief generation (3.6b) are not built. |
 | `ai-agent` | 8004 | Empty scaffold | Intended for trade grading via an LLM (`LLM_PROVIDER` env var supports Gemini/Anthropic). Only `/health` and `/` exist. |
 | `web` (dashboard) | 3000 | **Functional** | Next.js UI showing scan results, stock cards, market status. |
 
@@ -355,6 +355,12 @@ and the macro brief's inputs (Part 3.6a, spec `docs/specs/3.6a.md`):
     slots, 43 on an early close), plus a 16:20 ET settle check. A slot more
     than 60 s late is skipped with a "missed N" WARNING, never caught up.
     There are no night checks (Part 3.4b).
+  - **Waiting (3.4 follow-up):** the loop waits through `wallclock.py`: sleeps
+    of at most 60 s, the wall clock re-read after each, because Docker's
+    monotonic clock stops while the Mac sleeps. A wake that passed slots logs
+    "missed N" even between slots. A host pause over 120 s logs `host paused
+    ~Xh Ym`, and the next check's publish carries `pausedSeconds`. The news
+    poller waits the same way.
   - **A check:** `compute_health` → trend base → publish → insert, each step
     isolated, so a Postgres failure never delays a publish. Trend is ±5
     against the latest scored settle before the check's session open. A
