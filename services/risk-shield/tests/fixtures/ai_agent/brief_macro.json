@@ -1,0 +1,14 @@
+{
+  "regimeView": "Test fixture, not market commentary. The latest health check reads CAUTIOUS with a score in the mid-60s, stable against the previous settle; volatility is elevated but not rising.",
+  "keyRisks": [
+    "Fixture risk: a CPI release inside the calendar window can move rate expectations.",
+    "Fixture risk: breadth is narrow, so the index score leans on a few large names.",
+    "Fixture risk: two FRED series are stale, so the macro read is partly last-known."
+  ],
+  "upcoming": [
+    "Fixture event: CPI release, 08:30 ET.",
+    "Fixture event: FOMC decision, 14:00 ET."
+  ],
+  "oneParagraph": "Test fixture, not market commentary. Conditions read CAUTIOUS: the health score sits in the mid-60s and is stable against the previous settle, with volatility elevated but not rising. The calendar holds a CPI release and an FOMC decision, either of which can reprice rates, and breadth is narrow. Two FRED series are last-known rather than fresh.",
+  "model": "fixture"
+}
