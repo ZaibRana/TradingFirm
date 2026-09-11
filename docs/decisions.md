@@ -576,3 +576,63 @@ The shared ×1.3–1.8 put 3.5's code above its band (1,119 vs ~770–1,060) and
 **Why:** each bullet is a place where a plausible default would have hidden stale inputs from the brief: a fresh-looking 07:30 health row, a cooldown read as an error, a monthly series judged by a daily threshold, an empty news window read as a quiet day.
 
 **Supersedes:** 3.3's deferral of FRED last-known, cooldown-as-stale and cadence freshness (now built).
+
+---
+
+## 2026-09-10 — A risk-shield restart skips the slot it lands on
+
+**Decision:** accepted as designed. A container that boots more than 60 s after a slot's start skips that slot with a "Missed N" WARNING (3.4's grace rule, no catch-up). G15 timing (after the 16:20 settle, or before 09:30 ET) keeps prod rebuilds off slots.
+
+- The 3.5 deploy's new image booted at 18:58:12 UTC and logged `Missed 1 health check slot(s) up to 18:55:00 (woke 193s after that slot)`. So 18:55 fell inside the restart, and 3.5's "the rebuild window held no slot boundary" was wrong.
+- **18:45 UTC stays unexplained.** It was on the old image, whose logs went with the recreate. Saved logs from 3.6a on show no repeat (19:00–20:20 UTC, all 14 slots have a row).
+
+**Why:** the only way to learn this was the saved log, and a restart-skipped slot looks the same in `health_checks` as a scheduler bug.
+
+**Supersedes:** N/A.
+
+---
+
+## 2026-09-11 — The regime scheduler sleeps on a clock that stops while the Mac sleeps
+
+**Decision:** a Part 3.4 bug. The fix is planned, not applied.
+
+- **Cause:** `run_scheduler` sleeps once until the next slot with `asyncio.sleep`. That runs on the Docker VM's monotonic clock, which does not advance while macOS sleeps.
+- **2026-09-11:** the 2026-09-10 21:07 UTC boot slept 58,965 s toward 13:30 UTC. The container counted 17,783 s of 64,193 s wall time, and no row landed until a restart at 15:13:46 UTC (on a go), which skipped 15:10.
+- **Silent:** a wake outside a slot logs nothing. The news poller sleeps ≤ 15 min, so it recovered unaided.
+- **Planned 3.4 fix:**
+  - Cap each sleep (~60 s) and re-read the wall clock on every wake, so a late wake logs "Missed N".
+  - Add a fake-sleep test. The prod rebuild goes outside XNYS hours, on a go.
+  - Until then, a Mac asleep in market hours loses slots.
+- 18:45 UTC on 2026-09-10 is not this cause: `pmset` shows no sleep 17:00–20:00 UTC.
+
+**Why:** a lost session looks like an empty table, and 3.6 and Phase 6 read the settle.
+
+**Supersedes:** N/A.
+
+---
+
+## 2026-09-11 — The health score is near-static intraday
+
+**Decision:** an open design question for 3.3's monitors, not a bug. No change now.
+
+- Only `vix` reads the partial bar. `breadth`, `spy_trend`, `sector_rotation`, `volume` and `cross_asset` read complete bars only, so all session they score the previous close.
+- Intraday the score moves only when VIX crosses a band edge or jumps > 20% on the day (25% of the weight).
+- 2026-09-10: all 37 market rows scored 67.50 → 68 (VIX 17.28–18.12). The 20:20 UTC settle, with the day's bars complete, scored 62.50 → 63 (`spy_trend` 70 → 45).
+
+**Why:** a 5-minute check that sees the session only through VIX may not be what regime alerts and the 3.6 brief assume.
+
+**Supersedes:** N/A.
+
+---
+
+## 2026-09-11 — The quotes cache TTL equals the slot length
+
+**Decision:** recorded, no change now.
+
+- `TTL_QUOTES` is 300 s, one slot. The :x5 check finds the key the :x0 download wrote ~2 s into its slot, so every second market row is `source: cached`, carrying the previous slot's data.
+- VIX, the only intraday input, therefore refreshes every 10 min, not 5.
+- A shorter TTL doubles yfinance downloads (G6).
+
+**Why:** it explains the alternating `fresh` / `cached` rows and their ~2.5 s / ~0 s write offsets, which otherwise look like a fault.
+
+**Supersedes:** N/A.
