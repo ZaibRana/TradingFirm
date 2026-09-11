@@ -210,3 +210,111 @@ def test_generate_endpoint_outcomes(post_with, monkeypatch):
     monkeypatch.setattr(macro_brief, "generate_once", lost_race)
     resp = post_with(BriefStore())[0].post("/macro/brief/generate")
     assert (resp.status_code, resp.json()) == (409, {"detail": "generation in progress"})
+
+
+# ── The lifespan's brief loop (commit 5) ─────────────────────────
+
+import cache
+import httpx
+
+import ai_agent_client
+from ai_agent_client import AiAgentClient
+
+
+def _lifespan_deps(monkeypatch, events):
+    """A fake Redis and pool whose close() records the shutdown order; the other loops off."""
+    class Closing:
+        def __init__(self, name):
+            self.name = name
+
+        async def close(self):
+            events.append(f"{self.name} closed")
+
+    async def redis(*a, **k):
+        return Closing("redis")
+
+    async def pool(*a, **k):
+        return Closing("db")
+
+    monkeypatch.setattr(cache, "create_redis", redis)
+    monkeypatch.setattr(db, "create_db_pool", pool)
+    for flag in ("scheduler_enabled", "news_poll_enabled"):
+        monkeypatch.setattr(main.settings, flag, False)
+
+
+def test_lifespan_brief_off_starts_no_task(monkeypatch, caplog):
+    """The flag off, as prod and the twin run: no task, queue or ai-agent client,
+    no outbound request and AI_AGENT_URL never read (case 1); shutdown closes no
+    client that was never created (case 2)."""
+    events, built, sent = [], [], []
+    _lifespan_deps(monkeypatch, events)
+    monkeypatch.setattr(main.settings, "macro_brief_enabled", False)
+    real = main.settings
+
+    class Guarded:
+        def __getattr__(self, name):
+            assert name != "ai_agent_url", "AI_AGENT_URL read with MACRO_BRIEF_ENABLED off"
+            return getattr(real, name)
+
+    async def no_send(self, request, **kwargs):
+        sent.append(str(request.url))
+        raise AssertionError("an outbound request with the flag off")
+
+    monkeypatch.setattr(main, "settings", Guarded())
+    monkeypatch.setattr(httpx.AsyncClient, "send", no_send)
+    monkeypatch.setattr(ai_agent_client, "AiAgentClient", lambda *a, **k: built.append("client"))
+    monkeypatch.setattr(macro_brief, "run_brief_loop", lambda *a, **k: built.append("loop"))
+    with caplog.at_level(logging.WARNING), TestClient(main.app) as client:
+        body = client.get("/health").json()
+        state = main.app.state
+        assert (state.brief_task, state.ai_agent_client, getattr(state, "brief_queue", None)) == (None, None, None)
+        assert state.brief_status == macro_brief.initial_brief_status() and not state.brief_lock.locked()
+        assert body["macroBriefEnabled"] is False
+        assert client.post("/macro/brief/generate").json() == {"detail": "macro brief disabled"}
+    assert (built, sent) == ([], [])                                  # case 1
+    assert events == ["db closed", "redis closed"]                   # case 2: closing a None would log "close failed"
+    assert not [r for r in caplog.records if "close failed" in r.getMessage()]
+
+
+def test_lifespan_brief_task_cancelled_before_close(monkeypatch, caplog):
+    events = []
+    _lifespan_deps(monkeypatch, events)
+    monkeypatch.setattr(main.settings, "macro_brief_enabled", True)
+    monkeypatch.setattr(main.settings, "ai_agent_url", "http://ai-agent.test:8004")
+
+    async def recording_close(self):
+        events.append("ai-agent closed")
+
+    async def loop(state, client):
+        events.append("started")
+        assert client is state.ai_agent_client and client.url == "http://ai-agent.test:8004/brief/macro"
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            events.append("cancelled")
+            raise
+
+    monkeypatch.setattr(AiAgentClient, "aclose", recording_close)
+    monkeypatch.setattr(macro_brief, "run_brief_loop", loop)
+    with TestClient(main.app) as client:
+        client.get("/health")                                         # lets the task run its first step
+        assert isinstance(main.app.state.brief_task, asyncio.Task)
+    assert events == ["started", "cancelled", "ai-agent closed", "db closed", "redis closed"]
+
+    # A loop that ignores the cancel (stuck mid-call): shutdown is still bounded.
+    events.clear()
+    monkeypatch.setattr("config.SCHEDULER_SHUTDOWN_TIMEOUT", 0.05)
+
+    async def stubborn(state, client):
+        events.append("started")
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            events.append("ignored cancel")
+            await asyncio.sleep(0.3)
+
+    monkeypatch.setattr(macro_brief, "run_brief_loop", stubborn)
+    with caplog.at_level(logging.WARNING), TestClient(main.app) as client:
+        client.get("/health")
+    assert events[:2] == ["started", "ignored cancel"] and events.index("db closed") > 1
+    assert any("Macro brief did not stop" in r.getMessage() for r in caplog.records)

@@ -151,6 +151,12 @@ async def lifespan(app: FastAPI):
     app.state.brief_status = macro_brief.initial_brief_status()
     app.state.brief_lock = asyncio.Lock()
     app.state.ai_agent_client = AiAgentClient(settings.ai_agent_url) if settings.macro_brief_enabled else None
+    app.state.brief_task = None
+    if settings.macro_brief_enabled:
+        app.state.brief_task = asyncio.create_task(macro_brief.run_brief_loop(app.state, app.state.ai_agent_client))
+        logger.info("✅ Macro brief loop started")
+    else:
+        logger.info("Macro brief generation disabled (MACRO_BRIEF_ENABLED is not true)")
 
     logger.info(f"Risk Shield ready on port {settings.service_port}")
     yield
@@ -164,7 +170,8 @@ async def lifespan(app: FastAPI):
     running = {
         name: task
         for name, task in (("Regime scheduler", getattr(app.state, "scheduler_task", None)),
-                           ("News poller", getattr(app.state, "news_task", None)))
+                           ("News poller", getattr(app.state, "news_task", None)),
+                           ("Macro brief", getattr(app.state, "brief_task", None)))
         if task is not None
     }
     for task in running.values():

@@ -239,3 +239,11 @@ async def test_macro_brief_queries():
     assert [(op, args) for op, _, args in pool.calls] == [("fetchval", (None,)), ("fetchval", ("critical",))]
     assert _flat(pool.calls[0][1]) == ("SELECT max(generated_at) FROM risk.macro_briefs "
                                        "WHERE $1::text IS NULL OR trigger = $1")
+
+    pool = _RecordingPool(value=True)
+    end = AT.replace(minute=53)                                         # the slot window: + 1,980 s
+    assert await db.slot_brief_exists(pool, AT, end) is True
+    [(op, sql, args)] = pool.calls
+    assert (op, args) == ("fetchval", (AT, end))
+    assert _flat(sql) == ("SELECT EXISTS (SELECT 1 FROM risk.macro_briefs "
+                          "WHERE trigger = 'slot' AND generated_at >= $1 AND generated_at < $2)")

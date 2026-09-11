@@ -53,6 +53,8 @@ class BriefStore:
             raise self.fail_read
         if sql == db.LAST_BRIEF_AT_SQL:
             return max((r["generated_at"] for r in self.rows if args[0] in (None, r["trigger"])), default=None)
+        if sql == db.SLOT_BRIEF_EXISTS_SQL:
+            return any(r["trigger"] == "slot" and args[0] <= r["generated_at"] < args[1] for r in self.rows)
         raise AssertionError(f"unexpected query: {sql}")
 
     async def fetchrow(self, sql, *args):
@@ -238,3 +240,193 @@ async def test_brief_status_records_outcomes(monkeypatch):
          "lastError": None},
     ]
     assert all(v is None or isinstance(v, str) for status in seen for v in status.values())   # never the document
+
+
+# ── The schedule (decision 3, commit 5) ──────────────────────────
+
+from datetime import date
+from zoneinfo import ZoneInfo
+
+import scheduler
+
+ET = ZoneInfo("America/New_York")
+
+
+def et(y, mo, d, h, mi, s=0):
+    return datetime(y, mo, d, h, mi, s, tzinfo=ET).astimezone(timezone.utc)
+
+
+def loop_wait(clock, *, stop_at, freeze=None):
+    """A fake chunk wait moving the fake clock; the chunk that would reach
+    `stop_at` cancels instead. freeze=(chunk start, wake): that chunk ends at
+    `wake` (the host slept through it, or it woke early)."""
+    waits = []
+
+    async def wait(seconds):
+        waits.append(seconds)
+        if clock.t + timedelta(seconds=seconds) >= stop_at:
+            raise asyncio.CancelledError
+        clock.t = freeze[1] if freeze and clock.t == freeze[0] else clock.t + timedelta(seconds=seconds)
+
+    return wait, waits
+
+
+def record_generations(monkeypatch, *, raise_on=()):
+    runs = []
+
+    async def fake(state, client, *, trigger, clock):
+        runs.append((trigger, clock()))
+        if len(runs) in raise_on:
+            raise RuntimeError("generation bug")
+
+    monkeypatch.setattr(macro_brief, "generate_once", fake)
+    return runs
+
+
+def test_brief_slots_follow_xnys_sessions():
+    thursday = [et(2026, 9, 10, 7, 30), et(2026, 9, 10, 12, 30), et(2026, 9, 10, 16, 30)]
+    assert macro_brief.brief_slots_for_day(date(2026, 9, 10)) == thursday
+    assert (thursday[0].hour, macro_brief.brief_slots_for_day(date(2026, 11, 10))[0].hour) == (11, 12)  # across DST
+    assert macro_brief.brief_slots_for_day(date(2026, 9, 12)) == []                  # Saturday
+    assert macro_brief.brief_slots_for_day(date(2026, 11, 26)) == []                 # Thanksgiving
+    early = macro_brief.brief_slots_for_day(date(2026, 11, 27))                      # a 13:00 close keeps all three
+    assert early == [et(2026, 11, 27, 7, 30), et(2026, 11, 27, 12, 30), et(2026, 11, 27, 16, 30)]
+    assert early[1] < scheduler.session_bounds(date(2026, 11, 27))[1] < early[2]
+    assert macro_brief.next_brief_slot_after(et(2026, 11, 25, 16, 30)) == et(2026, 11, 27, 7, 30)
+    assert macro_brief.next_brief_slot_after(et(2026, 9, 11, 16, 31)) == et(2026, 9, 14, 7, 30)
+    assert macro_brief.brief_slots_between(et(2026, 9, 11, 12, 30), et(2026, 9, 14, 7, 30)) == [
+        et(2026, 9, 11, 12, 30), et(2026, 9, 11, 16, 30), et(2026, 9, 14, 7, 30)]
+    assert [t.strftime("%H:%M") for t in macro_brief.SLOT_TIMES_ET] == ["07:30", "12:30", "16:30"]
+    assert macro_brief.BRIEF_GRACE_SECONDS == 1800
+
+
+THU_0700, THU_0729 = et(2026, 9, 10, 7, 0), et(2026, 9, 10, 7, 29)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boot, freeze, stop_at, runs, warning", [
+    (THU_0700, None, et(2026, 9, 10, 7, 31), [et(2026, 9, 10, 7, 30)], None),
+    (THU_0700, (THU_0729, et(2026, 9, 10, 7, 29, 30)), et(2026, 9, 10, 7, 31), [et(2026, 9, 10, 7, 30)], None),
+    (THU_0700, (THU_0729, et(2026, 9, 10, 7, 59)), et(2026, 9, 10, 8, 0), [et(2026, 9, 10, 7, 59)], None),
+    (THU_0700, (THU_0729, et(2026, 9, 10, 8, 1)), et(2026, 9, 10, 8, 2), [],
+     "Macro brief: 1 slot(s) up to 2026-09-10T11:30:00+00:00 skipped, not caught up (woke 1860s after it)"),
+    (THU_0700, (THU_0729, et(2026, 9, 10, 13, 10)), et(2026, 9, 10, 13, 11), [],
+     "Macro brief: 2 slot(s) up to 2026-09-10T16:30:00+00:00 skipped, not caught up (woke 2400s after it)"),
+    (et(2026, 9, 10, 17, 7), (et(2026, 9, 10, 17, 45), et(2026, 9, 11, 9, 45)), et(2026, 9, 11, 9, 46), [],
+     "Macro brief: 1 slot(s) up to 2026-09-11T11:30:00+00:00 skipped, not caught up (woke 8100s after it)"),
+], ids=["exact", "early-wake", "29-min-late", "31-min-late", "slept-past-two", "a-16h-chunk"])
+async def test_brief_loop_one_generation_per_slot_no_catch_up(monkeypatch, caplog, boot, freeze, stop_at, runs,
+                                                             warning):
+    r = rig(monkeypatch)
+    generations = record_generations(monkeypatch)
+    clock = Clock(boot)
+    wait, waits = loop_wait(clock, stop_at=stop_at, freeze=freeze)
+    with caplog.at_level(logging.WARNING, logger="macro_brief"), pytest.raises(asyncio.CancelledError):
+        await macro_brief.run_brief_loop(r.state, r.client, clock=clock, wait=wait)
+    assert generations == [("slot", t) for t in runs]
+    assert [message for _, message in own_records(caplog)] == ([warning] if warning else [])
+    assert max(waits) <= 60                                          # item 7: no wait over 60 s
+
+
+@pytest.mark.asyncio
+async def test_brief_loop_restart_at_0745_skips_generated_slot(monkeypatch, caplog):
+    r = rig(monkeypatch, rows=[{"id": uuid.uuid4(), "generated_at": et(2026, 9, 10, 7, 31, 10), "trigger": "slot"}])
+    clock = Clock(et(2026, 9, 10, 7, 45))                           # the container restarted, 15 min into the grace
+    wait, _ = loop_wait(clock, stop_at=et(2026, 9, 10, 12, 31))
+    with caplog.at_level(logging.INFO, logger="macro_brief"), pytest.raises(asyncio.CancelledError):
+        await macro_brief.run_brief_loop(r.state, r.client, clock=clock, wait=wait)
+    assert len(r.agent.requests) == 1                                # 12:30's only: none at 07:45
+    assert [(row["trigger"], row["generated_at"]) for row in r.store.rows] == [
+        ("slot", et(2026, 9, 10, 7, 31, 10)), ("slot", et(2026, 9, 10, 12, 30))]
+    assert ("INFO", "Macro brief slot 2026-09-10T11:30:00+00:00 already has a brief: skipped") in own_records(
+        caplog, logging.INFO)
+
+
+@pytest.mark.asyncio
+async def test_slot_brief_exists_window(monkeypatch, caplog):
+    start = et(2026, 9, 10, 7, 30)
+    assert macro_brief.slot_window(start) == (start, start + timedelta(seconds=1980))
+    for row, generates in (({"generated_at": start + timedelta(seconds=1979), "trigger": "slot"}, False),
+                           ({"generated_at": start + timedelta(seconds=1980), "trigger": "slot"}, True),
+                           ({"generated_at": et(2026, 9, 10, 7, 20), "trigger": "manual"}, True),
+                           ({"generated_at": et(2026, 9, 10, 7, 40), "trigger": "manual"}, True),
+                           ({"generated_at": et(2026, 9, 9, 16, 31, 10), "trigger": "slot"}, True)):
+        r = rig(monkeypatch, rows=[row])
+        runs = record_generations(monkeypatch)
+        await macro_brief.run_slot(r.state, r.client, start, clock=Clock(start + timedelta(minutes=15)))
+        assert bool(runs) is generates, row
+
+    r = rig(monkeypatch, fail_read=asyncpg.InterfaceError("connection lost"))
+    runs = record_generations(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="macro_brief"):
+        await macro_brief.run_slot(r.state, r.client, start, clock=Clock(start))
+    assert (runs, r.state.brief_status["lastError"]) == ([], "database unavailable")
+    assert own_records(caplog) == [
+        ("WARNING", "Macro brief slot 2026-09-10T11:30:00+00:00 skipped: the slot check failed (InterfaceError)")]
+
+
+@pytest.mark.asyncio
+async def test_flag_on_ai_agent_404_warns_each_slot_no_backoff(monkeypatch, caplog):
+    not_found = (404, {"detail": "Not Found"})
+    r = rig(monkeypatch, answers=(not_found, not_found, not_found, (200, brief())))
+    real, errors = macro_brief.generate_once, []
+
+    async def watched(state, client, *, trigger, clock):
+        result = await real(state, client, trigger=trigger, clock=clock)
+        errors.append(state.brief_status["lastError"])
+        return result
+
+    monkeypatch.setattr(macro_brief, "generate_once", watched)
+    clock = Clock(THU_0700)
+    wait, waits = loop_wait(clock, stop_at=et(2026, 9, 11, 7, 31))
+    with caplog.at_level(logging.WARNING), pytest.raises(asyncio.CancelledError):
+        await macro_brief.run_brief_loop(r.state, r.client, clock=clock, wait=wait)
+    assert len(r.agent.requests) == 4                                # every slot calls again: no cooldown or backoff
+    assert errors == ["ai-agent: HTTP 404 (no /brief/macro)"] * 3 + [None]
+    assert [(row["trigger"], row["generated_at"]) for row in r.store.rows] == [("slot", et(2026, 9, 11, 7, 30))]
+    assert [(rec.levelname, rec.getMessage()) for rec in caplog.records] == [
+        ("WARNING", "ai-agent has no /brief/macro (HTTP 404)")] * 3  # one WARNING per slot, nothing else
+    assert max(waits) == 60
+
+
+@pytest.mark.asyncio
+async def test_brief_loop_survives_exception_and_cancels_cleanly(monkeypatch, caplog):
+    # Cancel during an ai-agent call: booted on a slot, the answer never comes.
+    r = rig(monkeypatch)
+    r.agent.delay = 30
+    task = asyncio.create_task(macro_brief.run_brief_loop(r.state, r.client, clock=Clock(et(2026, 9, 10, 7, 30))))
+    for _ in range(200):
+        if r.agent.requests:
+            break
+        await asyncio.sleep(0.005)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert (len(r.agent.requests), r.store.rows, r.state.brief_lock.locked()) == (1, [], False)
+
+    # Cancel during a wait: Saturday noon, the real chunked sleep.
+    task = asyncio.create_task(macro_brief.run_brief_loop(r.state, r.client, clock=Clock(et(2026, 9, 12, 12, 0))))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # A generation raises: ERROR, and the next slot still runs.
+    runs, clock = record_generations(monkeypatch, raise_on=(1,)), Clock(THU_0700)
+    wait, _ = loop_wait(clock, stop_at=et(2026, 9, 10, 12, 31))
+    with caplog.at_level(logging.ERROR, logger="macro_brief"), pytest.raises(asyncio.CancelledError):
+        await macro_brief.run_brief_loop(r.state, r.client, clock=clock, wait=wait)
+    assert runs == [("slot", et(2026, 9, 10, 7, 30)), ("slot", et(2026, 9, 10, 12, 30))]
+    assert own_records(caplog, logging.ERROR) == [("ERROR", "Macro brief slot raised RuntimeError: generation bug")]
+    assert r.state.brief_status["lastError"] == "slot raised: RuntimeError"
+
+    # No next slot: a 300 s wait in ≤ 60 s chunks, then it looks again.
+    real_next, looked = macro_brief.next_brief_slot_after, []
+    monkeypatch.setattr(macro_brief, "next_brief_slot_after",
+                        lambda now: looked.append(now) or (real_next(now) if len(looked) > 1 else None))
+    runs, clock = record_generations(monkeypatch), Clock(THU_0700)
+    wait, waits = loop_wait(clock, stop_at=et(2026, 9, 10, 7, 31))
+    with pytest.raises(asyncio.CancelledError):
+        await macro_brief.run_brief_loop(r.state, r.client, clock=clock, wait=wait)
+    assert (waits[:5], looked[:2], runs) == ([60] * 5, [THU_0700, et(2026, 9, 10, 7, 5)],
+                                             [("slot", et(2026, 9, 10, 7, 30))])

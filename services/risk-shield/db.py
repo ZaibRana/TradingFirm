@@ -230,3 +230,15 @@ async def latest_macro_brief(pool) -> Optional[dict]:
 async def last_brief_at(pool, trigger: Optional[str] = None) -> Optional[datetime]:
     """max(generated_at) over every stored brief, or one trigger's; None when there is none."""
     return await pool.fetchval(LAST_BRIEF_AT_SQL, trigger)
+
+
+# "This slot already has a brief" (decision 3): a `slot` row inside the slot's window.
+SLOT_BRIEF_EXISTS_SQL = """
+SELECT EXISTS (SELECT 1 FROM risk.macro_briefs
+               WHERE trigger = 'slot' AND generated_at >= $1 AND generated_at < $2)
+"""
+
+
+async def slot_brief_exists(pool, window_start: datetime, window_end: datetime) -> bool:
+    """Whether a `slot` brief was stored in [window_start, window_end)."""
+    return bool(await pool.fetchval(SLOT_BRIEF_EXISTS_SQL, window_start, window_end))
