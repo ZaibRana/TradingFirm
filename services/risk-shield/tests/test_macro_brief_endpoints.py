@@ -125,3 +125,88 @@ def test_health_reports_brief_status(client_with, brief_status, expected):
     body = client_with(brief_status=brief_status).get("/health").json()
     assert tuple(body[k] for k in HEALTH_FIELDS) == expected
     assert "macroBriefEnabled" in body and not {"lastBriefId", "lastAttemptAt"} & set(body)
+
+
+# ── POST /macro/brief/generate (commit 3) ────────────────────────
+
+import asyncio
+from datetime import timedelta
+from types import SimpleNamespace
+
+import macro_brief
+from tests.fake_ai_agent import FakeAiAgent
+from tests.test_macro_brief_flow import BriefStore, inputs_doc, not_ready, patch_inputs
+
+
+@pytest.fixture
+def post_with(client_with, monkeypatch):
+    """POST over stubbed state with the flag on → (client, agent, inputs log)."""
+    monkeypatch.setattr(main.settings, "macro_brief_enabled", True)
+
+    def _make(store, *answers, doc=None, lock=None):
+        client = client_with(store, brief_status=macro_brief.initial_brief_status())
+        agent, log = FakeAiAgent(*answers), []
+        patch_inputs(monkeypatch, log, doc or inputs_doc())
+        for name, value in (("brief_lock", lock or asyncio.Lock()), ("ai_agent_client", agent.client()),
+                            ("fred_client", object()), ("inputs_http", object())):
+            monkeypatch.setattr(main.app.state, name, value, raising=False)
+        return client, agent, log
+    return _make
+
+
+def test_generate_endpoint_disabled_503(client_with, monkeypatch):
+    monkeypatch.setattr(main.settings, "macro_brief_enabled", False)
+    agent, log = FakeAiAgent(), []
+    patch_inputs(monkeypatch, log, inputs_doc())
+    monkeypatch.setattr(main.app.state, "ai_agent_client", agent.client(), raising=False)
+    for pool in (BriefStore(fail_read=AssertionError("read with the flag off")), None):
+        resp = client_with(pool).post("/macro/brief/generate")
+        assert (resp.status_code, resp.json()) == (503, {"detail": "macro brief disabled"})
+    assert (agent.requests, log) == ([], [])
+    assert "POST /macro/brief/generate" in client_with().get("/").json()["endpoints"]
+
+
+def test_generate_endpoint_conflict_and_cooldown(post_with):
+    client, agent, log = post_with(BriefStore(), lock=SimpleNamespace(locked=lambda: True))
+    resp = client.post("/macro/brief/generate")
+    assert (resp.status_code, resp.json(), agent.requests, log) == (409, {"detail": "generation in progress"}, [], [])
+
+    store = BriefStore([{"generated_at": NOW - timedelta(seconds=599), "trigger": "slot"}])   # any trigger counts
+    client, agent, log = post_with(store)
+    resp = client.post("/macro/brief/generate")
+    assert (resp.status_code, resp.headers["retry-after"], agent.requests, log) == (429, "1", [], [])
+    store.rows[0]["generated_at"] = NOW - timedelta(seconds=601)
+    assert client.post("/macro/brief/generate").status_code == 201
+    resp = client.post("/macro/brief/generate")                    # the manual brief just stored counts too
+    assert (resp.status_code, resp.headers["retry-after"], len(agent.requests), len(store.rows)) == (429, "600", 1, 2)
+
+
+def test_generate_endpoint_outcomes(post_with, monkeypatch):
+    client, agent, _ = post_with(BriefStore())
+    resp = client.post("/macro/brief/generate")
+    body = resp.json()
+    assert (resp.status_code, list(body)) == (201, list(BODY))
+    assert (body["trigger"], body["generatedAt"], body["ageMinutes"], body["brief"], body["freshness"]) == (
+        "manual", NOW.isoformat(), 0, brief(), inputs_doc()["freshness"])
+    assert main.app.state.brief_status["lastBriefId"] == body["id"]
+    assert client.get("/macro/brief").json() == body               # one serializer: the 201 and GET never drift
+
+    client, agent, _ = post_with(BriefStore(), doc=not_ready())
+    resp = client.post("/macro/brief/generate")
+    assert (resp.status_code, resp.json(), agent.requests) == (422, {"detail": "inputs not ready"}, [])
+    assert main.app.state.brief_status["lastError"] == "inputs not ready"
+
+    for store, answer, status, detail in (
+        (BriefStore(), (503, {"detail": "busy"}), 502, "ai-agent: HTTP 503"),
+        (BriefStore(fail_insert=asyncpg.InterfaceError("lost")), (200, brief()), 503, "brief lost: database unavailable"),
+        (None, (200, brief()), 503, "database unavailable"),
+        (BriefStore(fail_read=TimeoutError()), (200, brief()), 503, "database unavailable"),
+    ):
+        resp = post_with(store, answer)[0].post("/macro/brief/generate")
+        assert (resp.status_code, resp.json()) == (status, {"detail": detail}), detail
+
+    async def lost_race(state, client, *, trigger, clock):          # another generation took the lock first
+        return {"outcome": "skipped", "cause": "busy", "id": None, "row": None}
+    monkeypatch.setattr(macro_brief, "generate_once", lost_race)
+    resp = post_with(BriefStore())[0].post("/macro/brief/generate")
+    assert (resp.status_code, resp.json()) == (409, {"detail": "generation in progress"})

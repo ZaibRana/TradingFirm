@@ -41,14 +41,17 @@ def contract_violations() -> dict:
 class FakeAiAgent:
     """Answers each call with the next (status, body), the last one repeating.
     body: dict / list (JSON), bytes (raw) or an exception to raise. `delay`
-    seconds before each answer. Every request is kept."""
+    seconds before each answer. Every request is kept, and "ai-agent" goes on
+    `log` per call when one is given."""
 
-    def __init__(self, *answers, delay: float = 0.0):
+    def __init__(self, *answers, delay: float = 0.0, log: list = None):
         self.answers = list(answers) or [(200, brief())]
-        self.delay, self.requests = delay, []
+        self.delay, self.requests, self.log = delay, [], log
 
     async def _handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        if self.log is not None:
+            self.log.append("ai-agent")
         status, body = self.answers[min(len(self.requests), len(self.answers)) - 1]
         if self.delay:
             await asyncio.sleep(self.delay)

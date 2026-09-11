@@ -18,6 +18,8 @@ Endpoints:
   GET /macro/brief/inputs — the macro brief's inputs document with freshness
                             flags, reused for 60 s (Part 3.6a)
   GET /macro/brief        — the latest stored macro brief, Postgres only (Part 3.6b)
+  POST /macro/brief/generate — one manual brief through ai-agent; 503 while
+                            MACRO_BRIEF_ENABLED is false (Part 3.6b)
 
 Port: 8003
 """
@@ -25,6 +27,7 @@ Port: 8003
 import asyncio
 import json
 import logging
+import math
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -36,6 +39,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import config
 import db
 import econ_calendar
+import macro_brief
 import macro_inputs
 import news_poller
 from config import settings
@@ -139,6 +143,15 @@ async def lifespan(app: FastAPI):
     app.state.inputs_lock = asyncio.Lock()
     app.state.inputs_last = None
 
+    # Macro brief generation (Part 3.6b decision 7). brief_status and the lock
+    # always exist (small; /health and POST /macro/brief/generate read them),
+    # the lock on the serving loop. The ai-agent client only when
+    # MACRO_BRIEF_ENABLED is true; it makes no request at construction.
+    from ai_agent_client import AiAgentClient
+    app.state.brief_status = macro_brief.initial_brief_status()
+    app.state.brief_lock = asyncio.Lock()
+    app.state.ai_agent_client = AiAgentClient(settings.ai_agent_url) if settings.macro_brief_enabled else None
+
     logger.info(f"Risk Shield ready on port {settings.service_port}")
     yield
 
@@ -173,14 +186,15 @@ async def lifespan(app: FastAPI):
             await client.aclose()
         except Exception as e:
             logger.warning(f"News poller client close failed: {e!r}")
-    for name in ("fred_client", "inputs_http"):
+    # The macro brief's clients: after the tasks, before the pool and Redis (3.6b decision 7).
+    for name in ("fred_client", "inputs_http", "ai_agent_client"):
         client = getattr(app.state, name, None)
         if client is None:
             continue
         try:
             await client.aclose()
         except Exception as e:
-            logger.warning(f"Macro inputs client close failed ({name}): {e!r}")
+            logger.warning(f"Macro brief client close failed ({name}): {e!r}")
     if getattr(app.state, "db_pool", None) is not None:
         await app.state.db_pool.close()
         logger.info("Database pool closed")
@@ -256,6 +270,7 @@ async def root():
             "GET  /market/calendar?days=7",
             "GET  /macro/brief/inputs",
             "GET  /macro/brief",
+            "POST /macro/brief/generate",
         ],
     }
 
@@ -502,10 +517,50 @@ def _brief_body(row: dict, *, include_inputs: bool = False) -> dict:
 
 
 @app.get("/macro/brief")
-async def macro_brief(include_inputs: bool = Query(False, alias="includeInputs")):
+async def get_macro_brief(include_inputs: bool = Query(False, alias="includeInputs")):
     """The latest stored brief. No row is a 404, distinct from a wrong route;
     no pool or a database failure is a 503."""
     row = await _read(db.latest_macro_brief)
     if row is None:
         raise HTTPException(status_code=404, detail=NO_BRIEF_DETAIL)
     return _brief_body(row, include_inputs=include_inputs)
+
+
+BRIEF_DISABLED_DETAIL = "macro brief disabled"
+GENERATION_BUSY_DETAIL = "generation in progress"
+BRIEF_LOST_DETAIL = "brief lost: database unavailable"
+MANUAL_COOLDOWN_SECONDS = 600     # since the last stored brief of any trigger
+
+
+@app.post("/macro/brief/generate", status_code=201)
+async def macro_brief_generate():
+    """
+    One manual brief (trigger "manual"), blocking for up to the ai-agent
+    timeout. In order: flag off 503, no pool 503, a generation running 409, a
+    stored brief under 600 s old 429 + Retry-After. Then 201 with GET's body,
+    422 inputs not ready (no LLM call, and not worth retrying on a timer), 502
+    an ai-agent failure, 503 an insert failure. Unauthenticated: carried to
+    going public.
+    """
+    state = app.state
+    if not settings.macro_brief_enabled:
+        raise HTTPException(status_code=503, detail=BRIEF_DISABLED_DETAIL)
+    if getattr(state, "db_pool", None) is None:
+        raise HTTPException(status_code=503, detail=DB_UNAVAILABLE_DETAIL)
+    if state.brief_lock.locked():
+        raise HTTPException(status_code=409, detail=GENERATION_BUSY_DETAIL)
+    last = await _read(db.last_brief_at)
+    age = (_now() - last).total_seconds() if last is not None else None
+    if age is not None and age < MANUAL_COOLDOWN_SECONDS:
+        raise HTTPException(status_code=429, detail="last macro brief too recent",
+                            headers={"Retry-After": str(math.ceil(MANUAL_COOLDOWN_SECONDS - age))})
+
+    result = await macro_brief.generate_once(state, state.ai_agent_client, trigger="manual", clock=_now)
+    if result["outcome"] == macro_brief.GENERATED:
+        return _brief_body(result["row"])
+    cause = result["cause"]
+    if cause.startswith("insert:"):
+        raise HTTPException(status_code=503, detail=BRIEF_LOST_DETAIL)
+    status, detail = {"busy": (409, GENERATION_BUSY_DETAIL), "inputs not ready": (422, cause),
+                      "database unavailable": (503, DB_UNAVAILABLE_DETAIL)}.get(cause, (502, cause))
+    raise HTTPException(status_code=status, detail=detail)
