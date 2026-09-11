@@ -660,3 +660,40 @@ The shared ×1.3–1.8 put 3.5's code above its band (1,119 vs ~770–1,060) and
 **Why:** the reason above. Waiting for 20:20 UTC left the settle to a scheduler that a Mac sleep could stall.
 
 **Supersedes:** N/A. A one-off exception to the 2026-09-10 G15 timing entry.
+
+---
+
+## 2026-09-11 — Part 4.6's brief contract is camelCase (from Part 3.6b)
+
+**Decision:** ai-agent `POST /brief/macro` takes `{"inputs": <macro inputs document v1>}` and answers `{regimeView, keyRisks[], upcoming[], oneParagraph, model?}`. A violation is rejected, never truncated. risk-shield pins the limits in `ai_agent_client.BRIEF_LIMITS` (`test_brief_limits_pinned_to_spec`), and 4.6 keeps a pinned copy.
+
+| field | rule |
+|---|---|
+| `regimeView` | string, non-blank, ≤ 1,000 chars |
+| `keyRisks` | list of 1–8 non-blank strings, each ≤ 300 |
+| `upcoming` | list of 0–10 non-blank strings, each ≤ 300 |
+| `oneParagraph` | string, non-blank, ≤ 2,000 chars |
+| `model` | optional string ≤ 100; blank or whitespace-only is returned as null, not rejected |
+| any other key | rejected |
+| the whole object | compact JSON ≤ 16,000 bytes, `allow_nan=False` |
+
+- The 16,000-byte bound is measured on compact JSON: `json.dumps(body, allow_nan=False, separators=(",", ":"))` with the default `ensure_ascii=True`, encoded as UTF-8, the same measure as `macro_inputs.encoded_size`. Every non-ASCII character counts as its JSON escape: 6 bytes, or 12 for an emoji.
+- What risk-shield does with an answer: 404, 429, another non-200, a transport error or a timeout is unavailable; 422 means the inputs contract drifted; a 200 outside the table is a bad response. No retries, no backoff, a 180 s bound (provisional; 4.6 revisits it).
+
+**Why:** API JSON is camelCase across the repo, and 4.6 is written from `decisions.md` because the plan is read-only.
+
+**Supersedes:** plan row 4.6's `{regime_view, key_risks[], upcoming[], one_paragraph}`.
+
+---
+
+## 2026-09-11 — Estimate bands revised on 3.6a actuals (from Part 3.6b)
+
+**Decision:** a standing rule revision.
+- code **×1.1–1.6**, tests **×0.9–1.3**, on fresh counts
+- fakes and mocks of a service that isn't built yet are estimated separately at **×1.0–1.5**
+- live scripts count as code; data stays outside every band and the 600-line threshold
+- **unchanged:** stop and report above a commit's band top before splitting; split any commit over 600 before the first push; an addition after approval re-cuts its commit's band at once; an overrun whose reason is accepted is re-cut to the measured numbers with a one-line note
+
+**Why:** 3.6a's code landed at ×1.37 overall. Commits extending an existing module came in at ×0.9–1.1, new modules at ×1.5–2.3. Tests landed at ×1.07 (×0.6–1.55). Five of eight commits were under the old bands' floors.
+
+**Supersedes:** the 2026-09-10 entry "Separate estimate bands for code and tests (from Part 3.6)" (code ×1.3–1.9, tests ×1.05–1.5).
