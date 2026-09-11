@@ -37,6 +37,7 @@ from cache import (
 )
 from config import settings
 from monitors.errors import FinnhubError, FinnhubNotAuthorized, FinnhubRateLimited
+import wallclock
 
 logger = logging.getLogger(__name__)
 
@@ -317,12 +318,13 @@ def _calendar_warning(now: datetime, last_day: Optional[date]) -> date:
 async def run_news_poller(state, client, http, *, clock: Callable[[], datetime] = _utc_now,
                           sleep=asyncio.sleep) -> None:
     """
-    Forever: sleep until the next quarter hour, then poll once. A wake-up
-    before the slot polls nothing and sleeps again; a late one (laptop sleep)
-    polls once right away — the page's span covers the gap, and the overlap
-    warning says when it did not — and the next slot is counted from now, so
-    missed slots are never caught up. A raise out of a poll is a bug: ERROR,
-    and the loop goes on. Cancellation (shutdown) propagates.
+    Forever: wait for the next quarter hour through wallclock (sleeps of
+    ≤ 60 s, the clock re-read after each; 3.4 follow-up), then poll once. A
+    late wake (laptop sleep) polls once right away — the page's span covers
+    the gap, and the overlap warning says when it did not — and the next slot
+    is counted from now, so missed slots are never caught up. A raise out of
+    a poll is a bug: ERROR, and the loop goes on. Cancellation (shutdown)
+    propagates.
     """
     status = state.news_status
     status["startedAt"] = clock().isoformat()
@@ -331,14 +333,12 @@ async def run_news_poller(state, client, http, *, clock: Callable[[], datetime] 
     while True:
         try:
             target = next_poll_after(clock())
-            delay = max(0.0, (target - clock()).total_seconds())
         except Exception as e:
             logger.error(f"News poller loop error {type(e).__name__}: {e}")
-            target, delay = None, FALLBACK_SLEEP_SECONDS
-        await sleep(delay)
-        now = clock()
-        if target is None or now < target:
+            await wallclock.sleep_until(clock() + timedelta(seconds=FALLBACK_SLEEP_SECONDS),
+                                        clock=clock, sleep=sleep, log=logger)
             continue
+        now = (await wallclock.sleep_until(target, clock=clock, sleep=sleep, log=logger)).now
         late = (now - target).total_seconds()
         if late >= POLL_MINUTES * 60:
             logger.warning(f"News poller woke {late:.0f}s after its slot: one poll now, missed slots not caught up")

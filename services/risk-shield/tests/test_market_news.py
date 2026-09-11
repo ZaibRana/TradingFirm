@@ -497,33 +497,27 @@ class LoopClock:
         return self.now
 
 
-def EXACT(delay):
-    return delay
+def utc(*args):
+    return datetime(*args, tzinfo=timezone.utc)
 
 
-def EARLY(delay):
-    return delay - 60
-
-
-def LATE(delay):
-    return delay + 7210            # past eight slots
-
-
-async def _run_loop(monkeypatch, start, steps, poll=None):
-    """Run the real loop on a fake clock. Each sleep applies the next step to
-    the requested delay; "stop" cancels. Returns (state, polls, delays)."""
+async def _run_loop(monkeypatch, start, *, stop_at, extra=None, poll=None):
+    """Run the real loop on a fake clock. Each chunk sleep moves the clock by
+    its seconds, plus extra[i] wall seconds on chunk i (the host paused); the
+    chunk that would reach `stop_at` is recorded and cancels. Returns
+    (state, polls, delays)."""
     clock = LoopClock(start)
-    polls, delays = [], []
+    polls, delays, extra = [], [], extra or {}
 
     async def recording(state, client, http, *, clock):
         polls.append(clock())
 
     async def sleep(delay):
+        index = len(delays)
         delays.append(delay)
-        step = steps.pop(0)
-        if step == "stop":
+        if clock.now + timedelta(seconds=delay) >= stop_at:
             raise asyncio.CancelledError
-        clock.now += timedelta(seconds=step(delay))
+        clock.now += timedelta(seconds=delay + extra.get(index, 0))
 
     monkeypatch.setattr(news_poller, "poll_once", poll or recording)
     state = _state()
@@ -542,11 +536,14 @@ async def test_news_loop_one_poll_per_slot_no_catch_up(monkeypatch, caplog):
     with pytest.raises(ValueError):
         news_poller.next_poll_after(datetime(2026, 9, 10, 10, 0))
 
-    state, polls, delays = await _run_loop(monkeypatch, start, [EXACT, EARLY, EXACT, LATE, EXACT, "stop"])
+    # Waits of 450 s (chunks 0–7), 900 s (8–22) and 900 s (23–37), where chunk
+    # 37 runs 7,210 s long: past eight slots. The early-wake case is the harness's.
+    state, polls, delays = await _run_loop(monkeypatch, start, extra={37: 7210}, stop_at=utc(2026, 9, 10, 13, 1))
     at = lambda h, m, s=0: datetime(2026, 9, 10, h, m, s, tzinfo=timezone.utc)
-    assert polls == [at(10, 15), at(10, 30), at(12, 45, 10), at(13, 0)]     # early wake polls nothing
-    assert delays == [450, 900, 60, 900, 890, 900]                         # no catch-up after the late wake
+    assert polls == [at(10, 15), at(10, 30), at(12, 45, 10), at(13, 0)]
+    assert max(delays) == 60 and len(delays) == 8 + 15 + 15 + 15 + 1    # no catch-up after the late wake
     assert _logged(caplog, "missed slots not caught up") == ["WARNING"]
+    assert _logged(caplog, "host paused ~2h 1m (wall +7270 s, process +0 s)") == ["WARNING"]   # real process clock
     assert state.news_status["startedAt"] == start.isoformat()
 
 
@@ -558,16 +555,46 @@ async def test_news_loop_calendar_warning_once_per_day(monkeypatch, caplog):
     async def poll(state, client, http, *, clock):
         seen.append(renewals())
 
-    # 2026-12-18: 13 days of coverage left, so short. Two polls that ET day, one the next.
-    next_day = lambda delay: delay + 86400
-    await _run_loop(monkeypatch, datetime(2026, 12, 18, 13, 7, tzinfo=timezone.utc),
-                    [EXACT, EXACT, next_day, "stop"], poll=poll)
+    # 2026-12-18: 13 days of coverage left, so short. Two polls that ET day, one the next
+    # (chunk 37, the last before 13:45, runs a day long).
+    await _run_loop(monkeypatch, utc(2026, 12, 18, 13, 7), extra={37: 86400},
+                    stop_at=utc(2026, 12, 19, 13, 46), poll=poll)
     assert seen == [1, 1, 2]
 
     caplog.clear()
     seen.clear()
-    await _run_loop(monkeypatch, datetime(2026, 9, 10, 13, 7, tzinfo=timezone.utc), [EXACT, "stop"], poll=poll)
+    await _run_loop(monkeypatch, utc(2026, 9, 10, 13, 7), stop_at=utc(2026, 9, 10, 13, 16), poll=poll)
     assert seen == [0]                                                     # not short in September
+
+
+@pytest.mark.asyncio
+async def test_news_loop_mac_sleep_16h_polls_once_on_wake(monkeypatch, caplog):
+    # The chunk starting 10:13:30 UTC (index 6) takes 16 h: the Mac wakes at 02:13:30.
+    start = utc(2026, 9, 10, 10, 7, 30)
+    _, polls, delays = await _run_loop(monkeypatch, start, extra={6: 57540}, stop_at=utc(2026, 9, 11, 2, 31))
+    assert polls == [utc(2026, 9, 11, 2, 13, 30), utc(2026, 9, 11, 2, 15), utc(2026, 9, 11, 2, 30)]
+    assert max(delays) == 60                                               # one poll on wake, none caught up
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+        "host paused ~16h 0m (wall +57600 s, process +0 s)",
+        "News poller woke 57510s after its slot: one poll now, missed slots not caught up",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_news_loop_error_fallback_is_chunked(monkeypatch, caplog):
+    real, calls = news_poller.next_poll_after, []
+
+    def flaky(now):
+        calls.append(now)
+        if len(calls) == 1:
+            raise RuntimeError("clock bug")
+        return real(now)
+
+    monkeypatch.setattr(news_poller, "next_poll_after", flaky)
+    _, polls, delays = await _run_loop(monkeypatch, utc(2026, 9, 10, 10, 7, 30), stop_at=utc(2026, 9, 10, 10, 31))
+    assert _logged(caplog, "News poller loop error RuntimeError: clock bug") == ["ERROR"]
+    assert delays[:15] == [60] * 15                                        # the 900 s fallback, in chunks
+    assert polls == [utc(2026, 9, 10, 10, 30)]
 
 
 @pytest.mark.asyncio
@@ -580,7 +607,7 @@ async def test_news_loop_survives_exception_and_cancels_cleanly(monkeypatch, cap
         if len(calls) == 1:
             raise RuntimeError("bug")
 
-    state, _, _ = await _run_loop(monkeypatch, start, [EXACT, EXACT, "stop"], poll=flaky)
+    state, _, _ = await _run_loop(monkeypatch, start, stop_at=utc(2026, 9, 10, 10, 31), poll=flaky)
     assert len(calls) == 2                                                 # the next slot still ran
     assert _logged(caplog, "News poll raised RuntimeError") == ["ERROR"]
     assert state.news_status["lastError"] == "poll raised: RuntimeError"
@@ -588,7 +615,7 @@ async def test_news_loop_survives_exception_and_cancels_cleanly(monkeypatch, cap
     async def cancelled_mid_poll(state, client, http, *, clock):
         raise asyncio.CancelledError
 
-    await _run_loop(monkeypatch, start, [EXACT, EXACT], poll=cancelled_mid_poll)   # propagates
+    await _run_loop(monkeypatch, start, stop_at=utc(2026, 9, 10, 10, 31), poll=cancelled_mid_poll)   # propagates
 
     # A real task cancelled during a real sleep ends cancelled, no raise swallowed.
     task = asyncio.create_task(news_poller.run_news_poller(
